@@ -1,6 +1,7 @@
 import logging
 import os
 import random
+import time
 from argparse import Namespace
 from contextlib import nullcontext
 from pathlib import Path
@@ -191,6 +192,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         clear_memory(clear_host_memory=True)
         print_memory("before offload model")
+        self._maybe_stagger_train_offload_pause()
         if (
             self.role == "actor"
             and self.args.use_critic
@@ -203,6 +205,46 @@ class MegatronTrainRayActor(TrainRayActor):
         torch_memory_saver.pause()
 
         print_memory("after offload model")
+
+    def _maybe_stagger_train_offload_pause(self) -> None:
+        raw_interval = os.environ.get("SLIME_TRAIN_OFFLOAD_STAGGER_SEC", "0")
+        try:
+            interval = float(raw_interval)
+        except ValueError:
+            logger.warning("Ignoring invalid SLIME_TRAIN_OFFLOAD_STAGGER_SEC=%r", raw_interval)
+            return
+        if interval <= 0:
+            return
+
+        raw_max = os.environ.get("SLIME_TRAIN_OFFLOAD_STAGGER_MAX_SEC", "120")
+        try:
+            max_delay = max(0.0, float(raw_max))
+        except ValueError:
+            logger.warning("Ignoring invalid SLIME_TRAIN_OFFLOAD_STAGGER_MAX_SEC=%r", raw_max)
+            max_delay = 120.0
+
+        raw_local_rank = os.environ.get("LOCAL_RANK")
+        try:
+            local_rank = int(raw_local_rank) if raw_local_rank is not None else int(self.args.rank) % int(
+                self.args.num_gpus_per_node
+            )
+        except (TypeError, ValueError, ZeroDivisionError):
+            local_rank = int(getattr(self.args, "rank", getattr(self, "_rank", 0)))
+
+        delay = min(max(0, local_rank) * interval, max_delay)
+        if delay <= 0:
+            return
+
+        logger.info(
+            "Staggering train offload pause for %.2fs before torch_memory_saver.pause() "
+            "(rank=%s, local_rank=%s, interval=%.2fs, max=%.2fs)",
+            delay,
+            getattr(self.args, "rank", getattr(self, "_rank", "?")),
+            local_rank,
+            interval,
+            max_delay,
+        )
+        time.sleep(delay)
 
     @timer
     def wake_up(self) -> None:

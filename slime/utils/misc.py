@@ -1,4 +1,5 @@
 import importlib
+import os
 import subprocess
 from collections import defaultdict
 from collections.abc import Callable, Iterable
@@ -119,7 +120,13 @@ def should_run_periodic_action(
     if interval is None:
         return False
 
-    if num_rollout is not None and rollout_id == num_rollout - 1:
+    disable_final_save = os.environ.get("SLIME_DISABLE_FINAL_SAVE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not disable_final_save and num_rollout is not None and rollout_id == num_rollout - 1:
         return True
 
     step = rollout_id + 1

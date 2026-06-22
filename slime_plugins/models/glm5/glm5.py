@@ -8,6 +8,11 @@ from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TELinear
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.common.embeddings import RotaryEmbedding, YarnRotaryEmbedding, _yarn_get_mscale
+from megatron.core.models.common.embeddings.rope_utils import (
+    _apply_rotary_pos_emb_bshd,
+    _apply_rotary_pos_emb_thd,
+    fused_apply_rotary_pos_emb_thd,
+)
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.post_training.modelopt.layers import Linear
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
@@ -572,26 +577,63 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
             kv_compressed, group=parallel_state.get_context_parallel_group()
         )
 
-        def fuse_rope(q, cu_seqlens, gathered=False):
-            # worse precision than apex.
-            # from megatron.core.extensions.transformer_engine import fused_apply_rotary_pos_emb_thd
-            from apex.transformer.functional import fused_apply_rotary_pos_emb_thd
+        rope_freqs = rotary_pos_emb.squeeze(0)
 
-            # mla use rope interleave
+        def apply_unfused_rope(q, cu_seqlens, gathered=False):
+            if not gathered:
+                return _apply_rotary_pos_emb_thd(
+                    q,
+                    cu_seqlens,
+                    rope_freqs,
+                    rotary_interleaved=self.config.rotary_interleaved,
+                    multi_latent_attention=self.config.multi_latent_attention,
+                    mscale=mscale,
+                    cp_group=parallel_state.get_context_parallel_group(),
+                )
+
+            seqlens = [int(x) for x in (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()]
+            q_splits = torch.split(q, seqlens)
+            if rope_freqs.dim() >= 1 and rope_freqs.size(0) == int(cu_seqlens[-1].item()):
+                freq_slices = [
+                    rope_freqs[int(cu_seqlens[i].item()) : int(cu_seqlens[i + 1].item())]
+                    for i in range(len(q_splits))
+                ]
+            else:
+                freq_slices = [rope_freqs[: x.size(0)] for x in q_splits]
+
+            freqs_packed = torch.cat(freq_slices, dim=0)
+            return _apply_rotary_pos_emb_bshd(
+                q.unsqueeze(1),
+                freqs_packed,
+                rotary_interleaved=self.config.rotary_interleaved,
+                multi_latent_attention=self.config.multi_latent_attention,
+                mscale=mscale,
+            ).squeeze(1)
+
+        def fuse_rope(q, cu_seqlens, gathered=False):
+            if (
+                not self.config.apply_rope_fusion
+                or fused_apply_rotary_pos_emb_thd is None
+                or mscale != 1.0
+            ):
+                return apply_unfused_rope(q, cu_seqlens, gathered=gathered)
+
+            # MLA uses RoPE interleaving before calling the fused THD kernel.
             x1 = q[..., 0::2]
             x2 = q[..., 1::2]
             t = torch.cat((x1, x2), dim=-1)
-            # TODO remove copy here
-            # fuse rope not support this way rope (diff with cp)
+            cp_size = parallel_state.get_context_parallel_world_size()
+            cp_rank = parallel_state.get_context_parallel_rank()
             if gathered:
-                return fused_apply_rotary_pos_emb_thd(t, cu_seqlens, rotary_pos_emb.squeeze(0))
-            else:
-                seq_len = q.shape[0]
-                cp_size = parallel_state.get_context_parallel_world_size()
-                cp_rank = parallel_state.get_context_parallel_rank()
-                t = t.repeat(cp_size, 1, 1)
-                out = fused_apply_rotary_pos_emb_thd(t, cu_seqlens, rotary_pos_emb.squeeze(0))
-                return out[cp_rank * seq_len : (cp_rank + 1) * seq_len]
+                cp_size = 1
+                cp_rank = 0
+            return fused_apply_rotary_pos_emb_thd(
+                t,
+                cu_seqlens,
+                rope_freqs,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+            )
 
         q_pos_emb = fuse_rope(q_pos_emb, cu_seqlens_q, gathered=False)
         k_pos_emb = fuse_rope(k_pos_emb, cu_seqlens_kv, gathered=True)

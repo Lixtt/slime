@@ -520,11 +520,9 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
         rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
             inference_context, None, hidden_states, self.config, packed_seq_params
         )
-        # YarnRotaryEmbedding/RotaryEmbedding.forward is wrapped in lru_cache, so it
-        # only accepts hashable args: pass the packed-sequence flag, not the
-        # (unhashable) PackedSeqParams object.
-        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
-        rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+        rotary_pos_emb, mscale = self.rotary_pos_emb(
+            rotary_seq_len, packed_seq_params=packed_seq_params
+        )
 
         cu_seqlens_q = packed_seq_params.cu_seqlens_q
         cu_seqlens_kv = packed_seq_params.cu_seqlens_kv

@@ -994,6 +994,110 @@ def _save_trainable_only_checkpoint(iteration: int, model: Sequence[DDP]) -> Non
     _safe_barrier()
 
 
+def _resolve_trainable_only_checkpoint_dir(path: str) -> Path:
+    checkpoint_path = Path(path)
+    if (checkpoint_path / "trainable_common.json").is_file():
+        return checkpoint_path
+
+    latest_iteration_file = checkpoint_path / "latest_trainable_iteration.txt"
+    if latest_iteration_file.is_file():
+        latest_iteration = int(latest_iteration_file.read_text(encoding="utf-8").strip())
+        iteration_dir = checkpoint_path / f"iter_{latest_iteration:07d}"
+        if (iteration_dir / "trainable_common.json").is_file():
+            return iteration_dir
+        raise FileNotFoundError(
+            f"latest_trainable_iteration.txt points to {latest_iteration}, "
+            f"but {iteration_dir / 'trainable_common.json'} does not exist"
+        )
+
+    raise FileNotFoundError(
+        f"{checkpoint_path} is not a trainable-only checkpoint directory; expected "
+        "trainable_common.json or latest_trainable_iteration.txt"
+    )
+
+
+@torch.no_grad()
+def _load_trainable_only_checkpoint_if_requested(
+    model: Sequence[DDP],
+) -> bool:
+    load_path = os.environ.get("SLIME_MEGATRON_TRAINABLE_ONLY_LOAD")
+    if not load_path:
+        return False
+
+    checkpoint_dir = _resolve_trainable_only_checkpoint_dir(load_path)
+    common_path = checkpoint_dir / "trainable_common.json"
+    common = json.loads(common_path.read_text(encoding="utf-8"))
+    if common.get("format") != "slime_megatron_trainable_only_v1":
+        raise ValueError(f"Unsupported trainable-only checkpoint format in {common_path}: {common.get('format')}")
+
+    rank, world_size = _dist_rank_world()
+    checkpoint_world_size = int(common.get("world_size", -1))
+    if checkpoint_world_size != world_size:
+        raise ValueError(
+            f"Trainable-only checkpoint world_size mismatch: checkpoint={checkpoint_world_size}, runtime={world_size}"
+        )
+
+    rank_files = common.get("rank_files") or []
+    rank_file_name = rank_files[rank] if rank < len(rank_files) else f"trainable_rank_{rank:05d}.pt"
+    rank_file = checkpoint_dir / rank_file_name
+    if not rank_file.is_file():
+        raise FileNotFoundError(f"Missing rank-local trainable-only checkpoint shard: {rank_file}")
+
+    payload = torch.load(rank_file, map_location="cpu", weights_only=False)
+    if payload.get("format") != "slime_megatron_trainable_only_v1":
+        raise ValueError(f"Unsupported rank shard format in {rank_file}: {payload.get('format')}")
+    if int(payload.get("rank", -1)) != rank:
+        raise ValueError(f"Rank shard mismatch in {rank_file}: checkpoint={payload.get('rank')}, runtime={rank}")
+    if int(payload.get("world_size", -1)) != world_size:
+        raise ValueError(
+            f"Rank shard world_size mismatch in {rank_file}: checkpoint={payload.get('world_size')}, runtime={world_size}"
+        )
+
+    modules = unwrap_model(model)
+    if not isinstance(modules, Sequence):
+        modules = [modules]
+    runtime_params = {
+        f"model_{chunk_idx}.{name}": param
+        for chunk_idx, module in enumerate(modules)
+        for name, param in module.named_parameters()
+    }
+
+    checkpoint_params = payload.get("params")
+    if not isinstance(checkpoint_params, dict):
+        raise ValueError(f"Rank shard {rank_file} does not contain a params dict")
+
+    missing = sorted(set(checkpoint_params) - set(runtime_params))
+    if missing:
+        preview = ", ".join(missing[:8])
+        raise KeyError(f"{len(missing)} trainable-only tensors are missing from the runtime model: {preview}")
+
+    loaded_param_count = len(checkpoint_params)
+    loaded_numel = 0
+    for name, tensor in checkpoint_params.items():
+        param = runtime_params[name]
+        if tuple(tensor.shape) != tuple(param.shape):
+            raise ValueError(
+                f"Shape mismatch for {name}: checkpoint={tuple(tensor.shape)}, runtime={tuple(param.shape)}"
+            )
+        param.data.copy_(tensor.to(device=param.device, dtype=param.dtype, non_blocking=True))
+        loaded_numel += tensor.numel()
+
+    del checkpoint_params, payload, runtime_params
+    clear_memory(clear_host_memory=True)
+    _safe_barrier()
+    if rank == 0:
+        logger.info(
+            "Loaded trainable-only Megatron checkpoint iteration=%s world_size=%s from %s; "
+            "rank-local tensors are restored on every rank, rank0_tensor_count=%s rank0_numel=%s",
+            common.get("iteration"),
+            world_size,
+            checkpoint_dir,
+            loaded_param_count,
+            loaded_numel,
+        )
+    return True
+
+
 def save(
     iteration: int,
     model: Sequence[DDP],
@@ -1067,6 +1171,9 @@ def initialize_model_and_optimizer(
         _reinitialize_critic_output_layer(model)
         if (args.fp16 or args.bf16) and optimizer is not None:
             optimizer.reload_model_params()
+    loaded_trainable_only_checkpoint = _load_trainable_only_checkpoint_if_requested(model)
+    if loaded_trainable_only_checkpoint and optimizer is not None and hasattr(optimizer, "reload_model_params"):
+        optimizer.reload_model_params()
     clear_memory()
 
     return model, optimizer, opt_param_scheduler, iteration

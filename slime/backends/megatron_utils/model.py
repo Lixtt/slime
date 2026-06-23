@@ -858,11 +858,18 @@ def train(
         disable_forward_pre_hook(model)
 
 
+def _drop_rank_local_common_checkpoint_state(common_state_dict):
+    filtered = dict(common_state_dict)
+    filtered.pop("args", None)
+    return filtered
+
+
 def save(
     iteration: int,
     model: Sequence[DDP],
     optimizer: MegatronOptimizer,
     opt_param_scheduler: OptimizerParamScheduler,
+    checkpointing_context: dict | None = None,
 ) -> None:
     """Persist a training checkpoint safely with forward hooks disabled.
 
@@ -881,9 +888,9 @@ def save(
         optimizer,
         opt_param_scheduler,
         num_floating_point_operations_so_far=0,
-        checkpointing_context=None,
+        checkpointing_context=checkpointing_context,
         train_data_iterator=None,
-        preprocess_common_state_dict_fn=None,
+        preprocess_common_state_dict_fn=_drop_rank_local_common_checkpoint_state,
     )
     if should_disable_forward_pre_hook(args):
         enable_forward_pre_hook(model)

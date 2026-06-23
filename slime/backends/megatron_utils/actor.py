@@ -59,6 +59,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         monkey_patch_torch_dist()
         super().init(args, role, with_ref, with_opd_teacher)
+        self.checkpointing_context = {}
 
         init(args)
 
@@ -608,7 +609,13 @@ class MegatronTrainRayActor(TrainRayActor):
 
             maybe_finalize_async_save(blocking=True)
 
-        save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
+        save(
+            rollout_id,
+            self.model,
+            self.optimizer,
+            self.opt_param_scheduler,
+            checkpointing_context=self.checkpointing_context,
+        )
 
         if force_sync and self.args.async_save:
             maybe_finalize_async_save(blocking=True)

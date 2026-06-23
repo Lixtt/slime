@@ -1,11 +1,13 @@
 import dataclasses
 import gc
+import json
 import logging
 import math
 import os
 from argparse import Namespace
 from collections.abc import Callable, Sequence
 from functools import partial
+from pathlib import Path
 
 import torch
 from megatron.core import mpu
@@ -864,6 +866,134 @@ def _drop_rank_local_common_checkpoint_state(common_state_dict):
     return filtered
 
 
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_barrier() -> None:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
+def _dist_rank_world() -> tuple[int, int]:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank(), torch.distributed.get_world_size()
+    return 0, 1
+
+
+def _safe_mpu_value(getter_name: str, *args, **kwargs):
+    getter = getattr(mpu, getter_name, None)
+    if getter is None:
+        return None
+    try:
+        return getter(*args, **kwargs)
+    except Exception:
+        return None
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def _atomic_torch_save(obj, path: Path) -> None:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(obj, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def _save_trainable_only_checkpoint(iteration: int, model: Sequence[DDP]) -> None:
+    """Save only rank-local trainable parameter shards.
+
+    This bypasses Megatron's full distributed checkpoint metadata path, which is
+    too memory-heavy for GLM5.2 744B resource-limited smoke/fine-tuning runs.
+    The checkpoint is a delta against ``args.load``/``args.ref_load`` and is not
+    a standalone Megatron checkpoint.
+    """
+
+    args = get_args()
+    rank, world_size = _dist_rank_world()
+    save_root = Path(args.save)
+    iteration_dir = save_root / f"iter_{iteration:07d}"
+    if rank == 0:
+        iteration_dir.mkdir(parents=True, exist_ok=True)
+    _safe_barrier()
+
+    params = {}
+    param_numel = 0
+    modules = unwrap_model(model)
+    if not isinstance(modules, Sequence):
+        modules = [modules]
+    for chunk_idx, module in enumerate(modules):
+        for name, param in module.named_parameters():
+            if not param.requires_grad:
+                continue
+            key = f"model_{chunk_idx}.{name}"
+            tensor = param.detach().cpu()
+            params[key] = tensor
+            param_numel += tensor.numel()
+
+    tensor_model_parallel_rank = _safe_mpu_value("get_tensor_model_parallel_rank")
+    pipeline_model_parallel_rank = _safe_mpu_value("get_pipeline_model_parallel_rank")
+    expert_model_parallel_rank = _safe_mpu_value("get_expert_model_parallel_rank")
+    data_parallel_rank = _safe_mpu_value("get_data_parallel_rank", with_context_parallel=True)
+    rank_payload = {
+        "format": "slime_megatron_trainable_only_v1",
+        "iteration": iteration,
+        "rank": rank,
+        "world_size": world_size,
+        "tensor_model_parallel_rank": tensor_model_parallel_rank,
+        "pipeline_model_parallel_rank": pipeline_model_parallel_rank,
+        "expert_model_parallel_rank": expert_model_parallel_rank,
+        "data_parallel_rank": data_parallel_rank,
+        "only_train_params_name_list": getattr(args, "only_train_params_name_list", None),
+        "param_count": len(params),
+        "param_numel": param_numel,
+        "params": params,
+    }
+    rank_file = iteration_dir / f"trainable_rank_{rank:05d}.pt"
+    _atomic_torch_save(rank_payload, rank_file)
+
+    rank_meta = {k: v for k, v in rank_payload.items() if k != "params"}
+    _atomic_write_text(
+        iteration_dir / f"trainable_rank_{rank:05d}.json",
+        json.dumps(rank_meta, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+    del params, rank_payload
+    clear_memory(clear_host_memory=True)
+    _safe_barrier()
+
+    if rank == 0:
+        common = {
+            "format": "slime_megatron_trainable_only_v1",
+            "iteration": iteration,
+            "world_size": world_size,
+            "requires_full_base_checkpoint": True,
+            "base_ref_load": getattr(args, "load", None),
+            "save_root": str(save_root),
+            "only_train_params_name_list": getattr(args, "only_train_params_name_list", None),
+            "tensor_model_parallel_size": _safe_mpu_value("get_tensor_model_parallel_world_size"),
+            "pipeline_model_parallel_size": _safe_mpu_value("get_pipeline_model_parallel_world_size"),
+            "expert_model_parallel_size": _safe_mpu_value("get_expert_model_parallel_world_size"),
+            "data_parallel_size": _safe_mpu_value("get_data_parallel_world_size", with_context_parallel=True),
+            "rank_files": [f"trainable_rank_{idx:05d}.pt" for idx in range(world_size)],
+            "created_by": "slime.megatron.trainable_only_save",
+        }
+        _atomic_write_text(
+            iteration_dir / "trainable_common.json",
+            json.dumps(common, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        )
+        _atomic_write_text(save_root / "latest_trainable_iteration.txt", f"{iteration}\n")
+        logger.info(
+            "Saved trainable-only Megatron checkpoint iteration=%s world_size=%s to %s",
+            iteration,
+            world_size,
+            iteration_dir,
+        )
+    _safe_barrier()
+
+
 def save(
     iteration: int,
     model: Sequence[DDP],
@@ -882,6 +1012,11 @@ def save(
     args = get_args()
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
+    if _env_flag("SLIME_MEGATRON_TRAINABLE_ONLY_SAVE"):
+        _save_trainable_only_checkpoint(iteration, model)
+        if should_disable_forward_pre_hook(args):
+            enable_forward_pre_hook(model)
+        return
     save_checkpoint(
         iteration,
         model,

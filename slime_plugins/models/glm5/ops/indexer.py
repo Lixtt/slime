@@ -27,9 +27,19 @@ class IndexerFunction(torch.autograd.Function):
         _, head_num, _ = index_q.shape
         logits = indexer_fwd_interface(index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits=True)
         if topk_indices is None:
-            index_score, topk_indices = torch.topk(logits, topk, dim=-1)
+            actual_topk = min(topk, logits.size(-1))
+            index_score, topk_indices = torch.topk(logits, actual_topk, dim=-1)
             topk_indices = topk_indices.to(torch.int32)
             topk_indices = topk_indices.masked_fill(index_score == -torch.inf, -1)
+            if actual_topk < topk:
+                pad_shape = (*topk_indices.shape[:-1], topk - actual_topk)
+                topk_indices = torch.cat(
+                    [
+                        topk_indices,
+                        torch.full(pad_shape, -1, dtype=topk_indices.dtype, device=topk_indices.device),
+                    ],
+                    dim=-1,
+                )
 
         index_score = pytorch_extract_topk_scores(logits, topk_indices)
 

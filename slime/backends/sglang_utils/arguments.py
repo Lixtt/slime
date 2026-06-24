@@ -114,6 +114,18 @@ def add_sglang_arguments(parser):
     ServerArgs.add_cli_args(parser)
     parser.add_argument = old_add_argument
 
+    # Some SGLang builds expose newer ServerArgs fields before exporting their
+    # CLI definitions through ServerArgs.add_cli_args(). Keep these prefixed
+    # compatibility args so slime can still forward explicit values.
+    if not any(action.dest == "sglang_attn_cp_size" for action in parser._actions):
+        parser.add_argument(
+            "--sglang-attn-cp-size",
+            dest="sglang_attn_cp_size",
+            type=int,
+            default=argparse.SUPPRESS,
+            help="Forward SGLang ServerArgs.attn_cp_size when the installed SGLang CLI omits it.",
+        )
+
     # PD disaggregation / multi-group config
     parser.add_argument(
         "--prefill-num-servers",

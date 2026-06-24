@@ -117,7 +117,10 @@ def add_sglang_arguments(parser):
     # Some SGLang builds expose newer ServerArgs fields before exporting their
     # CLI definitions through ServerArgs.add_cli_args(). Keep these prefixed
     # compatibility args so slime can still forward explicit values.
-    if not any(action.dest == "sglang_attn_cp_size" for action in parser._actions):
+    if not any(
+        action.dest == "sglang_attn_cp_size" or "--sglang-attn-cp-size" in action.option_strings
+        for action in parser._actions
+    ):
         parser.add_argument(
             "--sglang-attn-cp-size",
             dest="sglang_attn_cp_size",

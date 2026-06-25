@@ -479,6 +479,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "This is mainly useful for custom rollouts that handle padding or batching themselves."
                 ),
             )
+            parser.add_argument(
+                "--use-dynamic-global-batch-size",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help=(
+                    "Use the number of rollout samples actually returned to derive the training "
+                    "global batch size for this rollout. This is useful for custom rollouts that "
+                    "may return a short partial batch and then pad removed dummy samples later."
+                ),
+            )
 
             # partial rollout
             parser.add_argument(

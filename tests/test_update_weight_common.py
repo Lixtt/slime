@@ -85,6 +85,46 @@ def test_all_gather_object_for_group_via_gloo_filters_target_group(monkeypatch):
 
 
 @pytest.mark.unit
+def test_get_gloo_group_for_process_group_creates_reported_subgroups_in_order(monkeypatch):
+    common = _load_common_with_stubbed_deps(monkeypatch)
+    target_group = object()
+    world_gloo_group = object()
+    created = []
+
+    common.get_gloo_group = lambda: world_gloo_group
+    common.dist.get_world_size = lambda group=None: 4
+    common.dist.get_process_group_ranks = lambda group: [2, 7]
+
+    def fake_all_gather_object(obj, object_list, group):
+        assert obj == (2, 7)
+        assert group is world_gloo_group
+        object_list[:] = [
+            (5, 10),
+            (0, 3),
+            (2, 7),
+            (0, 3),
+        ]
+
+    def fake_new_group(*, ranks, backend):
+        created.append((tuple(ranks), backend))
+        return f"group:{','.join(map(str, ranks))}"
+
+    common.dist.all_gather_object = fake_all_gather_object
+    common.dist.new_group = fake_new_group
+
+    group = common.get_gloo_group_for_process_group(target_group)
+    group_again = common.get_gloo_group_for_process_group(target_group)
+
+    assert group == "group:2,7"
+    assert group_again == group
+    assert created == [
+        ((0, 3), "gloo"),
+        ((2, 7), "gloo"),
+        ((5, 10), "gloo"),
+    ]
+
+
+@pytest.mark.unit
 def test_named_params_and_buffers_trainable_only_filters_frozen_params_and_buffers(monkeypatch):
     common = _load_common_with_stubbed_deps(monkeypatch)
 

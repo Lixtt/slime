@@ -12,6 +12,38 @@ from slime.backends.megatron_utils.misc_utils import strip_param_name_prefix
 from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.types import ParamInfo
 
+_GLOO_SUBGROUP_CACHE = {}
+
+
+def get_gloo_group_for_process_group(group):
+    """Return a Gloo subgroup with the same ranks as ``group``.
+
+    The train backend normally owns NCCL Megatron groups, while metadata and
+    CPU byte tensors need Gloo.  Creating only the caller's subgroup can violate
+    PyTorch's global ``new_group`` ordering requirement, so every rank first
+    reports its target ranks over the already-initialized world Gloo group and
+    then creates all reported subgroups in deterministic order.
+    """
+
+    target_ranks = tuple(dist.get_process_group_ranks(group))
+    if target_ranks in _GLOO_SUBGROUP_CACHE:
+        return _GLOO_SUBGROUP_CACHE[target_ranks]
+
+    world_gloo_group = get_gloo_group()
+    gathered_rank_groups = [None] * dist.get_world_size(world_gloo_group)
+    dist.all_gather_object(target_ranks, gathered_rank_groups, group=world_gloo_group)
+
+    unique_rank_groups = sorted({tuple(ranks) for ranks in gathered_rank_groups})
+    for ranks in unique_rank_groups:
+        if ranks not in _GLOO_SUBGROUP_CACHE:
+            _GLOO_SUBGROUP_CACHE[ranks] = dist.new_group(ranks=list(ranks), backend="gloo")
+
+    if target_ranks not in _GLOO_SUBGROUP_CACHE:
+        # Defensive fallback for mocked or partially initialized distributed
+        # environments. Real training should have created it in the loop above.
+        _GLOO_SUBGROUP_CACHE[target_ranks] = dist.new_group(ranks=list(target_ranks), backend="gloo")
+    return _GLOO_SUBGROUP_CACHE[target_ranks]
+
 
 def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
     """

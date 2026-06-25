@@ -13,7 +13,12 @@ from slime.utils.types import ParamInfo
 
 from ..megatron_to_hf import convert_to_hf
 from ..sglang import monkey_patch_torch_reductions
-from .common import all_gather_object_for_group_via_gloo, all_gather_params_async, named_params_and_buffers
+from .common import (
+    all_gather_object_for_group_via_gloo,
+    all_gather_params_async,
+    get_gloo_group_for_process_group,
+    named_params_and_buffers,
+)
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .tensor_bytes import restore_tensor_from_cpu_byte_tensor, tensor_to_cpu_byte_tensor
 
@@ -134,16 +139,20 @@ def _broadcast_params_across_pp_ranks_via_gloo(
     param_infos: Sequence[ParamInfo],
     params: Sequence[torch.Tensor],
 ) -> None:
-    """Broadcast PP params through CPU byte buffers over the world Gloo group.
+    """Broadcast PP params through CPU byte buffers over a PP-matched Gloo group.
 
     Gloo does not reliably support every model dtype we may see here, so the
     tensor payload is sent as raw uint8 bytes and restored to the original dtype
     and shape before copying back to the CUDA tensor.
     """
 
-    gloo_group = get_gloo_group()
+    pp_group = mpu.get_pipeline_model_parallel_group()
+    pp_group_ranks = set(dist.get_process_group_ranks(pp_group))
+    gloo_group = get_gloo_group_for_process_group(pp_group)
     rank = dist.get_rank()
     for info, param in zip(param_infos, params, strict=False):
+        if info.src_rank not in pp_group_ranks:
+            continue
         if rank == info.src_rank:
             cpu_tensor = param.detach().cpu().contiguous()
             byte_tensor = tensor_to_cpu_byte_tensor(cpu_tensor)

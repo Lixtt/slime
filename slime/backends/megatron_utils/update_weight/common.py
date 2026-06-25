@@ -31,7 +31,7 @@ def get_gloo_group_for_process_group(group):
 
     world_gloo_group = get_gloo_group()
     gathered_rank_groups = [None] * dist.get_world_size(world_gloo_group)
-    dist.all_gather_object(target_ranks, gathered_rank_groups, group=world_gloo_group)
+    dist.all_gather_object(gathered_rank_groups, target_ranks, group=world_gloo_group)
 
     unique_rank_groups = sorted({tuple(ranks) for ranks in gathered_rank_groups})
     for ranks in unique_rank_groups:

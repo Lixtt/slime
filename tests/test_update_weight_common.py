@@ -95,7 +95,8 @@ def test_get_gloo_group_for_process_group_creates_reported_subgroups_in_order(mo
     common.dist.get_world_size = lambda group=None: 4
     common.dist.get_process_group_ranks = lambda group: [2, 7]
 
-    def fake_all_gather_object(obj, object_list, group):
+    def fake_all_gather_object(object_list, obj, group):
+        assert isinstance(object_list, list)
         assert obj == (2, 7)
         assert group is world_gloo_group
         object_list[:] = [

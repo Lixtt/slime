@@ -39,6 +39,8 @@ def _patch_bridge_expert_cache_to_cpu():
 class HfWeightIteratorBridge(HfWeightIteratorBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if self.trainable_only:
+            raise NotImplementedError("trainable-only rollout weight sync is only implemented for raw HF conversion.")
         self._bridge, self._hf_pretrained, _ = megatron_bridge_utils.build_bridge_for_hf_checkpoint(
             self.args.hf_checkpoint,
             load_weights=False,

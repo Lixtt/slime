@@ -299,6 +299,7 @@ def make_slime_validate_args(**overrides):
         train_backend="megatron",
         only_train_params_name_list=None,
         freeze_params_name_list=None,
+        update_weights_trainable_only=False,
         update_weight_transport="nccl",
         update_weight_disk_dir=None,
         update_weight_delta_dir=None,
@@ -378,6 +379,28 @@ def test_update_weight_delta_rejects_unknown_transport(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="supports only --update-weight-transport=nccl or disk"):
+        module._validate_update_weight_args(args)
+
+
+@pytest.mark.unit
+def test_update_weights_trainable_only_requires_only_train_params(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(update_weights_trainable_only=True, only_train_params_name_list=None)
+
+    with pytest.raises(ValueError, match="requires --only-train-params-name-list"):
+        module._validate_update_weight_args(args)
+
+
+@pytest.mark.unit
+def test_update_weights_trainable_only_requires_raw_conversion(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        update_weights_trainable_only=True,
+        only_train_params_name_list=["self_attention.linear_q_down_proj"],
+        megatron_to_hf_mode="bridge",
+    )
+
+    with pytest.raises(ValueError, match="raw HF conversion"):
         module._validate_update_weight_args(args)
 
 

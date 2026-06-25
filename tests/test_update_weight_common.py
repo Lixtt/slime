@@ -82,3 +82,35 @@ def test_all_gather_object_for_group_via_gloo_filters_target_group(monkeypatch):
 
     assert calls == {"obj": ("local", "payload"), "group": gloo_group}
     assert gathered == [(1, "rank1"), (3, "rank3")]
+
+
+@pytest.mark.unit
+def test_named_params_and_buffers_trainable_only_filters_frozen_params_and_buffers(monkeypatch):
+    common = _load_common_with_stubbed_deps(monkeypatch)
+
+    class DummyTensor:
+        def __init__(self, requires_grad):
+            self.requires_grad = requires_grad
+
+    class DummyModule:
+        def named_parameters(self):
+            return [
+                ("train.weight", DummyTensor(True)),
+                ("frozen.weight", DummyTensor(False)),
+            ]
+
+        def named_buffers(self):
+            return [
+                ("expert_bias", DummyTensor(False)),
+            ]
+
+    items = list(
+        common.named_params_and_buffers(
+            args=object(),
+            model=[DummyModule()],
+            convert_to_global_name=False,
+            trainable_only=True,
+        )
+    )
+
+    assert [name for name, _ in items] == ["vp_stages.0.train.weight"]

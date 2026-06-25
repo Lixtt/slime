@@ -51,7 +51,11 @@ class UpdateWeightFromTensor:
         self.update_weight_metrics: dict[str, float] = {}
 
         self._hf_weight_iterator = HfWeightIteratorBase.create(
-            args=args, model=model, model_name=model_name, quantization_config=quantization_config
+            args=args,
+            model=model,
+            model_name=model_name,
+            quantization_config=quantization_config,
+            trainable_only=getattr(args, "update_weights_trainable_only", False),
         )
 
         self._ipc_gather_group = None

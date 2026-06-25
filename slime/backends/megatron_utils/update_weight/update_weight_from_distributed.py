@@ -157,7 +157,11 @@ class UpdateWeightFromDistributed:
         """
         buffer_size = 0
         buffer: list[tuple[str, torch.Tensor]] = []
-        for name, param in named_params_and_buffers(self.args, self.model):
+        for name, param in named_params_and_buffers(
+            self.args,
+            self.model,
+            trainable_only=getattr(self.args, "update_weights_trainable_only", False),
+        ):
             if ".experts." in name:
                 continue
             param = all_gather_param(name, param)
@@ -185,7 +189,15 @@ class UpdateWeightFromDistributed:
         defaults to all expert params on this rank.
         """
         if params is None:
-            params = ((n, p) for n, p in named_params_and_buffers(self.args, self.model) if ".experts." in n)
+            params = (
+                (n, p)
+                for n, p in named_params_and_buffers(
+                    self.args,
+                    self.model,
+                    trainable_only=getattr(self.args, "update_weights_trainable_only", False),
+                )
+                if ".experts." in n
+            )
         buffer_size = 0
         batch: list[tuple[str, torch.Tensor]] = []
         for name, param in params:

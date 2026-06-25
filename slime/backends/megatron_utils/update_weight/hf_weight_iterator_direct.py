@@ -1,4 +1,5 @@
 import dataclasses
+import logging
 from argparse import Namespace
 from collections.abc import Sequence
 
@@ -15,11 +16,24 @@ from ..sglang import monkey_patch_torch_reductions
 from .common import all_gather_object_for_group_via_gloo, all_gather_params_async, named_params_and_buffers
 from .hf_weight_iterator_base import HfWeightIteratorBase
 
+logger = logging.getLogger(__name__)
+
 
 class HfWeightIteratorDirect(HfWeightIteratorBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.megatron_local_param_info_buckets = _get_megatron_local_param_info_buckets(self.args, self.model)
+        self.megatron_local_param_info_buckets = _get_megatron_local_param_info_buckets(
+            self.args,
+            self.model,
+            trainable_only=self.trainable_only,
+        )
+        if self.trainable_only and dist.get_rank() == 0:
+            param_count = sum(len(bucket) for bucket in self.megatron_local_param_info_buckets)
+            logger.info(
+                "Megatron raw HF weight iterator will sync %d trainable parameter group(s) in %d bucket(s).",
+                param_count,
+                len(self.megatron_local_param_info_buckets),
+            )
 
     def get_hf_weight_chunks(self, megatron_local_weights, progress_desc: str = "Update weights"):
         rank = dist.get_rank()
@@ -105,11 +119,16 @@ def _get_megatron_full_params(
     return gathered_params
 
 
-def _get_megatron_local_param_info_buckets(args: Namespace, model: Sequence[torch.nn.Module]) -> list[list[ParamInfo]]:
+def _get_megatron_local_param_info_buckets(
+    args: Namespace,
+    model: Sequence[torch.nn.Module],
+    *,
+    trainable_only: bool = False,
+) -> list[list[ParamInfo]]:
     """
     Partition params into buckets ≤ update_weight_buffer_size (with TP replication).
     """
-    param_infos = _get_megatron_local_param_infos(args, model)
+    param_infos = _get_megatron_local_param_infos(args, model, trainable_only=trainable_only)
     param_info_buckets = [[]]  # Start with one empty bucket
     buffer_size = 0  # Track current bucket size in bytes
 
@@ -135,7 +154,12 @@ def _get_megatron_local_param_info_buckets(args: Namespace, model: Sequence[torc
     return param_info_buckets
 
 
-def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Module]) -> list[ParamInfo]:
+def _get_megatron_local_param_infos(
+    args: Namespace,
+    model: Sequence[torch.nn.Module],
+    *,
+    trainable_only: bool = False,
+) -> list[ParamInfo]:
     """
     Build global param metadata: collect → exchange PP/EP → resolve duplicates (MTP virtual PP)
     by min src_rank → validate. Returns sorted ParamInfo identical across all ranks.
@@ -145,7 +169,7 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
 
     param_infos = {}
     rank = dist.get_rank()
-    for name, param in named_params_and_buffers(args, model):
+    for name, param in named_params_and_buffers(args, model, trainable_only=trainable_only):
         param_infos[name] = ParamInfo(
             name=name,
             dtype=param.dtype,
@@ -200,6 +224,15 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
         object_list=all_param_info_list,
         group=get_gloo_group(),
     )
+    if trainable_only and len(param_infos) == 0:
+        raise RuntimeError(
+            "No trainable Megatron parameters matched for rollout weight sync. "
+            "Check --only-train-params-name-list and model parameter names."
+        )
+    for infos in all_param_info_list:
+        assert len(infos) == len(param_infos), (
+            f"Parameter info length mismatch: {len(infos)} != {len(param_infos)}"
+        )
     for i, param_info in enumerate(param_infos):
         for infos in all_param_info_list:
             assert infos[i].name == param_info.name, f"Parameter name mismatch: {infos[i].name} != {param_info.name}"

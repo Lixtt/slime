@@ -567,6 +567,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Interval for updating the weights",
             )
             parser.add_argument(
+                "--update-weights-trainable-only",
+                action="store_true",
+                default=False,
+                help=(
+                    "Only synchronize Megatron parameters that require gradients when updating rollout weights. "
+                    "Use this with --only-train-params-name-list for partial fine-tuning; full HF exports remain "
+                    "unaffected."
+                ),
+            )
+            parser.add_argument(
                 "--keep-old-actor",
                 action="store_true",
                 help="Whether to keep the rollout model on training process",
@@ -1782,6 +1792,12 @@ def _resolve_update_weight_disk_dir(args) -> None:
 
 def _validate_update_weight_args(args) -> None:
     _resolve_update_weight_disk_dir(args)
+
+    if getattr(args, "update_weights_trainable_only", False):
+        if getattr(args, "train_backend", None) == "megatron" and args.megatron_to_hf_mode != "raw":
+            raise ValueError("--update-weights-trainable-only currently supports Megatron raw HF conversion only.")
+        if not getattr(args, "only_train_params_name_list", None):
+            raise ValueError("--update-weights-trainable-only requires --only-train-params-name-list.")
 
     if args.update_weight_mode == "delta":
         if args.update_weight_transport not in ("nccl", "disk"):

@@ -135,11 +135,15 @@ def named_params_and_buffers(
     model: Sequence[torch.nn.Module],
     convert_to_global_name: bool = True,
     translate_gpu_to_cpu: bool = False,
+    trainable_only: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     if convert_to_global_name:
         ans = _named_params_and_buffers_global(args, model)
     else:
         ans = _named_params_and_buffers_vanilla(model)
+
+    if trainable_only:
+        ans = ((name, tensor) for name, tensor in ans if getattr(tensor, "requires_grad", False))
 
     if translate_gpu_to_cpu:
         ans = ((name, _maybe_get_cpu_backup(tensor)) for name, tensor in ans)

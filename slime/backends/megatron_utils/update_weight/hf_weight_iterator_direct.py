@@ -34,6 +34,8 @@ class HfWeightIteratorDirect(HfWeightIteratorBase):
                 param_count,
                 len(self.megatron_local_param_info_buckets),
             )
+        if getattr(self.args, "megatron_direct_pp_broadcast_backend", "nccl") == "gloo" and dist.get_rank() == 0:
+            logger.info("Megatron raw HF weight iterator will use CPU/Gloo for PP tensor broadcasts.")
 
     def get_hf_weight_chunks(self, megatron_local_weights, progress_desc: str = "Update weights"):
         rank = dist.get_rank()
@@ -41,7 +43,11 @@ class HfWeightIteratorDirect(HfWeightIteratorBase):
         for megatron_local_param_infos in tqdm(
             self.megatron_local_param_info_buckets, disable=rank != 0, desc=progress_desc
         ):
-            megatron_full_params = _get_megatron_full_params(megatron_local_param_infos, megatron_local_weights)
+            megatron_full_params = _get_megatron_full_params(
+                self.args,
+                megatron_local_param_infos,
+                megatron_local_weights,
+            )
             hf_named_tensors = self._convert_to_hf_named_tensors(megatron_full_params, megatron_local_param_infos)
             yield hf_named_tensors
             del megatron_full_params
@@ -56,6 +62,7 @@ class HfWeightIteratorDirect(HfWeightIteratorBase):
 
 
 def _get_megatron_full_params(
+    args: Namespace,
     megatron_local_param_infos: Sequence[ParamInfo],
     megatron_local_weights,
 ) -> Sequence[torch.Tensor]:
@@ -79,16 +86,19 @@ def _get_megatron_full_params(
 
     # broadcast params across pp ranks
     if pp_size > 1:
-        handles = []
-        for info, param in zip(megatron_local_param_infos, params, strict=False):
-            if info.src_rank in dist.get_process_group_ranks(mpu.get_pipeline_model_parallel_group()):
-                handles.append(
-                    torch.distributed.broadcast(
-                        param, src=info.src_rank, group=mpu.get_pipeline_model_parallel_group(), async_op=True
+        if getattr(args, "megatron_direct_pp_broadcast_backend", "nccl") == "gloo":
+            _broadcast_params_across_pp_ranks_via_gloo(megatron_local_param_infos, params)
+        else:
+            handles = []
+            for info, param in zip(megatron_local_param_infos, params, strict=False):
+                if info.src_rank in dist.get_process_group_ranks(mpu.get_pipeline_model_parallel_group()):
+                    handles.append(
+                        torch.distributed.broadcast(
+                            param, src=info.src_rank, group=mpu.get_pipeline_model_parallel_group(), async_op=True
+                        )
                     )
-                )
-        for handle in handles:
-            handle.wait()
+            for handle in handles:
+                handle.wait()
 
     # broadcast params across ep ranks
     if ep_size > 1:
@@ -117,6 +127,42 @@ def _get_megatron_full_params(
     gathered_params = all_gather_params_async(list(zip(megatron_local_param_infos, params, strict=False)))
 
     return gathered_params
+
+
+def _broadcast_params_across_pp_ranks_via_gloo(
+    param_infos: Sequence[ParamInfo],
+    params: Sequence[torch.Tensor],
+) -> None:
+    """Broadcast PP params through CPU byte buffers over the world Gloo group.
+
+    Gloo does not reliably support every model dtype we may see here, so the
+    tensor payload is sent as raw uint8 bytes and restored to the original dtype
+    and shape before copying back to the CUDA tensor.
+    """
+
+    gloo_group = get_gloo_group()
+    rank = dist.get_rank()
+    for info, param in zip(param_infos, params, strict=False):
+        if rank == info.src_rank:
+            cpu_tensor = param.detach().cpu().contiguous()
+            byte_tensor = cpu_tensor.view(torch.uint8)
+            if byte_tensor.numel() != info.size:
+                raise RuntimeError(
+                    f"Unexpected byte size for {info.name}: {byte_tensor.numel()} != {info.size}"
+                )
+        else:
+            byte_tensor = torch.empty(info.size, dtype=torch.uint8, device="cpu")
+
+        dist.broadcast(byte_tensor, src=info.src_rank, group=gloo_group)
+        if rank != info.src_rank:
+            restored = torch.empty(info.shape, dtype=info.dtype, device="cpu")
+            restored.view(torch.uint8).copy_(byte_tensor)
+            param.copy_(restored.to(device=param.device, non_blocking=True))
+        del byte_tensor
+        if rank == info.src_rank:
+            del cpu_tensor
+
+    torch.cuda.synchronize()
 
 
 def _get_megatron_local_param_info_buckets(

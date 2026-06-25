@@ -577,6 +577,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--megatron-direct-pp-broadcast-backend",
+                choices=["nccl", "gloo"],
+                default="nccl",
+                help=(
+                    "Backend for pipeline-parallel tensor broadcasts inside the raw Megatron HF weight iterator. "
+                    "'gloo' copies tensors through CPU byte buffers and is slower but avoids cross-node NCCL PP "
+                    "broadcasts during colocated rollout weight sync."
+                ),
+            )
+            parser.add_argument(
                 "--keep-old-actor",
                 action="store_true",
                 help="Whether to keep the rollout model on training process",

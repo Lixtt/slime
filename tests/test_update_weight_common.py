@@ -1,0 +1,84 @@
+import importlib.util
+import sys
+import types
+from pathlib import Path
+
+import pytest
+
+
+def _load_common_with_stubbed_deps(monkeypatch):
+    torch_mod = types.ModuleType("torch")
+    dist_mod = types.ModuleType("torch.distributed")
+    torch_mod.Tensor = object
+    torch_mod.cat = lambda *args, **kwargs: None
+    torch_mod.nn = types.SimpleNamespace(Module=object, Parameter=object)
+    torch_mod.distributed = dist_mod
+
+    mpu_mod = types.ModuleType("megatron.core.mpu")
+    transformer_layer_mod = types.ModuleType("megatron.core.transformer.transformer_layer")
+    transformer_layer_mod.get_transformer_layer_offset = lambda *args, **kwargs: 0
+
+    misc_utils_mod = types.ModuleType("slime.backends.megatron_utils.misc_utils")
+    misc_utils_mod.strip_param_name_prefix = lambda name: name
+    distributed_utils_mod = types.ModuleType("slime.utils.distributed_utils")
+    distributed_utils_mod.get_gloo_group = lambda: None
+    types_mod = types.ModuleType("slime.utils.types")
+    types_mod.ParamInfo = object
+
+    for name, module in {
+        "torch": torch_mod,
+        "torch.distributed": dist_mod,
+        "megatron": types.ModuleType("megatron"),
+        "megatron.core": types.ModuleType("megatron.core"),
+        "megatron.core.mpu": mpu_mod,
+        "megatron.core.transformer": types.ModuleType("megatron.core.transformer"),
+        "megatron.core.transformer.transformer_layer": transformer_layer_mod,
+        "slime": types.ModuleType("slime"),
+        "slime.backends": types.ModuleType("slime.backends"),
+        "slime.backends.megatron_utils": types.ModuleType("slime.backends.megatron_utils"),
+        "slime.backends.megatron_utils.misc_utils": misc_utils_mod,
+        "slime.utils": types.ModuleType("slime.utils"),
+        "slime.utils.distributed_utils": distributed_utils_mod,
+        "slime.utils.types": types_mod,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    common_path = Path(__file__).resolve().parents[1] / "slime/backends/megatron_utils/update_weight/common.py"
+    spec = importlib.util.spec_from_file_location("_update_weight_common_under_test", common_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.unit
+def test_all_gather_object_for_group_via_gloo_filters_target_group(monkeypatch):
+    common = _load_common_with_stubbed_deps(monkeypatch)
+    target_group = object()
+    gloo_group = object()
+    calls = {}
+
+    common.get_gloo_group = lambda: gloo_group
+    common.dist.get_world_size = lambda group=None: 4
+
+    def fake_get_process_group_ranks(group):
+        assert group is target_group
+        return [1, 3]
+
+    def fake_all_gather_object(*, obj, object_list, group):
+        calls["obj"] = obj
+        calls["group"] = group
+        object_list[:] = [
+            (0, "rank0"),
+            (1, "rank1"),
+            (2, "rank2"),
+            (3, "rank3"),
+        ]
+
+    common.dist.get_process_group_ranks = fake_get_process_group_ranks
+    common.dist.all_gather_object = fake_all_gather_object
+
+    gathered = common.all_gather_object_for_group_via_gloo(("local", "payload"), target_group)
+
+    assert calls == {"obj": ("local", "payload"), "group": gloo_group}
+    assert gathered == [(1, "rank1"), (3, "rank3")]

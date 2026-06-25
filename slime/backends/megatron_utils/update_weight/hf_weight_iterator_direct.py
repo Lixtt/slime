@@ -12,7 +12,7 @@ from slime.utils.types import ParamInfo
 
 from ..megatron_to_hf import convert_to_hf
 from ..sglang import monkey_patch_torch_reductions
-from .common import all_gather_params_async, named_params_and_buffers
+from .common import all_gather_object_for_group_via_gloo, all_gather_params_async, named_params_and_buffers
 from .hf_weight_iterator_base import HfWeightIteratorBase
 
 
@@ -161,10 +161,11 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
         )
 
     if pp_size > 1:
-        param_infos_list = [None] * pp_size
-        dist.all_gather_object(
-            obj=(rank, param_infos), object_list=param_infos_list, group=mpu.get_pipeline_model_parallel_group()
+        param_infos_list = all_gather_object_for_group_via_gloo(
+            obj=(rank, param_infos),
+            group=mpu.get_pipeline_model_parallel_group(),
         )
+        assert len(param_infos_list) == pp_size, f"Expected {pp_size} PP metadata payloads, got {len(param_infos_list)}"
         for src_rank, infos in param_infos_list:
             if src_rank == rank:
                 continue
@@ -177,10 +178,11 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
                     param_infos[name] = info
 
     if ep_size > 1:
-        param_infos_list = [None] * ep_size
-        dist.all_gather_object(
-            obj=(rank, param_infos), object_list=param_infos_list, group=mpu.get_expert_model_parallel_group()
+        param_infos_list = all_gather_object_for_group_via_gloo(
+            obj=(rank, param_infos),
+            group=mpu.get_expert_model_parallel_group(),
         )
+        assert len(param_infos_list) == ep_size, f"Expected {ep_size} EP metadata payloads, got {len(param_infos_list)}"
         for src_rank, infos in param_infos_list:
             for name, info in infos.items():
                 if name not in param_infos:

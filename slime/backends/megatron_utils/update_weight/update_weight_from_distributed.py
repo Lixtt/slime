@@ -17,7 +17,7 @@ from slime.utils.distributed_utils import get_gloo_group, init_process_group
 
 from ..megatron_to_hf import convert_to_hf
 from ..sglang import DeltaSpec
-from .common import all_gather_param, named_params_and_buffers
+from .common import all_gather_object_for_group_via_gloo, all_gather_param, named_params_and_buffers
 
 
 class UpdateWeightFromDistributed:
@@ -212,8 +212,12 @@ class UpdateWeightFromDistributed:
         PP source, [] elsewhere. Clears ``named_tensors``.
         """
         names = [name for name, _ in named_tensors]
-        all_names = [None] * mpu.get_expert_model_parallel_world_size()
-        dist.all_gather_object(all_names, names, group=mpu.get_expert_model_parallel_group())
+        all_names = [
+            names for _rank, names in all_gather_object_for_group_via_gloo(names, mpu.get_expert_model_parallel_group())
+        ]
+        assert len(all_names) == mpu.get_expert_model_parallel_world_size(), (
+            f"Expected {mpu.get_expert_model_parallel_world_size()} EP name payloads, got {len(all_names)}"
+        )
 
         for names in all_names:
             assert len(named_tensors) == len(names), f"mismatch names length: {len(named_tensors)} != {len(names)}"

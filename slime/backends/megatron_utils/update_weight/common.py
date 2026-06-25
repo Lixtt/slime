@@ -9,6 +9,7 @@ from megatron.core import mpu
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
 from slime.backends.megatron_utils.misc_utils import strip_param_name_prefix
+from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.types import ParamInfo
 
 
@@ -48,6 +49,20 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
             partition_dim = 1
     param = torch.cat(param_partitions, dim=partition_dim)
     return param
+
+
+def all_gather_object_for_group_via_gloo(obj, group) -> list:
+    """Gather Python metadata over world Gloo, then keep members of ``group``.
+
+    Object collectives over Megatron's NCCL PP/EP groups can trip NCCL watchdogs
+    during large-model init. This path is CPU metadata only, so use the already
+    initialized world-size Gloo group and filter back to the intended subgroup.
+    """
+
+    target_ranks = set(dist.get_process_group_ranks(group))
+    gathered = [None] * dist.get_world_size(get_gloo_group())
+    dist.all_gather_object(obj=obj, object_list=gathered, group=get_gloo_group())
+    return [item for item in gathered if item[0] in target_ranks]
 
 
 def all_gather_params_async(

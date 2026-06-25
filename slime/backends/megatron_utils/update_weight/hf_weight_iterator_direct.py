@@ -15,6 +15,7 @@ from ..megatron_to_hf import convert_to_hf
 from ..sglang import monkey_patch_torch_reductions
 from .common import all_gather_object_for_group_via_gloo, all_gather_params_async, named_params_and_buffers
 from .hf_weight_iterator_base import HfWeightIteratorBase
+from .tensor_bytes import restore_tensor_from_cpu_byte_tensor, tensor_to_cpu_byte_tensor
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +146,7 @@ def _broadcast_params_across_pp_ranks_via_gloo(
     for info, param in zip(param_infos, params, strict=False):
         if rank == info.src_rank:
             cpu_tensor = param.detach().cpu().contiguous()
-            byte_tensor = cpu_tensor.view(torch.uint8)
+            byte_tensor = tensor_to_cpu_byte_tensor(cpu_tensor)
             if byte_tensor.numel() != info.size:
                 raise RuntimeError(
                     f"Unexpected byte size for {info.name}: {byte_tensor.numel()} != {info.size}"
@@ -155,8 +156,7 @@ def _broadcast_params_across_pp_ranks_via_gloo(
 
         dist.broadcast(byte_tensor, src=info.src_rank, group=gloo_group)
         if rank != info.src_rank:
-            restored = torch.empty(info.shape, dtype=info.dtype, device="cpu")
-            restored.view(torch.uint8).copy_(byte_tensor)
+            restored = restore_tensor_from_cpu_byte_tensor(byte_tensor, shape=info.shape, dtype=info.dtype)
             param.copy_(restored.to(device=param.device, non_blocking=True))
         del byte_tensor
         if rank == info.src_rank:

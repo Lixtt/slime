@@ -32,9 +32,6 @@ def train(args):
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
 
-    if args.offload_rollout:
-        ray.get(rollout_manager.onload_kv.remote())
-
     run_rollout_generation_quality_gate(rollout_manager, "post_initial_update")
 
     # special case for eval-only

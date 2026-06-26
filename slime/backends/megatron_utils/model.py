@@ -1019,16 +1019,19 @@ def _resolve_trainable_only_checkpoint_dir(path: str) -> Path:
 @torch.no_grad()
 def _load_trainable_only_checkpoint_if_requested(
     model: Sequence[DDP],
-) -> bool:
+) -> int | None:
     load_path = os.environ.get("SLIME_MEGATRON_TRAINABLE_ONLY_LOAD")
     if not load_path:
-        return False
+        return None
 
     checkpoint_dir = _resolve_trainable_only_checkpoint_dir(load_path)
     common_path = checkpoint_dir / "trainable_common.json"
     common = json.loads(common_path.read_text(encoding="utf-8"))
     if common.get("format") != "slime_megatron_trainable_only_v1":
         raise ValueError(f"Unsupported trainable-only checkpoint format in {common_path}: {common.get('format')}")
+    checkpoint_iteration = int(common.get("iteration", -1))
+    if checkpoint_iteration < 0:
+        raise ValueError(f"Invalid trainable-only checkpoint iteration in {common_path}: {common.get('iteration')}")
 
     rank, world_size = _dist_rank_world()
     checkpoint_world_size = int(common.get("world_size", -1))
@@ -1095,7 +1098,7 @@ def _load_trainable_only_checkpoint_if_requested(
             loaded_param_count,
             loaded_numel,
         )
-    return True
+    return checkpoint_iteration
 
 
 def save(
@@ -1171,8 +1174,10 @@ def initialize_model_and_optimizer(
         _reinitialize_critic_output_layer(model)
         if (args.fp16 or args.bf16) and optimizer is not None:
             optimizer.reload_model_params()
-    loaded_trainable_only_checkpoint = _load_trainable_only_checkpoint_if_requested(model)
-    if loaded_trainable_only_checkpoint and optimizer is not None and hasattr(optimizer, "reload_model_params"):
+    loaded_trainable_only_iteration = _load_trainable_only_checkpoint_if_requested(model)
+    if loaded_trainable_only_iteration is not None:
+        iteration = loaded_trainable_only_iteration
+    if loaded_trainable_only_iteration is not None and optimizer is not None and hasattr(optimizer, "reload_model_params"):
         optimizer.reload_model_params()
     clear_memory()
 

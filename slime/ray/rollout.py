@@ -704,7 +704,7 @@ class RolloutManager:
 
     def _compute_dynamic_global_batch_size(self, num_samples: int, target_steps: int | None = None) -> int:
         """Calculate dynamic global_batch_size from actual rollout samples."""
-        dp_size = self.train_parallel_config["dp_size"]
+        dp_size = self._get_train_parallel_config()["dp_size"]
         original_gbs = self.args.global_batch_size
 
         desired_steps = int(target_steps) if target_steps is not None and target_steps > 0 else 1
@@ -725,6 +725,62 @@ class RolloutManager:
             )
 
         return dynamic_gbs
+
+    def _get_train_parallel_config(self) -> dict:
+        config = getattr(self, "train_parallel_config", None)
+        if config is not None:
+            return config
+
+        def _positive_int(name: str, default: int = 1) -> int:
+            value = getattr(self.args, name, default)
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                value = default
+            return max(1, value)
+
+        world_size = getattr(self.args, "world_size", None)
+        try:
+            world_size = int(world_size)
+        except (TypeError, ValueError):
+            world_size = 0
+        if world_size <= 0:
+            world_size = _positive_int("actor_num_nodes", 1) * _positive_int("actor_num_gpus_per_node", 1)
+
+        tp_size = _positive_int("tensor_model_parallel_size", 1)
+        pp_size = _positive_int("pipeline_model_parallel_size", 1)
+        cp_size = _positive_int("context_parallel_size", 1)
+        parallel_product = tp_size * pp_size * cp_size
+        dp_size = max(1, world_size // parallel_product) if world_size > 0 else 1
+
+        if world_size > 0 and world_size % parallel_product != 0:
+            logger.warning(
+                "Inferring fallback train_parallel_config with non-divisible world size: "
+                "world_size=%d, tp=%d, pp=%d, cp=%d. Using dp_size=%d.",
+                world_size,
+                tp_size,
+                pp_size,
+                cp_size,
+                dp_size,
+            )
+        else:
+            logger.warning(
+                "Inferring fallback train_parallel_config for RolloutManager: "
+                "world_size=%d, tp=%d, pp=%d, cp=%d, dp=%d.",
+                world_size,
+                tp_size,
+                pp_size,
+                cp_size,
+                dp_size,
+            )
+
+        self.train_parallel_config = {
+            "dp_size": dp_size,
+            "cp_size": cp_size,
+            "vpp_size": _positive_int("virtual_pipeline_model_parallel_size", 1),
+            "microbatch_group_size_per_vp_stage": _positive_int("microbatch_group_size_per_vp_stage", 1),
+        }
+        return self.train_parallel_config
 
     def _save_debug_rollout_data(self, data, rollout_id, evaluation: bool):
         # TODO to be refactored (originally Buffer._set_data)
@@ -813,7 +869,7 @@ class RolloutManager:
                 )
             return dummy_samples
 
-        dp_size = self.train_parallel_config["dp_size"]
+        dp_size = self._get_train_parallel_config()["dp_size"]
         target_group_count = None
         if getattr(self.args, "use_dynamic_global_batch_size", False):
             target_steps = getattr(self.args, "num_steps_per_rollout", None)
@@ -951,13 +1007,14 @@ class RolloutManager:
         ``global_batch_size`` groups so the training-step count per rollout is
         stable even when a rollout produced multiple training samples.
         """
-        dp_size = self.train_parallel_config["dp_size"]
+        train_parallel_config = self._get_train_parallel_config()
+        dp_size = train_parallel_config["dp_size"]
         total_lengths = [len(t) for t in data["tokens"]]
         data["total_lengths"] = total_lengths
 
         partitions, micro_batch_indices, num_microbatches, global_batch_sizes = build_dp_schedule(
             self.args,
-            self.train_parallel_config,
+            train_parallel_config,
             total_lengths,
             global_batch_size=getattr(self, "_dynamic_global_batch_size", self.args.global_batch_size),
             group_indices=data["group_ids"],

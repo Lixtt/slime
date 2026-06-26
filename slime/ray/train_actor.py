@@ -124,5 +124,6 @@ class TrainRayActor(RayActor):
 
     def set_rollout_manager(self, rollout_manager):
         self.rollout_manager = rollout_manager
-        if not self.args.debug_rollout_only and self.args.rank == 0:
+        rank = getattr(self.args, "rank", getattr(self, "_rank", 0))
+        if rank == 0 and hasattr(self, "train_parallel_config"):
             ray.get(self.rollout_manager.set_train_parallel_config.remote(self.train_parallel_config))

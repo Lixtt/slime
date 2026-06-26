@@ -170,6 +170,31 @@ def test_dynamic_global_batch_keeps_short_rollout_until_dummy_padding():
     assert rollout_data_refs[1]["global_batch_sizes"] == [2]
 
 
+def test_dynamic_global_batch_infers_missing_train_parallel_config():
+    _install_rollout_import_stubs()
+    rollout = importlib.import_module("slime.ray.rollout")
+
+    manager = object.__new__(rollout.RolloutManager)
+    manager.args = types.SimpleNamespace(
+        global_batch_size=8,
+        world_size=40,
+        tensor_model_parallel_size=8,
+        pipeline_model_parallel_size=5,
+        context_parallel_size=1,
+        virtual_pipeline_model_parallel_size=None,
+        microbatch_group_size_per_vp_stage=None,
+    )
+
+    assert not hasattr(manager, "train_parallel_config")
+    assert manager._compute_dynamic_global_batch_size(12, target_steps=8) == 1
+    assert manager.train_parallel_config == {
+        "dp_size": 1,
+        "cp_size": 1,
+        "vpp_size": 1,
+        "microbatch_group_size_per_vp_stage": 1,
+    }
+
+
 def test_empty_rollout_batch_is_padded_with_dummy_samples():
     _install_rollout_import_stubs()
     rollout = importlib.import_module("slime.ray.rollout")

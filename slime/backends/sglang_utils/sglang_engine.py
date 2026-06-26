@@ -275,6 +275,12 @@ class SGLangEngine(RayActor):
             raise
         return response.json()
 
+    def _local_process_alive_or_unknown(self) -> bool:
+        process = getattr(self, "process", None)
+        if process is None:
+            return True
+        return process.is_alive()
+
     def health_generate(self, timeout: float = 5.0) -> bool:
         """Run /health_generate on the underlying SGLang HTTP server.
 
@@ -410,8 +416,12 @@ class SGLangEngine(RayActor):
                     break
                 logger.info(f"Error flushing cache: HTTP {response.status_code} {response.text!r}")
                 time.sleep(1)
-            except NewConnectionError as e:
-                raise e
+            except requests.exceptions.ConnectionError as e:
+                if not self._local_process_alive_or_unknown():
+                    raise
+                logger.info(f"Error flushing cache: {e}")
+                time.sleep(1)
+                continue
             except Exception as e:
                 logger.info(f"Error flushing cache: {e}")
                 time.sleep(1)
@@ -476,7 +486,20 @@ class SGLangEngine(RayActor):
         return self._make_request("update_weight_version", {"new_version": str(new_version)})
 
     def release_memory_occupation(self):
-        self.flush_cache()
+        try:
+            self.flush_cache()
+        except requests.exceptions.ConnectionError as e:
+            if not self._local_process_alive_or_unknown():
+                logger.warning(
+                    "Skip release_memory_occupation for dead SGLang server process "
+                    f"{self.server_host}:{self.server_port}: {e}"
+                )
+                return {
+                    "skipped": True,
+                    "reason": "server_process_not_alive",
+                    "url": f"http://{self.server_host}:{self.server_port}",
+                }
+            raise
         return self._make_request("release_memory_occupation")
 
     def resume_memory_occupation(self, tags: list[str] = None):

@@ -4,6 +4,7 @@ from slime.ray.placement_group import create_placement_groups, create_rollout_ma
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking
 from slime.utils.misc import should_run_periodic_action
+from slime.utils.rollout_quality_gate import run_rollout_generation_quality_gate
 
 
 # The framework supports other asynchronous approaches such as fully async (which is shown in examples/full_async).
@@ -21,11 +22,15 @@ def train(args):
     # create the actor and critic models
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
 
+    run_rollout_generation_quality_gate(rollout_manager, "pre_initial_update")
+
     # Always push actor weights to rollout once weights are loaded.
     actor_model.update_weights()
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
+
+    run_rollout_generation_quality_gate(rollout_manager, "post_initial_update")
 
     # async train loop.
     rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
@@ -67,6 +72,7 @@ def train(args):
             rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
             rollout_data_next_future = None
             actor_model.update_weights()
+            run_rollout_generation_quality_gate(rollout_manager, f"post_update_{rollout_id}")
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))

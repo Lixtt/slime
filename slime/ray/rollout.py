@@ -632,6 +632,11 @@ class RolloutManager:
     def check_weights(self, action: str):
         return ray.get([engine.check_weights.remote(action=action) for engine in self.rollout_engines])
 
+    def generation_quality_check(self, label: str = ""):
+        srv = self._get_updatable_server() or self.server
+        engines = srv.engines if srv else []
+        return ray.get([engine.generation_quality_check.remote(label=label) for engine in engines])
+
     def _get_rollout_data(self, rollout_id):
         if self.args.load_debug_rollout_data:
             data = torch.load(

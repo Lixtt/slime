@@ -1,9 +1,12 @@
 import dataclasses
 import ipaddress
+import json
 import logging
 import multiprocessing
 import os
+import re
 import time
+from collections import Counter
 from urllib.parse import quote
 
 import requests
@@ -293,6 +296,82 @@ class SGLangEngine(RayActor):
         )
         response.raise_for_status()
         return True
+
+    def generation_quality_check(self, label: str = "") -> dict | None:
+        if self.node_rank != 0:
+            return None
+
+        prompt = os.environ.get("ROLLOUT_GENERATION_QUALITY_GATE_PROMPT", "Answer exactly with the digit 2.")
+        expected_regex = os.environ.get("ROLLOUT_GENERATION_QUALITY_GATE_EXPECTED_REGEX", r"^\s*2\s*$")
+        max_tokens = int(os.environ.get("ROLLOUT_GENERATION_QUALITY_GATE_MAX_TOKENS", "16"))
+        timeout = float(os.environ.get("ROLLOUT_GENERATION_QUALITY_GATE_TIMEOUT_SEC", "120"))
+        max_repeat_ratio = float(os.environ.get("ROLLOUT_GENERATION_QUALITY_GATE_MAX_REPEAT_CHAR_RATIO", "0.8"))
+        require_nonempty_content = str(
+            os.environ.get("ROLLOUT_GENERATION_QUALITY_GATE_REQUIRE_NONEMPTY_CONTENT", "1")
+        ).lower() in {"1", "true", "yes", "on"}
+        extra_body = os.environ.get("ROLLOUT_GENERATION_QUALITY_GATE_EXTRA_BODY_JSON", "")
+
+        payload = {
+            "model": getattr(self.args, "model_name", None) or "default",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": 0,
+            "top_p": 1,
+            "stream": False,
+        }
+        if extra_body:
+            try:
+                extra_payload = json.loads(extra_body)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid ROLLOUT_GENERATION_QUALITY_GATE_EXTRA_BODY_JSON: {exc}") from exc
+            if not isinstance(extra_payload, dict):
+                raise ValueError("ROLLOUT_GENERATION_QUALITY_GATE_EXTRA_BODY_JSON must decode to an object")
+            payload.update(extra_payload)
+
+        url = f"http://{self.server_host}:{self.server_port}/v1/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        api_key = getattr(self.args, "sglang_api_key", None)
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        response = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        response.raise_for_status()
+        data = response.json()
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        content = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+        if not isinstance(content, str):
+            content = json.dumps(content, ensure_ascii=False)
+        if not isinstance(reasoning, str):
+            reasoning = json.dumps(reasoning, ensure_ascii=False)
+        finish_reason = choice.get("finish_reason")
+
+        errors = []
+        if require_nonempty_content and not content.strip():
+            errors.append("empty content")
+        if expected_regex and not re.search(expected_regex, content, flags=re.DOTALL):
+            errors.append(f"content does not match {expected_regex!r}")
+
+        repeat_text = "".join(ch for ch in (content + reasoning) if not ch.isspace())
+        repeat_ratio = 0.0
+        if repeat_text:
+            repeat_ratio = max(Counter(repeat_text).values()) / len(repeat_text)
+            if repeat_ratio > max_repeat_ratio:
+                errors.append(f"repeat_char_ratio {repeat_ratio:.3f} exceeds {max_repeat_ratio:.3f}")
+
+        return {
+            "ok": not errors,
+            "label": label,
+            "engine_rank": self.rank,
+            "url": url,
+            "errors": errors,
+            "finish_reason": finish_reason,
+            "content_preview": content[:512],
+            "reasoning_preview": reasoning[:512],
+            "repeat_char_ratio": repeat_ratio,
+            "usage": data.get("usage") or {},
+        }
 
     def update_weights_from_tensor(
         self,

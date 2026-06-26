@@ -4,6 +4,7 @@ from slime.ray.placement_group import create_placement_groups, create_rollout_ma
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking
 from slime.utils.misc import should_run_periodic_action
+from slime.utils.rollout_quality_gate import run_rollout_generation_quality_gate
 
 
 def train(args):
@@ -21,6 +22,9 @@ def train(args):
 
     if args.offload_rollout:
         ray.get(rollout_manager.onload_weights.remote())
+        ray.get(rollout_manager.onload_kv.remote())
+
+    run_rollout_generation_quality_gate(rollout_manager, "pre_initial_update")
 
     # Always push actor weights to rollout once weights are loaded.
     actor_model.update_weights()
@@ -30,6 +34,8 @@ def train(args):
 
     if args.offload_rollout:
         ray.get(rollout_manager.onload_kv.remote())
+
+    run_rollout_generation_quality_gate(rollout_manager, "post_initial_update")
 
     # special case for eval-only
     if args.num_rollout == 0 and args.eval_interval is not None:
@@ -90,6 +96,8 @@ def train(args):
 
         if args.offload_rollout:
             ray.get(rollout_manager.onload_kv.remote())
+
+        run_rollout_generation_quality_gate(rollout_manager, f"post_update_{rollout_id}")
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))

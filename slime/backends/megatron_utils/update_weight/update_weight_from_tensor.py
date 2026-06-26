@@ -182,9 +182,14 @@ class UpdateWeightFromTensor:
         # IPC handles are now released by the consumers.  Clean them up.
         torch.cuda.ipc_collect()
 
-        # int4/fp4 post_process
         if rank == 0:
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            # Quantized rollout weights need the same post-load processing that
+            # SGLang runs during initial model load. FP8 uses it to refresh
+            # packed/fused derived tensors after online trainable-only updates.
+            if self.quantization_config and self.quantization_config["quant_method"] in [
+                "compressed-tensors",
+                "fp8",
+            ]:
                 post_process_weights(
                     restore_weights_before_load=False,
                     post_process_quantization=True,

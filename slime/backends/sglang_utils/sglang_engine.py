@@ -604,7 +604,26 @@ class SGLangEngine(RayActor):
         )
 
     def pause_generation(self):
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/pause_generation", json={})
+        if self.node_rank != 0:
+            return
+        try:
+            response = requests.post(
+                f"http://{self.server_host}:{self.server_port}/pause_generation",
+                json={},
+                timeout=30,
+            )
+        except requests.exceptions.RequestException as e:
+            if not self._local_process_alive_or_unknown():
+                logger.warning(
+                    "Skip pause_generation for dead SGLang server process "
+                    f"{self.server_host}:{self.server_port}: {e}"
+                )
+                return {
+                    "skipped": True,
+                    "reason": "server_process_not_alive",
+                    "url": f"http://{self.server_host}:{self.server_port}",
+                }
+            raise
         response.raise_for_status()
         return response
 

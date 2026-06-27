@@ -18,3 +18,26 @@ def test_training_loop_still_resumes_kv_after_rollout_offload():
 
     assert "rollout_manager.offload.remote()" in train_loop
     assert "rollout_manager.onload_kv.remote()" in train_loop
+
+
+def test_rollout_offload_pauses_generation_before_memory_release():
+    source = Path("slime/slime/ray/rollout.py").read_text()
+    offload_body = source.split("    def offload(self):", 1)[1].split("\n    def onload", 1)[0]
+
+    assert "engine.pause_generation.remote()" in offload_body
+    assert "engine.release_memory_occupation.remote()" in offload_body
+    assert offload_body.index("pause_generation") < offload_body.index("release_memory_occupation")
+
+
+def test_rollout_onload_continues_generation_after_kv_cache_resume():
+    source = Path("slime/slime/ray/rollout.py").read_text()
+    onload_body = source.split("    def onload(self, tags: list[str] | None = None):", 1)[1].split(
+        "\n    def onload_weights_from_disk",
+        1,
+    )[0]
+
+    assert "engine.resume_memory_occupation.remote(tags=tags)" in onload_body
+    assert "GPU_MEMORY_TYPE_KV_CACHE" in onload_body
+    assert "GPU_MEMORY_TYPE_CUDA_GRAPH" in onload_body
+    assert "engine.continue_generation.remote()" in onload_body
+    assert onload_body.index("resume_memory_occupation") < onload_body.index("continue_generation")

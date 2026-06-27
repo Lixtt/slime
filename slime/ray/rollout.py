@@ -247,24 +247,45 @@ class ServerGroup:
         return init_handles, port_cursors
 
     def offload(self):
-        """Fire release_memory_occupation on all engines (non-blocking).
+        """Pause generation, then release memory occupation on all engines.
 
-        Returns a list of Ray ObjectRefs.  Skipped for groups that do not
-        overlap with megatron GPUs (``needs_offload=False``).
+        SGLang refuses ``flush_cache`` while requests are still running.  The
+        memory-release endpoint flushes internally, so offload has to follow
+        the same pause-before-flush sequence used by online weight updates.
+        Returns release ObjectRefs.  Skipped for groups that do not overlap
+        with megatron GPUs (``needs_offload=False``).
         """
         if not self.needs_offload:
             return []
-        return [engine.release_memory_occupation.remote() for engine in self.engines if engine is not None]
+        engines = [engine for engine in self.engines if engine is not None]
+        if not engines:
+            return []
+        ray.get([engine.pause_generation.remote() for engine in engines])
+        return [engine.release_memory_occupation.remote() for engine in engines]
 
     def onload(self, tags: list[str] | None = None):
-        """Fire resume_memory_occupation on all engines (non-blocking).
+        """Resume memory occupation on all engines.
 
-        Returns a list of Ray ObjectRefs.  Skipped for groups that do not
-        overlap with megatron GPUs (``needs_offload=False``).
+        Generation is continued only after the KV/cache side is restored.  This
+        pairs with ``offload`` pausing generation, while avoiding a window where
+        requests can run after weights are restored but before KV/cache memory
+        is available.
+        Returns final continue ObjectRefs when generation is resumed; otherwise
+        returns an empty list.  Skipped for groups that do not overlap with
+        megatron GPUs (``needs_offload=False``).
         """
         if not self.needs_offload:
             return []
-        return [engine.resume_memory_occupation.remote(tags=tags) for engine in self.engines if engine is not None]
+        engines = [engine for engine in self.engines if engine is not None]
+        if not engines:
+            return []
+        ray.get([engine.resume_memory_occupation.remote(tags=tags) for engine in engines])
+        should_continue = tags is None or any(
+            tag in {GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH} for tag in tags
+        )
+        if should_continue:
+            return [engine.continue_generation.remote() for engine in engines]
+        return []
 
     def onload_weights_from_disk(self):
         """Reload weights from ``model_path`` for non-updatable groups.

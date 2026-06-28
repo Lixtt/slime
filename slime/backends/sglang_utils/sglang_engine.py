@@ -163,6 +163,22 @@ class SGLangEngine(RayActor):
     ):
         self.router_ip = router_ip if router_ip is not None else self.args.sglang_router_ip
         self.router_port = router_port if router_port is not None else self.args.sglang_router_port
+        env_audit_keys = (
+            "SGLANG_DSA_FUSE_TOPK",
+            "SGLANG_NSA_FUSE_TOPK",
+            "SGLANG_DSA_TOPK_BACKEND",
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK",
+            "SGLANG_JIT_DEEPGEMM_PRECOMPILE",
+            "SGLANG_ENABLE_JIT_DEEPGEMM",
+            "NVSHMEM_DISABLE_NCCL",
+            "MLP_SKIP_SORT_RDMA",
+        )
+        logger.info(
+            "SGLangEngine env audit rank=%s worker_type=%s %s",
+            self.rank,
+            self.worker_type,
+            " ".join(f"{key}={os.environ.get(key, '<unset>')}" for key in env_audit_keys),
+        )
 
         host = host or get_host_info()[1]
 

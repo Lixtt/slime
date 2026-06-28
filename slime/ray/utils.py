@@ -4,6 +4,7 @@ import os
 import ray
 import torch
 from slime.ray.ray_actor import RayActor
+from slime.utils.ray_env import collect_ray_runtime_env_passthrough
 
 # Refer to
 # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/nvidia_gpu.py#L95-L96
@@ -30,7 +31,7 @@ RAY_DEFAULT_ENV_VARS = {
 
 
 def add_default_ray_env_vars(env_vars: dict[str, str] | None = None) -> dict[str, str]:
-    return RAY_DEFAULT_ENV_VARS | (env_vars or {})
+    return RAY_DEFAULT_ENV_VARS | collect_ray_runtime_env_passthrough() | (env_vars or {})
 
 
 def ray_noset_visible_devices(env_vars=os.environ):

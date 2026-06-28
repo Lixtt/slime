@@ -12,10 +12,25 @@ from pathlib import Path
 
 from slime.utils.external_utils.typer_utils import dataclass_cli
 from slime.utils.misc import exec_command
+from slime.utils.ray_env import collect_ray_runtime_env_passthrough, format_env_key_list
 
 _ = exec_command, dataclass_cli
 
 repo_base_dir = Path(os.path.abspath(__file__)).resolve().parents[3]
+
+
+def _ray_job_pythonpath() -> str:
+    parts = ["/root/Megatron-LM/", str(repo_base_dir)]
+    current = os.environ.get("PYTHONPATH", "")
+    if current:
+        parts.extend(item for item in current.split(os.pathsep) if item)
+    deduped = []
+    seen = set()
+    for item in parts:
+        if item and item not in seen:
+            deduped.append(item)
+            seen.add(item)
+    return os.pathsep.join(deduped)
 
 
 def convert_checkpoint(
@@ -137,7 +152,7 @@ def execute_train(
     runtime_env_json = json.dumps(
         {
             "env_vars": {
-                "PYTHONPATH": "/root/Megatron-LM/",
+                "PYTHONPATH": _ray_job_pythonpath(),
                 "RAY_USE_UVLOOP": "0",
                 "CUDA_DEVICE_MAX_CONNECTIONS": "1",
                 "NCCL_NVLS_ENABLE": str(int(check_has_nvlink())),
@@ -154,11 +169,14 @@ def execute_train(
                     if config.cuda_core_dump
                     else {}
                 ),
+                **collect_ray_runtime_env_passthrough(),
                 **extra_env_vars,
                 **_parse_extra_env_vars(config.extra_env_vars),
             }
         }
     )
+    runtime_env_keys = json.loads(runtime_env_json)["env_vars"]
+    print(f"ray_runtime_env_passthrough_keys={format_env_key_list(runtime_env_keys)}")
 
     if get_bool_env_var("SLIME_SCRIPT_ENABLE_RAY_SUBMIT", "1"):
         cmd_megatron_model_source = (

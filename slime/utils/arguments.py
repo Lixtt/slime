@@ -581,6 +581,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--update-weights-initial-full-sync",
+                action="store_true",
+                default=False,
+                help=(
+                    "When using --update-weights-trainable-only, synchronize all rollout weights for the first "
+                    "online update, then switch to trainable-only updates. This keeps rollout and training bases "
+                    "aligned before fast partial updates."
+                ),
+            )
+            parser.add_argument(
                 "--megatron-direct-pp-broadcast-backend",
                 choices=["nccl", "gloo"],
                 default="nccl",
@@ -1812,6 +1822,8 @@ def _validate_update_weight_args(args) -> None:
             raise ValueError("--update-weights-trainable-only currently supports Megatron raw HF conversion only.")
         if not getattr(args, "only_train_params_name_list", None):
             raise ValueError("--update-weights-trainable-only requires --only-train-params-name-list.")
+    elif getattr(args, "update_weights_initial_full_sync", False):
+        raise ValueError("--update-weights-initial-full-sync requires --update-weights-trainable-only.")
 
     if args.update_weight_mode == "delta":
         if args.update_weight_transport not in ("nccl", "disk"):

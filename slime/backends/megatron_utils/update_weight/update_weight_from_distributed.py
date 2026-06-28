@@ -154,6 +154,14 @@ class UpdateWeightFromDistributed:
         Hook for each HF chunk in ``_send_weights`` before its broadcast. No-op by default.
         """
 
+    def _trainable_only_for_current_update(self) -> bool:
+        if not getattr(self.args, "update_weights_trainable_only", False):
+            return False
+        return not (
+            self.weight_version == 1
+            and getattr(self.args, "update_weights_initial_full_sync", False)
+        )
+
     def _iter_non_expert_chunks(self) -> Iterator[list[tuple[str, torch.Tensor]]]:
         """
         Yield broadcast-sized HF chunks of non-expert params: TP all-gather +
@@ -165,7 +173,7 @@ class UpdateWeightFromDistributed:
         for name, param in named_params_and_buffers(
             self.args,
             self.model,
-            trainable_only=getattr(self.args, "update_weights_trainable_only", False),
+            trainable_only=self._trainable_only_for_current_update(),
         ):
             if ".experts." in name:
                 continue
@@ -199,7 +207,7 @@ class UpdateWeightFromDistributed:
                 for n, p in named_params_and_buffers(
                     self.args,
                     self.model,
-                    trainable_only=getattr(self.args, "update_weights_trainable_only", False),
+                    trainable_only=self._trainable_only_for_current_update(),
                 )
                 if ".experts." in n
             )

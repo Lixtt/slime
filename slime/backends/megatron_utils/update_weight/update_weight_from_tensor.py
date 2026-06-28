@@ -57,6 +57,17 @@ class UpdateWeightFromTensor:
             quantization_config=quantization_config,
             trainable_only=getattr(args, "update_weights_trainable_only", False),
         )
+        self._full_hf_weight_iterator = None
+        if getattr(args, "update_weights_trainable_only", False) and getattr(
+            args, "update_weights_initial_full_sync", False
+        ):
+            self._full_hf_weight_iterator = HfWeightIteratorBase.create(
+                args=args,
+                model=model,
+                model_name=model_name,
+                quantization_config=quantization_config,
+                trainable_only=False,
+            )
 
         self._ipc_gather_group = None
         self._ipc_gather_src = None
@@ -168,7 +179,16 @@ class UpdateWeightFromTensor:
 
         megatron_local_weights = self.weights_getter()
 
-        for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+        weight_iterator = self._hf_weight_iterator
+        progress_desc = "Update weights"
+        if self.weight_version == 1 and self._full_hf_weight_iterator is not None:
+            weight_iterator = self._full_hf_weight_iterator
+            progress_desc = "Initial full update weights"
+
+        for hf_named_tensors in weight_iterator.get_hf_weight_chunks(
+            megatron_local_weights,
+            progress_desc=progress_desc,
+        ):
             refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
             ray.get(refs)
             # Free GPU tensors so the caching allocator can reuse the blocks,

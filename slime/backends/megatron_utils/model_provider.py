@@ -19,6 +19,8 @@ from megatron.training.arguments import core_transformer_config_from_args
 
 from slime.utils.misc import load_function
 
+from .lora import apply_megatron_lora
+
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
 class LinearForLastLayer(torch.nn.Linear):
@@ -115,9 +117,8 @@ def _get_model_provider_func(
         # Bridge providers are constructed from HF config and ignore most CLI flags
         # forwarded to TransformerConfig in the raw path. Activation-recompute is
         # the most consequential one for long-context RL memory.
-        skip_full_recompute = (
-            getattr(args, "recompute_granularity", None) == "full"
-            and bool(getattr(provider, "deepstack_visual_indexes", None))
+        skip_full_recompute = getattr(args, "recompute_granularity", None) == "full" and bool(
+            getattr(provider, "deepstack_visual_indexes", None)
         )
         if skip_full_recompute:
             print(
@@ -315,7 +316,7 @@ def _get_model_provider_func(
     return model_provider
 
 
-def wrap_model_provider_with_freeze(original_provider, args):
+def wrap_model_provider_with_freeze(original_provider, args, role="actor"):
     def wrapped_provider(
         pre_process=True,
         post_process=True,
@@ -332,6 +333,8 @@ def wrap_model_provider_with_freeze(original_provider, args):
 
         model = original_provider(**provider_kwargs)
         freeze_model_params(model, args)
+        if role == "actor" and getattr(args, "use_megatron_lora", False):
+            apply_megatron_lora(model, args)
 
         return model
 
@@ -339,7 +342,7 @@ def wrap_model_provider_with_freeze(original_provider, args):
 
 
 def get_model_provider_func(args, role="actor"):
-    return wrap_model_provider_with_freeze(_get_model_provider_func(args, role), args)
+    return wrap_model_provider_with_freeze(_get_model_provider_func(args, role), args, role=role)
 
 
 def freeze_model_params(model: GPTModel, args: argparse.Namespace):

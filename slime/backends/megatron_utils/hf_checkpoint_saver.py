@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import shutil
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -29,17 +30,24 @@ def save_hf_model_to_path(
     progress_desc: str = "Save HF checkpoint",
 ) -> None:
     """Save a Megatron model as an HF checkpoint at a concrete directory."""
-    if args.megatron_to_hf_mode == "bridge":
-        save_hf_model_bridge_to_path(args, output_dir, model)
-    else:
-        save_hf_model_direct_to_path(
-            args,
-            output_dir,
-            model,
-            model_name=model_name,
-            quantization_config=quantization_config,
-            progress_desc=progress_desc,
-        )
+    merge_context = nullcontext()
+    if getattr(args, "use_megatron_lora", False):
+        from .lora import merged_megatron_lora
+
+        merge_context = merged_megatron_lora(model)
+
+    with merge_context:
+        if args.megatron_to_hf_mode == "bridge":
+            save_hf_model_bridge_to_path(args, output_dir, model)
+        else:
+            save_hf_model_direct_to_path(
+                args,
+                output_dir,
+                model,
+                model_name=model_name,
+                quantization_config=quantization_config,
+                progress_desc=progress_desc,
+            )
 
 
 def save_hf_model_direct_to_path(

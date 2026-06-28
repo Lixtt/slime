@@ -6,7 +6,6 @@ import ast
 from argparse import Namespace
 from pathlib import Path
 
-
 SLIME_ROOT = Path(__file__).resolve().parents[1]
 if str(SLIME_ROOT) not in sys.path:
     sys.path.insert(0, str(SLIME_ROOT))
@@ -80,6 +79,7 @@ def test_train_backend_fsdp_dispatches_to_fsdp_actor(monkeypatch):
     _install_minimal_ray(monkeypatch)
     ray_utils = types.ModuleType("slime.ray.utils")
     ray_utils.NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = []
+    ray_utils.add_default_ray_env_vars = lambda env_vars: env_vars
     monkeypatch.setitem(sys.modules, "slime.ray.utils", ray_utils)
 
     fsdp_pkg = types.ModuleType("slime.backends.fsdp_utils")
@@ -165,6 +165,8 @@ def test_slime_extra_args_include_fsdp_lora_defaults(monkeypatch):
     assert defaults.gradient_checkpointing is False
     assert defaults.use_lora is False
     assert defaults.lora_rank == 8
+    assert defaults.use_megatron_lora is False
+    assert defaults.megatron_lora_save_adapter_only is True
 
     parsed = parser.parse_args(
         [
@@ -189,6 +191,34 @@ def test_slime_extra_args_include_fsdp_lora_defaults(monkeypatch):
     assert parsed.lora_alpha == 256
     assert parsed.lora_target_modules == "q_proj,v_proj"
 
+    megatron_parsed = parser.parse_args(
+        [
+            "--rollout-batch-size",
+            "1",
+            "--use-megatron-lora",
+            "--lora-target-modules",
+            "linear_q_down_proj,linear_kv_down_proj",
+            "--no-megatron-lora-save-adapter-only",
+            "--megatron-lora-adapter-load",
+            "/tmp/adapter",
+            "--megatron-lora-include-experts",
+        ]
+    )
+    assert megatron_parsed.use_megatron_lora is True
+    assert megatron_parsed.lora_target_modules == "linear_q_down_proj,linear_kv_down_proj"
+    assert megatron_parsed.megatron_lora_save_adapter_only is False
+    assert megatron_parsed.megatron_lora_adapter_load == "/tmp/adapter"
+    assert megatron_parsed.megatron_lora_include_experts is True
+
+
+def test_runtime_lora_backend_switches_are_explicit():
+    source = (SLIME_ROOT.parent / "a3s-code-rl/scripts/runtime/run_a3s_code_rl.sh").read_text()
+
+    assert "--use-lora" in source
+    assert "--use-megatron-lora" in source
+    assert "TRAIN_BACKEND=fsdp" not in source
+    assert "Megatron USE_LORA=1 cannot be combined with ONLY_TRAIN_PARAMS_NAME_LIST" in source
+
 
 def test_fsdp_actor_uses_current_rollout_manager_update_api():
     source = (SLIME_ROOT / "slime/backends/fsdp_utils/actor.py").read_text()
@@ -212,11 +242,7 @@ def test_fsdp_actor_train_accepts_actor_group_external_data_kwarg():
 
     for node in module.body:
         if isinstance(node, ast.ClassDef) and node.name == "FSDPTrainRayActor":
-            train_defs = [
-                item
-                for item in node.body
-                if isinstance(item, ast.FunctionDef) and item.name == "train"
-            ]
+            train_defs = [item for item in node.body if isinstance(item, ast.FunctionDef) and item.name == "train"]
             break
     else:
         raise AssertionError("FSDPTrainRayActor class not found")

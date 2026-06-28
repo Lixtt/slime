@@ -34,6 +34,7 @@ from slime.utils.memory_utils import clear_memory
 from .checkpoint import load_checkpoint, save_checkpoint
 from .cp_utils import reduce_train_step_metrics
 from .data import DataIterator, get_batch
+from .lora import load_megatron_lora_checkpoint, save_megatron_lora_checkpoint
 from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_rollout_top_p_logprob_kwargs, loss_function
 from .model_provider import get_model_provider_func
 
@@ -1117,25 +1118,66 @@ def save(
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
     """
     args = get_args()
-    if should_disable_forward_pre_hook(args):
+    disable_hook = should_disable_forward_pre_hook(args)
+    if disable_hook:
         disable_forward_pre_hook(model)
-    if _env_flag("SLIME_MEGATRON_TRAINABLE_ONLY_SAVE"):
-        _save_trainable_only_checkpoint(iteration, model)
-        if should_disable_forward_pre_hook(args):
+    try:
+        if getattr(args, "use_megatron_lora", False) and getattr(args, "megatron_lora_save_adapter_only", True):
+            save_megatron_lora_checkpoint(model, args, iteration)
+            return
+        if _env_flag("SLIME_MEGATRON_TRAINABLE_ONLY_SAVE"):
+            _save_trainable_only_checkpoint(iteration, model)
+            return
+        save_checkpoint(
+            iteration,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far=0,
+            checkpointing_context=checkpointing_context,
+            train_data_iterator=None,
+            preprocess_common_state_dict_fn=_drop_rank_local_common_checkpoint_state,
+        )
+    finally:
+        if disable_hook:
             enable_forward_pre_hook(model)
+
+
+def _maybe_redirect_lora_adapter_load(args: Namespace) -> None:
+    if not getattr(args, "use_megatron_lora", False):
         return
-    save_checkpoint(
-        iteration,
-        model,
-        optimizer,
-        opt_param_scheduler,
-        num_floating_point_operations_so_far=0,
-        checkpointing_context=checkpointing_context,
-        train_data_iterator=None,
-        preprocess_common_state_dict_fn=_drop_rank_local_common_checkpoint_state,
+    if getattr(args, "megatron_lora_adapter_load", None):
+        return
+
+    load_path = getattr(args, "load", None)
+    if not load_path:
+        return
+    load_root = Path(load_path)
+    if not (load_root / "latest_megatron_lora_iteration.txt").is_file():
+        return
+
+    args.megatron_lora_adapter_load = str(load_root)
+    base_load = None
+    try:
+        latest_iteration = int((load_root / "latest_megatron_lora_iteration.txt").read_text(encoding="utf-8").strip())
+        metadata_path = load_root / f"iter_{latest_iteration:07d}" / "meta.json"
+        if metadata_path.is_file():
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            base_load = metadata.get("base_load") or metadata.get("base_hf_checkpoint")
+    except Exception as exc:
+        logger.warning("Could not inspect Megatron LoRA adapter metadata under %s: %s", load_root, exc)
+
+    args.load = base_load or getattr(args, "ref_load", None) or getattr(args, "hf_checkpoint", None)
+    args.no_load_optim = True
+    args.no_load_rng = True
+    args.finetune = True
+    logger.info(
+        "Detected adapter-only Megatron LoRA load root %s; loading base weights from %s and adapter from %s",
+        load_root,
+        args.load,
+        args.megatron_lora_adapter_load,
     )
-    if should_disable_forward_pre_hook(args):
-        enable_forward_pre_hook(model)
+
 
 def initialize_model_and_optimizer(
     args: Namespace, role: str = "actor"
@@ -1159,6 +1201,7 @@ def initialize_model_and_optimizer(
         filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync
         print("[ROCm] Applied FileSystemWriterAsync patch for HIP compatibility")
 
+    _maybe_redirect_lora_adapter_load(args)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
     model[0].role = role
     reinit_critic_output_layer = _critic_output_layer_needs_reinit(args, model, role)
@@ -1174,10 +1217,19 @@ def initialize_model_and_optimizer(
         _reinitialize_critic_output_layer(model)
         if (args.fp16 or args.bf16) and optimizer is not None:
             optimizer.reload_model_params()
+    loaded_lora_iteration = None
+    if getattr(args, "use_megatron_lora", False):
+        loaded_lora_iteration = load_megatron_lora_checkpoint(model, getattr(args, "megatron_lora_adapter_load", None))
+        if loaded_lora_iteration is not None:
+            iteration = loaded_lora_iteration
     loaded_trainable_only_iteration = _load_trainable_only_checkpoint_if_requested(model)
     if loaded_trainable_only_iteration is not None:
         iteration = loaded_trainable_only_iteration
-    if loaded_trainable_only_iteration is not None and optimizer is not None and hasattr(optimizer, "reload_model_params"):
+    if (
+        (loaded_lora_iteration is not None or loaded_trainable_only_iteration is not None)
+        and optimizer is not None
+        and hasattr(optimizer, "reload_model_params")
+    ):
         optimizer.reload_model_params()
     clear_memory()
 

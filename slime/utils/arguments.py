@@ -156,6 +156,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             ensure_arg("--lora-dropout", type=float, default=0.0)
             ensure_arg("--lora-target-modules", type=str, default=None)
             ensure_arg("--lora-modules-to-save", type=str, default=None)
+            ensure_arg("--use-megatron-lora", action="store_true", default=False)
+            ensure_arg("--megatron-lora-save-adapter-only", action=argparse.BooleanOptionalAction, default=True)
+            ensure_arg("--megatron-lora-adapter-load", type=str, default=None)
+            ensure_arg("--megatron-lora-include-experts", action="store_true", default=False)
             parser.add_argument(
                 "--train-env-vars",
                 type=json.loads,
@@ -2088,5 +2092,26 @@ def slime_validate_args(args):
 
     if args.only_train_params_name_list and args.freeze_params_name_list:
         raise ValueError("You can only specify ONE of: --only-train-params-name-list, or --freeze-params-name-list.")
+
+    if getattr(args, "use_lora", False) and getattr(args, "train_backend", None) != "fsdp":
+        raise ValueError("--use-lora is the FSDP LoRA path; use --use-megatron-lora with --train-backend=megatron.")
+
+    if getattr(args, "use_megatron_lora", False):
+        if getattr(args, "train_backend", None) != "megatron":
+            raise ValueError("--use-megatron-lora requires --train-backend=megatron.")
+        if getattr(args, "use_lora", False):
+            raise ValueError("Use only one LoRA backend flag: --use-lora or --use-megatron-lora.")
+        if not getattr(args, "lora_target_modules", None):
+            raise ValueError("--use-megatron-lora requires --lora-target-modules.")
+        if getattr(args, "only_train_params_name_list", None) or getattr(args, "freeze_params_name_list", None):
+            raise ValueError(
+                "--use-megatron-lora freezes base parameters itself; do not combine it with "
+                "--only-train-params-name-list or --freeze-params-name-list."
+            )
+        if getattr(args, "update_weights_trainable_only", False):
+            raise ValueError(
+                "--use-megatron-lora is incompatible with --update-weights-trainable-only. "
+                "For rollout sync, use a normal merged-weight update or experimental --update-weight-mode=delta."
+            )
 
     _validate_update_weight_args(args)

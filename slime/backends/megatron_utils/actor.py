@@ -143,7 +143,10 @@ class MegatronTrainRayActor(TrainRayActor):
             assert (
                 self.args.update_weight_mode == "full"
             ), "--update-weight-mode=delta is not supported with --colocate"
-            update_weight_cls = UpdateWeightFromTensor
+            if self.args.update_weight_transport == "disk":
+                update_weight_cls = UpdateWeightFromDisk
+            else:
+                update_weight_cls = UpdateWeightFromTensor
         elif self.args.update_weight_mode == "delta":
             # Lazy import: the delta module pulls DeltaEncoding/DeltaParam/DeltaSpec from
             # sglang, which only exist on newer images. Importing eagerly would break old

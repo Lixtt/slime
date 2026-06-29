@@ -166,6 +166,7 @@ class SGLangEngine(RayActor):
         self.router_ip = router_ip if router_ip is not None else self.args.sglang_router_ip
         self.router_port = router_port if router_port is not None else self.args.sglang_router_port
         env_audit_keys = (
+            "SGLANG_PP_LAYER_PARTITION",
             "SGLANG_DSA_FUSE_TOPK",
             "SGLANG_NSA_FUSE_TOPK",
             "SGLANG_DSA_TOPK_BACKEND",

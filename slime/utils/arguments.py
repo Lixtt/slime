@@ -601,6 +601,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--colocated-tensor-update-cpu-payload",
+                action="store_true",
+                default=False,
+                help=(
+                    "Serialize colocated rollout weight updates through CPU tensors instead of CUDA IPC handles. "
+                    "This is required when one colocated SGLang rollout engine spans multiple nodes."
+                ),
+            )
+            parser.add_argument(
                 "--keep-old-actor",
                 action="store_true",
                 help="Whether to keep the rollout model on training process",

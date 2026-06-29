@@ -1,3 +1,4 @@
+import logging
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -19,6 +20,9 @@ from .update_weight_from_distributed import (
     post_process_weights,
     update_weights_from_distributed,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class UpdateWeightFromTensor:
@@ -73,6 +77,7 @@ class UpdateWeightFromTensor:
         self._ipc_gather_src = None
         self._ipc_engine = None
         self._model_update_groups = None
+        self._ipc_force_cpu_payload = False
 
     def connect_rollout_engines(
         self,
@@ -149,6 +154,20 @@ class UpdateWeightFromTensor:
             end = start + colocate_gpu_counts[i]
             if start <= dist.get_rank() < end:
                 self._ipc_engine = engine
+                spans_nodes = colocate_gpu_counts[i] > getattr(
+                    self.args, "num_gpus_per_node", colocate_gpu_counts[i]
+                )
+                explicit_cpu_payload = getattr(self.args, "colocated_tensor_update_cpu_payload", False)
+                self._ipc_force_cpu_payload = bool(explicit_cpu_payload or spans_nodes)
+                if dist.get_rank() == start and self._ipc_force_cpu_payload:
+                    logger.info(
+                        "Using CPU payload for colocated tensor update: engine=%s ranks=%s-%s spans_nodes=%s explicit=%s",
+                        i,
+                        start,
+                        end - 1,
+                        spans_nodes,
+                        explicit_cpu_payload,
+                    )
 
     def pop_metrics(self) -> dict[str, float]:
         """
@@ -227,6 +246,7 @@ class UpdateWeightFromTensor:
             ipc_gather_src=self._ipc_gather_src,
             ipc_gather_group=self._ipc_gather_group,
             weight_version=self.weight_version,
+            force_cpu_payload=self._ipc_force_cpu_payload,
         )
         all_refs.extend(refs_colocated)
 
@@ -251,6 +271,7 @@ def _send_to_colocated_engine(
     ipc_gather_src,
     ipc_gather_group,
     weight_version,
+    force_cpu_payload: bool = False,
 ) -> tuple[list[ObjectRef], Any]:
     # Placeholder ranks (GPU slots reserved but no engine) have no gather group.
     # gather_object is only collective among group members, so we skip entirely.
@@ -273,8 +294,13 @@ def _send_to_colocated_engine(
     for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
         flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
         metadata = flattened_tensor_bucket.get_metadata()
+        flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
+        if force_cpu_payload:
+            # CUDA IPC handles are node-local. A colocated PP rollout engine can
+            # span nodes, so serialize tensor data through CPU for that path.
+            flattened_tensor = flattened_tensor.detach().cpu().contiguous()
         flattened_tensor_data = {
-            "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+            "flattened_tensor": flattened_tensor,
             "metadata": metadata,
         }
         long_live_tensors.append(flattened_tensor_data)

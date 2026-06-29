@@ -211,6 +211,7 @@ class ServerGroup:
                 self.args,
                 rank=global_rank,
                 worker_type=self.worker_type,
+                rank_offset=self.rank_offset,
                 base_gpu_id=base_gpu_id,
                 sglang_overrides=self.sglang_overrides,
                 num_gpus_per_engine=self.num_gpus_per_engine,

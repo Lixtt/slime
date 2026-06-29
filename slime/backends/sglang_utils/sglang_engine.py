@@ -140,6 +140,7 @@ class SGLangEngine(RayActor):
         args,
         rank: int,
         worker_type: str = "regular",
+        rank_offset: int = 0,
         base_gpu_id: int | None = None,
         sglang_overrides: dict | None = None,
         num_gpus_per_engine: int | None = None,
@@ -147,6 +148,7 @@ class SGLangEngine(RayActor):
         self.args = args
         self.rank = rank
         self.worker_type = worker_type
+        self.rank_offset = rank_offset
         self.base_gpu_id = base_gpu_id
         self.sglang_overrides = sglang_overrides or {}
         self.num_gpus_per_engine = num_gpus_per_engine
@@ -199,6 +201,7 @@ class SGLangEngine(RayActor):
         server_args_dict, external_engine_need_check_fields = _compute_server_args(
             self.args,
             self.rank,
+            self.rank_offset,
             dist_init_addr,
             nccl_port,
             host,
@@ -716,6 +719,7 @@ class SGLangEngine(RayActor):
 def _compute_server_args(
     args,
     rank,
+    rank_offset,
     dist_init_addr,
     nccl_port,
     host,
@@ -742,7 +746,10 @@ def _compute_server_args(
         os.environ["SGLANG_EXTERNAL_MODEL_PACKAGE"] = "slime_plugins.sglang_models"
 
     nnodes = max(1, _gpus_per_engine // args.num_gpus_per_node)
-    node_rank = rank % nnodes
+    local_rank = rank - rank_offset
+    if local_rank < 0:
+        raise ValueError(f"rank {rank} is smaller than rank_offset {rank_offset}")
+    node_rank = local_rank % nnodes
     base = base_gpu_id if base_gpu_id is not None else get_base_gpu_id(args, rank)
     base = _to_local_gpu_id(base)
     kwargs = {
@@ -773,6 +780,15 @@ def _compute_server_args(
         # is available for external scraping.
         "enable_metrics": True,
     }
+    logger.info(
+        "SGLang rank mapping: global_rank=%s rank_offset=%s local_rank=%s nnodes=%s node_rank=%s worker_type=%s",
+        rank,
+        rank_offset,
+        local_rank,
+        nnodes,
+        node_rank,
+        worker_type,
+    )
 
     if worker_type == "prefill":
         kwargs["disaggregation_mode"] = "prefill"

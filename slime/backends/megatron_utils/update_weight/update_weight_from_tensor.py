@@ -1,4 +1,6 @@
+import base64
 import logging
+import pickle
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -304,7 +306,11 @@ def _send_to_colocated_engine(
             "metadata": metadata,
         }
         long_live_tensors.append(flattened_tensor_data)
-        serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
+        if force_cpu_payload:
+            payload = pickle.dumps(flattened_tensor_data, protocol=pickle.HIGHEST_PROTOCOL)
+            serialized_tensors.append(base64.b64encode(payload).decode("utf-8"))
+        else:
+            serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
 
     serialized_named_tensors = (
         [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == dist.get_rank() else None

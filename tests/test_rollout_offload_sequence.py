@@ -1,7 +1,15 @@
 from pathlib import Path
 
 
-def test_initial_weight_update_does_not_resume_kv_twice():
+def test_initial_weight_update_does_not_resume_kv_before_sync():
+    source = Path("slime/train.py").read_text()
+    before_initial_update = source.split("actor_model.update_weights()", 1)[0]
+
+    assert "rollout_manager.onload_weights.remote()" in before_initial_update
+    assert "onload_kv" not in before_initial_update
+
+
+def test_initial_weight_update_resumes_kv_before_post_update_gate():
     source = Path("slime/train.py").read_text()
     initial_update_tail = source.split("actor_model.update_weights()", 1)[1]
     before_post_initial_gate = initial_update_tail.split(
@@ -9,7 +17,7 @@ def test_initial_weight_update_does_not_resume_kv_twice():
         1,
     )[0]
 
-    assert "onload_kv" not in before_post_initial_gate
+    assert "rollout_manager.onload_kv.remote()" in before_post_initial_gate
 
 
 def test_training_loop_still_resumes_kv_after_rollout_offload():

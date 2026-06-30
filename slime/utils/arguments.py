@@ -610,6 +610,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--colocated-use-distributed-weight-update",
+                action="store_true",
+                default=False,
+                help=(
+                    "Use the distributed NCCL weight-update path even when rollout engines are colocated with "
+                    "Megatron actors. This avoids CUDA-IPC and CPU gather_object payloads for colocated SGLang "
+                    "pipeline-parallel engines that span multiple nodes."
+                ),
+            )
+            parser.add_argument(
                 "--keep-old-actor",
                 action="store_true",
                 help="Whether to keep the rollout model on training process",

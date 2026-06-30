@@ -145,6 +145,8 @@ class MegatronTrainRayActor(TrainRayActor):
             ), "--update-weight-mode=delta is not supported with --colocate"
             if self.args.update_weight_transport == "disk":
                 update_weight_cls = UpdateWeightFromDisk
+            elif getattr(self.args, "colocated_use_distributed_weight_update", False):
+                update_weight_cls = UpdateWeightFromDistributed
             else:
                 update_weight_cls = UpdateWeightFromTensor
         elif self.args.update_weight_mode == "delta":

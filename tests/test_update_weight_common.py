@@ -13,6 +13,7 @@ def _load_common_with_stubbed_deps(monkeypatch):
     torch_mod.cat = lambda *args, **kwargs: None
     torch_mod.nn = types.SimpleNamespace(Module=object, Parameter=object)
     torch_mod.distributed = dist_mod
+    torch_mod.cuda = types.SimpleNamespace(is_available=lambda: False, current_device=lambda: 0)
 
     mpu_mod = types.ModuleType("megatron.core.mpu")
     transformer_layer_mod = types.ModuleType("megatron.core.transformer.transformer_layer")
@@ -155,3 +156,33 @@ def test_named_params_and_buffers_trainable_only_filters_frozen_params_and_buffe
     )
 
     assert [name for name, _ in items] == ["vp_stages.0.train.weight"]
+
+
+@pytest.mark.unit
+def test_all_gather_param_moves_cpu_non_tp_param_to_current_cuda(monkeypatch):
+    common = _load_common_with_stubbed_deps(monkeypatch)
+    calls = {}
+
+    class DummyDevice:
+        type = "cpu"
+
+    class DummyTensor:
+        tensor_model_parallel = False
+        parallel_mode = None
+
+        def __init__(self, label):
+            self.label = label
+            self.data = self
+            self.device = DummyDevice()
+
+        def to(self, *, device, non_blocking):
+            calls["device"] = device
+            calls["non_blocking"] = non_blocking
+            return DummyTensor(f"{self.label}@{device}")
+
+    common.torch.cuda = types.SimpleNamespace(is_available=lambda: True, current_device=lambda: 5)
+
+    gathered = common.all_gather_param("module.module.decoder.layers.0.self_attention.weight", DummyTensor("w"))
+
+    assert gathered.label == "w@cuda:5"
+    assert calls == {"device": "cuda:5", "non_blocking": True}

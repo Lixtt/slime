@@ -93,6 +93,7 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
 
 def _quantize_param(name, weight, weight_block_size):
     assert name.endswith(".weight"), f"Expected weight parameter, got {name}"
+    weight = _to_current_cuda_if_available(weight)
     FP8_MIN = torch.finfo(torch.float8_e4m3fn).min
     FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
     if weight_block_size is not None:
@@ -111,3 +112,12 @@ def _quantize_param(name, weight, weight_block_size):
         scale = scale.view(1)
         scale_name = name.replace(".weight", ".weight_scale")
     return [(name, qweight), (scale_name, scale)]
+
+
+def _to_current_cuda_if_available(tensor):
+    device = getattr(tensor, "device", None)
+    if getattr(device, "type", None) == "cuda":
+        return tensor
+    if not torch.cuda.is_available():
+        return tensor
+    return tensor.to(device=f"cuda:{torch.cuda.current_device()}", non_blocking=True)

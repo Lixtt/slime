@@ -17,7 +17,12 @@ from slime.utils.distributed_utils import get_gloo_group, init_process_group
 
 from ..megatron_to_hf import convert_to_hf
 from ..sglang import DeltaSpec
-from .common import all_gather_object_for_group_via_gloo, all_gather_param, named_params_and_buffers
+from .common import (
+    all_gather_object_for_group_via_gloo,
+    all_gather_param,
+    group_fused_qkv_a_sync_items,
+    named_params_and_buffers,
+)
 
 
 class UpdateWeightFromDistributed:
@@ -171,13 +176,19 @@ class UpdateWeightFromDistributed:
         """
         buffer_size = 0
         buffer: list[tuple[str, torch.Tensor]] = []
-        for name, param in self._iter_named_params_for_current_update():
-            if ".experts." in name:
-                continue
-            param = all_gather_param(name, param)
+        non_expert_params = [
+            (name, param)
+            for name, param in self._iter_named_params_for_current_update()
+            if ".experts." not in name
+        ]
+        for param_group in group_fused_qkv_a_sync_items(non_expert_params, lambda item: item[0]):
+            hf_chunk: list[tuple[str, torch.Tensor]] = []
+            for name, param in param_group:
+                param = all_gather_param(name, param)
+                if self._is_pp_src_rank:
+                    hf_chunk.extend(convert_to_hf(self.args, self.model_name, name, param, self.quantization_config))
             if not self._is_pp_src_rank:
                 continue
-            hf_chunk = convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
             chunk_bytes = sum(t.numel() * t.element_size() for _, t in hf_chunk)
             if buffer and buffer_size + chunk_bytes > self.args.update_weight_buffer_size:
                 yield buffer

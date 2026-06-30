@@ -127,6 +127,25 @@ def test_get_gloo_group_for_process_group_creates_reported_subgroups_in_order(mo
 
 
 @pytest.mark.unit
+def test_group_fused_qkv_a_sync_items_keeps_loader_pair_together(monkeypatch):
+    common = _load_common_with_stubbed_deps(monkeypatch)
+    items = [
+        ("module.module.decoder.layers.0.self_attention.linear_kv_down_proj.weight", "kv0"),
+        ("module.module.decoder.layers.0.self_attention.linear_q_down_proj.weight", "q0"),
+        ("module.module.decoder.layers.0.self_attention.linear_proj.weight", "out0"),
+        ("module.module.decoder.layers.1.self_attention.linear_q_down_proj.weight", "q1"),
+    ]
+
+    groups = common.group_fused_qkv_a_sync_items(items, lambda item: item[0])
+
+    assert groups == [
+        [items[0], items[1]],
+        [items[2]],
+        [items[3]],
+    ]
+
+
+@pytest.mark.unit
 def test_named_params_and_buffers_trainable_only_filters_frozen_params_and_buffers(monkeypatch):
     common = _load_common_with_stubbed_deps(monkeypatch)
 

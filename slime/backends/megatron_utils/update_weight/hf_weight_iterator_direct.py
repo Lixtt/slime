@@ -17,6 +17,7 @@ from .common import (
     all_gather_object_for_group_via_gloo,
     all_gather_params_async,
     get_gloo_group_for_process_group,
+    group_fused_qkv_a_sync_items,
     named_params_and_buffers,
 )
 from .hf_weight_iterator_base import HfWeightIteratorBase
@@ -187,24 +188,27 @@ def _get_megatron_local_param_info_buckets(
     param_info_buckets = [[]]  # Start with one empty bucket
     buffer_size = 0  # Track current bucket size in bytes
 
-    for info in param_infos:
+    for info_group in group_fused_qkv_a_sync_items(param_infos, lambda info: info.name):
+        group_size = 0
         # Expert params use expert-TP size, others use regular-TP size
-        if ".experts." in info.name:
-            tp_size = mpu.get_expert_tensor_parallel_world_size()
-        else:
-            tp_size = mpu.get_tensor_model_parallel_world_size()
+        for info in info_group:
+            if ".experts." in info.name:
+                tp_size = mpu.get_expert_tensor_parallel_world_size()
+            else:
+                tp_size = mpu.get_tensor_model_parallel_world_size()
 
-        # Full param size = shard size × TP replicas (all-gather will reconstruct full param)
-        param_size = info.size * tp_size
+            # Full param size = shard size × TP replicas (all-gather will reconstruct full param)
+            group_size += info.size * tp_size
 
-        # If adding this param exceeds limit AND current bucket has params: start new bucket
-        if buffer_size + param_size > args.update_weight_buffer_size and len(param_info_buckets[-1]) > 0:
+        # If adding this group exceeds limit AND current bucket has params: start new bucket.
+        # Some SGLang loaders need grouped params in one load_weights RPC.
+        if buffer_size + group_size > args.update_weight_buffer_size and len(param_info_buckets[-1]) > 0:
             param_info_buckets.append([])
             buffer_size = 0
 
-        # Add param to current bucket and update size
-        param_info_buckets[-1].append(info)
-        buffer_size += param_size
+        # Add group to current bucket and update size.
+        param_info_buckets[-1].extend(info_group)
+        buffer_size += group_size
 
     return param_info_buckets
 

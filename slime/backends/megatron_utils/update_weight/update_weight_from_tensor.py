@@ -15,7 +15,7 @@ from ray.actor import ActorHandle
 from slime.utils.distributed_utils import get_gloo_group
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
-from .colocated_payload import select_colocated_tensor_payload_ranks
+from .colocated_payload import select_colocated_tensor_payload_ranks, split_hf_named_tensors_for_sglang_pp
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .update_weight_from_distributed import (
     connect_rollout_engines_from_distributed,
@@ -26,6 +26,7 @@ from .update_weight_from_distributed import (
 
 
 logger = logging.getLogger(__name__)
+_LOGGED_NESTED_PP_PAYLOAD = False
 
 
 class UpdateWeightFromTensor:
@@ -261,6 +262,7 @@ class UpdateWeightFromTensor:
 
         refs_colocated, long_lived_tensors = _send_to_colocated_engine(
             hf_named_tensors,
+            args=self.args,
             ipc_engine=self._ipc_engine,
             ipc_gather_src=self._ipc_gather_src,
             ipc_gather_group=self._ipc_gather_group,
@@ -286,6 +288,7 @@ class UpdateWeightFromTensor:
 def _send_to_colocated_engine(
     hf_named_tensors: list[tuple[str, torch.Tensor]],
     *,
+    args: Namespace | None,
     ipc_engine,
     ipc_gather_src,
     ipc_gather_group,
@@ -298,6 +301,11 @@ def _send_to_colocated_engine(
         return [], None
 
     long_live_tensors = []
+    pp_size = int(getattr(args, "sglang_pp_size", 1) or 1) if args is not None else 1
+    num_layers = int(getattr(args, "num_layers", 0) or 0) if args is not None else 0
+    nested_pp_payload = pp_size > 1
+    if nested_pp_payload and num_layers <= 0:
+        raise ValueError("SGLang PP tensor update requires args.num_layers to split payloads by PP rank")
 
     if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
         converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors}
@@ -311,23 +319,31 @@ def _send_to_colocated_engine(
 
     serialized_tensors = []
     for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
-        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-        metadata = flattened_tensor_bucket.get_metadata()
-        flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
-        if force_cpu_payload:
-            # CUDA IPC handles are node-local. A colocated PP rollout engine can
-            # span nodes, so serialize tensor data through CPU for that path.
-            flattened_tensor = flattened_tensor.detach().cpu().contiguous()
-        flattened_tensor_data = {
-            "flattened_tensor": flattened_tensor,
-            "metadata": metadata,
-        }
-        long_live_tensors.append(flattened_tensor_data)
-        if force_cpu_payload:
-            payload = pickle.dumps(flattened_tensor_data, protocol=pickle.HIGHEST_PROTOCOL)
-            serialized_tensors.append(base64.b64encode(payload).decode("utf-8"))
+        if nested_pp_payload:
+            pp_named_tensors = split_hf_named_tensors_for_sglang_pp(
+                named_tensors,
+                pp_size=pp_size,
+                num_layers=num_layers,
+                partition=getattr(args, "sglang_pp_layer_partition", None),
+            )
+            serialized_tensors.append(
+                [
+                    _serialize_flattened_bucket(
+                        pp_tensors,
+                        long_live_tensors=long_live_tensors,
+                        force_cpu_payload=force_cpu_payload,
+                    )
+                    for pp_tensors in pp_named_tensors
+                ]
+            )
         else:
-            serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
+            serialized_tensors.append(
+                _serialize_flattened_bucket(
+                    named_tensors,
+                    long_live_tensors=long_live_tensors,
+                    force_cpu_payload=force_cpu_payload,
+                )
+            )
 
     serialized_named_tensors = (
         [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == dist.get_rank() else None
@@ -343,12 +359,60 @@ def _send_to_colocated_engine(
     if dist.get_rank() == ipc_gather_src:
         # TODO: here we assume all ranks have the same number of dtypes, not sure if that is correct.
         num_dtypes = len(serialized_named_tensors[0])
+        if nested_pp_payload:
+            global _LOGGED_NESTED_PP_PAYLOAD
+            if not _LOGGED_NESTED_PP_PAYLOAD:
+                logger.info(
+                    "Colocated tensor update will send nested SGLang PP payloads: pp_size=%s "
+                    "tp_payload_ranks=%s num_layers=%s partition=%s",
+                    pp_size,
+                    len(serialized_named_tensors),
+                    num_layers,
+                    getattr(args, "sglang_pp_layer_partition", None),
+                )
+                _LOGGED_NESTED_PP_PAYLOAD = True
         for i in range(num_dtypes):
+            if nested_pp_payload:
+                payload = [
+                    [rank_tensors[i][pp_rank] for rank_tensors in serialized_named_tensors]
+                    for pp_rank in range(pp_size)
+                ]
+            else:
+                payload = [tensors[i] for tensors in serialized_named_tensors]
             kwargs = {
-                "serialized_named_tensors": [tensors[i] for tensors in serialized_named_tensors],
+                "serialized_named_tensors": payload,
                 "load_format": "flattened_bucket",
                 "weight_version": str(weight_version),
             }
             refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))
 
     return refs, long_live_tensors
+
+
+def _serialize_flattened_bucket(
+    named_tensors: list[tuple[str, torch.Tensor]],
+    *,
+    long_live_tensors: list[Any],
+    force_cpu_payload: bool,
+):
+    if named_tensors:
+        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        metadata = flattened_tensor_bucket.get_metadata()
+        flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
+    else:
+        metadata = []
+        flattened_tensor = torch.empty(0, dtype=torch.uint8, device="cpu")
+
+    if force_cpu_payload:
+        # CUDA IPC handles are node-local. A colocated PP rollout engine can
+        # span nodes, so serialize tensor data through CPU for that path.
+        flattened_tensor = flattened_tensor.detach().cpu().contiguous()
+    flattened_tensor_data = {
+        "flattened_tensor": flattened_tensor,
+        "metadata": metadata,
+    }
+    long_live_tensors.append(flattened_tensor_data)
+    if force_cpu_payload:
+        payload = pickle.dumps(flattened_tensor_data, protocol=pickle.HIGHEST_PROTOCOL)
+        return base64.b64encode(payload).decode("utf-8")
+    return MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)

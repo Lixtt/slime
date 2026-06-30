@@ -41,6 +41,7 @@ class UpdateWeightFromDistributed:
         """
         self.args = args
         self.model = model
+        self.weights_getter = weights_getter
         self.model_name = model_name
         self.quantization_config = quantization_config
         self.weight_version = 0
@@ -170,11 +171,7 @@ class UpdateWeightFromDistributed:
         """
         buffer_size = 0
         buffer: list[tuple[str, torch.Tensor]] = []
-        for name, param in named_params_and_buffers(
-            self.args,
-            self.model,
-            trainable_only=self._trainable_only_for_current_update(),
-        ):
+        for name, param in self._iter_named_params_for_current_update():
             if ".experts." in name:
                 continue
             param = all_gather_param(name, param)
@@ -204,11 +201,7 @@ class UpdateWeightFromDistributed:
         if params is None:
             params = (
                 (n, p)
-                for n, p in named_params_and_buffers(
-                    self.args,
-                    self.model,
-                    trainable_only=self._trainable_only_for_current_update(),
-                )
+                for n, p in self._iter_named_params_for_current_update()
                 if ".experts." in n
             )
         buffer_size = 0
@@ -230,6 +223,33 @@ class UpdateWeightFromDistributed:
             hf_chunk = self._ep_gather_and_convert(batch)
             if hf_chunk:
                 yield hf_chunk
+
+    def _iter_named_params_for_current_update(self) -> Iterator[tuple[str, torch.Tensor]]:
+        """
+        Yield Megatron parameter metadata paired with update payload tensors.
+
+        In colocated offload mode the Megatron model tensors can be paused by
+        torch_memory_saver while rollout weights are resident. The actor keeps
+        an up-to-date CPU backup after every train step, so online sync streams
+        from that backup instead of globally resuming the paused model.
+        """
+
+        local_weights = self.weights_getter()
+        for name, model_param in named_params_and_buffers(
+            self.args,
+            self.model,
+            trainable_only=self._trainable_only_for_current_update(),
+        ):
+            backup = local_weights.get(name)
+            if backup is None:
+                if getattr(self.args, "offload_train", False):
+                    raise KeyError(
+                        f"Missing CPU actor weight backup for {name!r} during offloaded rollout weight sync. "
+                        "Refusing to read the paused Megatron model tensor."
+                    )
+                yield name, model_param
+                continue
+            yield name, _copy_megatron_param_attrs(backup, model_param)
 
     def _ep_gather_and_convert(self, named_tensors: list[tuple[str, torch.Tensor]]) -> list[tuple[str, torch.Tensor]]:
         """
@@ -301,6 +321,16 @@ class UpdateWeightFromDistributed:
         converted_named_tensors.clear()
         ray.get(self.rollout_engine_lock.release.remote())
         pbar.update(1)
+
+
+_MEGATRON_PARAM_ATTRS = ("tensor_model_parallel", "partition_dim", "partition_stride", "parallel_mode")
+
+
+def _copy_megatron_param_attrs(tensor: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    for attr in _MEGATRON_PARAM_ATTRS:
+        if hasattr(reference, attr):
+            setattr(tensor, attr, getattr(reference, attr))
+    return tensor
 
 
 def connect_rollout_engines_from_distributed(

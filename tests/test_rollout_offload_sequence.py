@@ -51,19 +51,24 @@ def test_rollout_onload_continues_generation_after_kv_cache_resume():
     assert onload_body.index("resume_memory_occupation") < onload_body.index("continue_generation")
 
 
-def test_megatron_update_resumes_paused_actor_weights_before_sync():
+def test_megatron_update_does_not_resume_all_paused_actor_weights_before_sync():
     source = Path("slime/slime/backends/megatron_utils/actor.py").read_text()
-    helper_body = source.split("def _resume_tms_train_weights_for_update():", 1)[1].split(
-        "\n\nclass MegatronTrainRayActor",
-        1,
-    )[0]
     update_body = source.split("    def update_weights(self) -> None:", 1)[1].split(
         "\n    def load_other_checkpoint",
         1,
     )[0]
 
-    assert "torch_memory_saver.resume()" in helper_body
-    assert "torch_memory_saver.pause()" in helper_body
-    assert "_resume_tms_train_weights_for_update()" in update_body
-    assert "with offload_context, train_weight_context, lora_context:" in update_body
-    assert update_body.index("train_weight_context") < update_body.index("self.weight_updater.update_weights()")
+    assert "_resume_tms_train_weights_for_update" not in source
+    assert "train_weight_context" not in update_body
+    assert "with offload_context, lora_context:" in update_body
+    assert "self.weight_updater.update_weights()" in update_body
+
+
+def test_distributed_weight_update_streams_from_actor_cpu_backup():
+    source = Path("slime/slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py").read_text()
+
+    assert "self.weights_getter = weights_getter" in source
+    assert "def _iter_named_params_for_current_update" in source
+    assert "local_weights = self.weights_getter()" in source
+    assert "Missing CPU actor weight backup" in source
+    assert "Refusing to read the paused Megatron model tensor" in source

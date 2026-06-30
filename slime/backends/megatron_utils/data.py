@@ -1,4 +1,5 @@
 import logging
+import os
 from argparse import Namespace
 from collections.abc import Sequence
 
@@ -23,6 +24,32 @@ from .cp_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _gloo_process_groups_disabled() -> bool:
+    return os.getenv("MEGATRON_DISABLE_GLOO_PROCESS_GROUPS", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _get_rollout_log_dp_group(metric_name: str, dp_src_rank: int):
+    """Return the Gloo DP*CP group used by gather_object, or skip noncritical logging.
+
+    ``gather_and_reduce_log_dict`` uses ``dist.gather_object``.  In the GLM5.2
+    long-context profile we intentionally disable Megatron's Gloo process
+    groups to avoid slow/fragile cross-node CPU collectives, so this metric
+    gather is optional.  Training, update_weights, and checkpointing do not
+    depend on it.
+    """
+    try:
+        return mpu.get_data_parallel_group_gloo(with_context_parallel=True)
+    except AssertionError:
+        if _gloo_process_groups_disabled():
+            if dist.is_initialized() and dist.get_rank() == dp_src_rank:
+                logger.warning(
+                    "Skipping %s rollout metric gather because Megatron Gloo process groups are disabled.",
+                    metric_name,
+                )
+            return None
+        raise
 
 
 def get_batch(
@@ -181,11 +208,15 @@ def gather_log_data(
     CPU multi-process unit tests directly. This function adds the
     ``metric_name`` prefix and the W&B / TB logging side effects.
     """
+    dp_src_rank = mpu.get_data_parallel_src_rank(with_context_parallel=True)
+    dp_group = _get_rollout_log_dp_group(metric_name, dp_src_rank)
+    if dp_group is None:
+        return None
     reduced = gather_and_reduce_log_dict(
         log_dict,
         dp_size=mpu.get_data_parallel_world_size(with_context_parallel=True),
-        dp_src_rank=mpu.get_data_parallel_src_rank(with_context_parallel=True),
-        dp_group=mpu.get_data_parallel_group_gloo(with_context_parallel=True),
+        dp_src_rank=dp_src_rank,
+        dp_group=dp_group,
     )
     if reduced is None:
         return None

@@ -49,3 +49,15 @@ def test_rollout_onload_continues_generation_after_kv_cache_resume():
     assert "GPU_MEMORY_TYPE_CUDA_GRAPH" in onload_body
     assert "engine.continue_generation.remote()" in onload_body
     assert onload_body.index("resume_memory_occupation") < onload_body.index("continue_generation")
+
+
+def test_megatron_update_resumes_paused_train_weights_before_sync():
+    source = Path("slime/slime/backends/megatron_utils/actor.py").read_text()
+    update_body = source.split("    def update_weights(self) -> None:", 1)[1].split(
+        "\n    def load_other_checkpoint",
+        1,
+    )[0]
+
+    assert "_resume_tms_rl_inference_model_for_update()" in update_body
+    assert "with offload_context, train_weight_context, lora_context:" in update_body
+    assert update_body.index("train_weight_context") < update_body.index("self.weight_updater.update_weights()")

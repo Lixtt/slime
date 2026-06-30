@@ -3,7 +3,7 @@ import os
 import random
 import time
 from argparse import Namespace
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import ray
@@ -43,6 +43,18 @@ from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
 logging.getLogger("megatron").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+_TMS_RL_INFERENCE_MODEL_TAG = "rl_inference_model"
+
+
+@contextmanager
+def _resume_tms_rl_inference_model_for_update():
+    """Make paused Megatron RL inference weights resident for online weight sync."""
+
+    torch_memory_saver.resume(_TMS_RL_INFERENCE_MODEL_TAG)
+    try:
+        yield
+    finally:
+        torch_memory_saver.pause(_TMS_RL_INFERENCE_MODEL_TAG)
 
 
 class MegatronTrainRayActor(TrainRayActor):
@@ -680,10 +692,18 @@ class MegatronTrainRayActor(TrainRayActor):
                 ray.get(self.rollout_manager.clear_updatable_num_new_engines.remote())
 
         offload_context = torch_memory_saver.disable() if self.args.offload_train else nullcontext()
+        # During colocated initial/post-train updates the actor is still paused
+        # by torch_memory_saver.  SGLang has only restored rollout weights, so
+        # do a narrow tag resume for Megatron weights while broadcasting them.
+        train_weight_context = (
+            _resume_tms_rl_inference_model_for_update()
+            if self.args.offload_train and not reconnect_rollout_engines
+            else nullcontext()
+        )
         lora_context = (
             merged_megatron_lora(self.model) if getattr(self.args, "use_megatron_lora", False) else nullcontext()
         )
-        with offload_context, lora_context:
+        with offload_context, train_weight_context, lora_context:
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights")

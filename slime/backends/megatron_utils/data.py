@@ -17,6 +17,7 @@ from slime.utils.types import RolloutBatch
 
 from ...utils import logging_utils
 from .cp_utils import (
+    all_reduce_numeric_log_dict,
     gather_and_reduce_log_dict,
     get_sum_of_sample_mean,
     rollout_log_metric_contribution,
@@ -30,26 +31,54 @@ def _gloo_process_groups_disabled() -> bool:
     return os.getenv("MEGATRON_DISABLE_GLOO_PROCESS_GROUPS", "").lower() in {"1", "true", "yes", "on"}
 
 
-def _get_rollout_log_dp_group(metric_name: str, dp_src_rank: int):
-    """Return the Gloo DP*CP group used by gather_object, or skip noncritical logging.
+_TENSOR_LOG_REDUCE_WARNED: set[str] = set()
 
-    ``gather_and_reduce_log_dict`` uses ``dist.gather_object``.  In the GLM5.2
-    long-context profile we intentionally disable Megatron's Gloo process
-    groups to avoid slow/fragile cross-node CPU collectives, so this metric
-    gather is optional.  Training, update_weights, and checkpointing do not
-    depend on it.
+
+def _warn_tensor_log_reduce_once(metric_name: str, dp_src_rank: int) -> None:
+    if metric_name in _TENSOR_LOG_REDUCE_WARNED:
+        return
+    _TENSOR_LOG_REDUCE_WARNED.add(metric_name)
+    if dist.is_initialized() and dist.get_rank() == dp_src_rank:
+        logger.warning(
+            "Using tensor all-reduce for %s rollout metric gather because Megatron Gloo process groups are disabled.",
+            metric_name,
+        )
+
+
+def _reduce_rollout_log_dict(
+    metric_name: str,
+    log_dict: dict[str, "float | tuple[float, float]"],
+    *,
+    dp_size: int,
+    dp_src_rank: int,
+) -> dict[str, float] | None:
+    """Reduce rollout metrics with object gather, or tensor all-reduce without Gloo.
+
+    The default path keeps Megatron's Gloo DP*CP group and
+    ``dist.gather_object``.  GLM5.2 long-context runs can disable those Gloo
+    groups to avoid slow cross-node CPU collectives; in that case we encode the
+    numeric log values into a tensor and reduce over the regular DP*CP group so
+    W&B/TB metrics are still reported.
     """
     try:
-        return mpu.get_data_parallel_group_gloo(with_context_parallel=True)
+        dp_group = mpu.get_data_parallel_group_gloo(with_context_parallel=True)
     except AssertionError:
-        if _gloo_process_groups_disabled():
-            if dist.is_initialized() and dist.get_rank() == dp_src_rank:
-                logger.warning(
-                    "Skipping %s rollout metric gather because Megatron Gloo process groups are disabled.",
-                    metric_name,
-                )
-            return None
-        raise
+        if not _gloo_process_groups_disabled():
+            raise
+        dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        _warn_tensor_log_reduce_once(metric_name, dp_src_rank)
+        return all_reduce_numeric_log_dict(
+            log_dict,
+            dp_size=dp_size,
+            dp_src_rank=dp_src_rank,
+            dp_group=dp_group,
+        )
+    return gather_and_reduce_log_dict(
+        log_dict,
+        dp_size=dp_size,
+        dp_src_rank=dp_src_rank,
+        dp_group=dp_group,
+    )
 
 
 def get_batch(
@@ -209,14 +238,11 @@ def gather_log_data(
     ``metric_name`` prefix and the W&B / TB logging side effects.
     """
     dp_src_rank = mpu.get_data_parallel_src_rank(with_context_parallel=True)
-    dp_group = _get_rollout_log_dp_group(metric_name, dp_src_rank)
-    if dp_group is None:
-        return None
-    reduced = gather_and_reduce_log_dict(
+    reduced = _reduce_rollout_log_dict(
+        metric_name,
         log_dict,
         dp_size=mpu.get_data_parallel_world_size(with_context_parallel=True),
         dp_src_rank=dp_src_rank,
-        dp_group=dp_group,
     )
     if reduced is None:
         return None

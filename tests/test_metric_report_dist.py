@@ -181,6 +181,7 @@ def _rollout_log_distributed_worker(
     dp_size: int,
     master_port: int,
     result_path: str,
+    use_tensor_all_reduce: bool,
 ) -> None:
     """Per-rank entrypoint for ``mp.spawn``: build a multi-key log_dict
     covering all three reduction modes ``gather_and_reduce_log_dict``
@@ -198,6 +199,7 @@ def _rollout_log_distributed_worker(
     dp_group = init_worker_process_group(rank, world_size, master_port)
     try:
         from slime.backends.megatron_utils.cp_utils import (
+            all_reduce_numeric_log_dict,
             gather_and_reduce_log_dict,
             get_sum_of_sample_mean,
             rollout_log_metric_contribution,
@@ -245,7 +247,15 @@ def _rollout_log_distributed_worker(
             "rank_local_mean": float(sum(my_tl)) / len(my_tl),
         }
 
-        reduced = gather_and_reduce_log_dict(log_dict, dp_size=world_size, dp_src_rank=0, dp_group=dp_group)
+        if use_tensor_all_reduce:
+            reduced = all_reduce_numeric_log_dict(
+                log_dict,
+                dp_size=world_size,
+                dp_src_rank=0,
+                dp_group=dp_group,
+            )
+        else:
+            reduced = gather_and_reduce_log_dict(log_dict, dp_size=world_size, dp_src_rank=0, dp_group=dp_group)
 
         if rank == 0:
             with open(result_path, "wb") as f:
@@ -281,7 +291,7 @@ def test_rollout_log_real_distributed_multi_key(dp_size, cp_size, tmp_path):
     result_path = str(tmp_path / "result.pkl")
     mp.spawn(
         _rollout_log_distributed_worker,
-        args=(world_size, cp_size, dp_size, free_port(), result_path),
+        args=(world_size, cp_size, dp_size, free_port(), result_path, False),
         nprocs=world_size,
         join=True,
     )
@@ -293,6 +303,36 @@ def test_rollout_log_real_distributed_multi_key(dp_size, cp_size, tmp_path):
     # per-sample-mean: every sample has total_length=12, so the average is 12.
     assert reduced["total_lengths_per_sample"] == pytest.approx(12.0)
     # mean-across-ranks: every rank's local mean is 12, so cross-rank mean is 12.
+    assert reduced["rank_local_mean"] == pytest.approx(12.0)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dp_size,cp_size", [(1, 1), (2, 1), (2, 2), (4, 2)])
+def test_rollout_log_numeric_all_reduce_real_distributed(dp_size, cp_size, tmp_path):
+    """The no-Gloo fallback must preserve the same rollout log reductions.
+
+    GLM5.2 long-context runs disable Megatron's Gloo process groups. In that
+    profile rollout logging falls back from ``gather_object`` to numeric tensor
+    all-reduce over the regular DP*CP group; it must not drop W&B/TB metrics or
+    change their meaning.
+    """
+    import pickle
+
+    import torch.multiprocessing as mp
+
+    world_size = dp_size * cp_size
+    result_path = str(tmp_path / "result.pkl")
+    mp.spawn(
+        _rollout_log_distributed_worker,
+        args=(world_size, cp_size, dp_size, free_port(), result_path, True),
+        nprocs=world_size,
+        join=True,
+    )
+    with open(result_path, "rb") as f:
+        reduced = pickle.load(f)
+
+    assert reduced["logp_per_rollout"] == pytest.approx(FOUR_ROLLOUT_EXPECTED_REPORT)
+    assert reduced["total_lengths_per_sample"] == pytest.approx(12.0)
     assert reduced["rank_local_mean"] == pytest.approx(12.0)
 
 

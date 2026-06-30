@@ -232,6 +232,73 @@ def gather_and_reduce_log_dict(
     return None
 
 
+def _distributed_backend_name(group) -> str:
+    try:
+        return str(dist.get_backend(group=group)).lower()
+    except TypeError:
+        return str(dist.get_backend(group)).lower()
+    except Exception:
+        return ""
+
+
+def _log_reduce_tensor_device(group) -> torch.device:
+    backend = _distributed_backend_name(group)
+    if "nccl" in backend:
+        return torch.device("cuda", torch.cuda.current_device())
+    if "gloo" in backend:
+        return torch.device("cpu")
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
+def all_reduce_numeric_log_dict(
+    log_dict: dict,
+    *,
+    dp_size: int,
+    dp_src_rank: int,
+    dp_group,
+) -> dict | None:
+    """All-reduce numeric log_dict values without ``gather_object``.
+
+    This has the same reduction contract as :func:`gather_and_reduce_log_dict`,
+    but encodes metrics into a numeric tensor so it can use the regular DP*CP
+    process group. That keeps rollout logging available in profiles where
+    Megatron's Gloo object-collective groups are intentionally disabled.
+    """
+    keys = list(log_dict)
+    is_tuple_value: list[bool] = []
+    flat_values: list[float] = []
+    for key in keys:
+        value = log_dict[key]
+        if isinstance(value, tuple) and len(value) == 2:
+            is_tuple_value.append(True)
+            flat_values.extend([float(value[0]), float(value[1])])
+        else:
+            is_tuple_value.append(False)
+            flat_values.extend([float(value), 0.0])
+
+    values = torch.tensor(
+        flat_values,
+        dtype=torch.float64,
+        device=_log_reduce_tensor_device(dp_group),
+    )
+    dist.all_reduce(values, op=dist.ReduceOp.SUM, group=dp_group)
+    if dist.get_rank() != dp_src_rank:
+        return None
+
+    reduced_values = values.cpu().tolist()
+    reduced: dict = {}
+    for idx, key in enumerate(keys):
+        numerator = reduced_values[2 * idx]
+        denominator = reduced_values[2 * idx + 1]
+        if is_tuple_value[idx]:
+            reduced[key] = numerator / denominator if denominator else 0.0
+        else:
+            reduced[key] = numerator / dp_size
+    return reduced
+
+
 def all_gather_with_cp(tensor: torch.Tensor, total_length: int, response_length: int) -> torch.Tensor:
     """
     Gather tensors across all ranks in the context parallel group.

@@ -1,5 +1,6 @@
 import base64
 import logging
+import os
 import pickle
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
@@ -15,7 +16,12 @@ from ray.actor import ActorHandle
 from slime.utils.distributed_utils import get_gloo_group
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
-from .colocated_payload import select_colocated_tensor_payload_ranks, split_hf_named_tensors_for_sglang_pp
+from .colocated_payload import (
+    get_sglang_pp_layer_ranges,
+    resolve_sglang_pp_layer_partition,
+    select_colocated_tensor_payload_ranks,
+    split_hf_named_tensors_for_sglang_pp,
+)
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .update_weight_from_distributed import (
     connect_rollout_engines_from_distributed,
@@ -306,6 +312,14 @@ def _send_to_colocated_engine(
     nested_pp_payload = pp_size > 1
     if nested_pp_payload and num_layers <= 0:
         raise ValueError("SGLang PP tensor update requires args.num_layers to split payloads by PP rank")
+    pp_partition_arg = getattr(args, "sglang_pp_layer_partition", None) if args is not None else None
+    pp_partition_env = os.getenv("SGLANG_PP_LAYER_PARTITION", "")
+    pp_partition = resolve_sglang_pp_layer_partition(pp_partition_arg)
+    pp_layer_ranges = (
+        get_sglang_pp_layer_ranges(num_layers=num_layers, pp_size=pp_size, partition=pp_partition)
+        if nested_pp_payload
+        else []
+    )
 
     if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
         converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors}
@@ -324,7 +338,7 @@ def _send_to_colocated_engine(
                 named_tensors,
                 pp_size=pp_size,
                 num_layers=num_layers,
-                partition=getattr(args, "sglang_pp_layer_partition", None),
+                partition=pp_partition,
             )
             serialized_tensors.append(
                 [
@@ -364,11 +378,15 @@ def _send_to_colocated_engine(
             if not _LOGGED_NESTED_PP_PAYLOAD:
                 logger.info(
                     "Colocated tensor update will send nested SGLang PP payloads: pp_size=%s "
-                    "tp_payload_ranks=%s num_layers=%s partition=%s",
+                    "tp_payload_ranks=%s num_layers=%s partition=%r partition_arg=%r "
+                    "partition_env=%r layer_ranges=%s",
                     pp_size,
                     len(serialized_named_tensors),
                     num_layers,
-                    getattr(args, "sglang_pp_layer_partition", None),
+                    pp_partition,
+                    pp_partition_arg,
+                    pp_partition_env,
+                    pp_layer_ranges,
                 )
                 _LOGGED_NESTED_PP_PAYLOAD = True
         for i in range(num_dtypes):

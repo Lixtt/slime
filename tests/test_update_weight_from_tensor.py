@@ -51,6 +51,32 @@ def test_get_sglang_pp_layer_ranges_matches_explicit_partition():
     ) == [(0, 14), (14, 30), (30, 46), (46, 62), (62, 78)]
 
 
+def test_get_sglang_pp_layer_ranges_uses_env_partition(monkeypatch):
+    helper = _load_payload_helper()
+    monkeypatch.setenv("SGLANG_PP_LAYER_PARTITION", "14,16,16,16,16")
+
+    assert helper.resolve_sglang_pp_layer_partition(None) == "14,16,16,16,16"
+    assert helper.get_sglang_pp_layer_ranges(num_layers=78, pp_size=5) == [
+        (0, 14),
+        (14, 30),
+        (30, 46),
+        (46, 62),
+        (62, 78),
+    ]
+
+
+def test_get_sglang_pp_layer_ranges_default_uses_last_remainder():
+    helper = _load_payload_helper()
+
+    assert helper.get_sglang_pp_layer_ranges(num_layers=78, pp_size=5, partition="") == [
+        (0, 15),
+        (15, 30),
+        (30, 46),
+        (46, 62),
+        (62, 78),
+    ]
+
+
 def test_split_hf_named_tensors_for_sglang_pp_uses_layer_ranges():
     helper = _load_payload_helper()
     named_tensors = [

@@ -41,6 +41,10 @@ def select_colocated_tensor_payload_ranks(group_ranks: Sequence[int], args: Name
     return ranks[:tp_size]
 
 
+def resolve_sglang_pp_layer_partition(partition: str | None = None) -> str:
+    return (partition if partition is not None else os.getenv("SGLANG_PP_LAYER_PARTITION", "")).strip()
+
+
 def get_sglang_pp_layer_ranges(
     *,
     num_layers: int,
@@ -52,7 +56,7 @@ def get_sglang_pp_layer_ranges(
     if pp_size <= 1:
         return [(0, num_layers)]
 
-    partition = (partition if partition is not None else os.getenv("SGLANG_PP_LAYER_PARTITION", "")).strip()
+    partition = resolve_sglang_pp_layer_partition(partition)
     if partition:
         try:
             partitions = [int(part) for part in partition.split(",")]

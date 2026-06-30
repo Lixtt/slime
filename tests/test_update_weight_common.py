@@ -164,21 +164,22 @@ def test_all_gather_param_moves_cpu_non_tp_param_to_current_cuda(monkeypatch):
     calls = {}
 
     class DummyDevice:
-        type = "cpu"
+        def __init__(self, device_type):
+            self.type = device_type
 
     class DummyTensor:
         tensor_model_parallel = False
         parallel_mode = None
 
-        def __init__(self, label):
+        def __init__(self, label, device_type="cpu"):
             self.label = label
             self.data = self
-            self.device = DummyDevice()
+            self.device = DummyDevice(device_type)
 
         def to(self, *, device, non_blocking):
             calls["device"] = device
             calls["non_blocking"] = non_blocking
-            return DummyTensor(f"{self.label}@{device}")
+            return DummyTensor(f"{self.label}@{device}", "cuda")
 
     common.torch.cuda = types.SimpleNamespace(is_available=lambda: True, current_device=lambda: 5)
 
@@ -186,3 +187,29 @@ def test_all_gather_param_moves_cpu_non_tp_param_to_current_cuda(monkeypatch):
 
     assert gathered.label == "w@cuda:5"
     assert calls == {"device": "cuda:5", "non_blocking": True}
+
+
+@pytest.mark.unit
+def test_all_gather_param_uses_current_cuda_even_if_is_available_is_false(monkeypatch):
+    common = _load_common_with_stubbed_deps(monkeypatch)
+
+    class DummyDevice:
+        type = "cpu"
+
+    class DummyTensor:
+        tensor_model_parallel = False
+        parallel_mode = None
+
+        def __init__(self, label, device_type="cpu"):
+            self.label = label
+            self.data = self
+            self.device = types.SimpleNamespace(type=device_type)
+
+        def to(self, *, device, non_blocking):
+            return DummyTensor(f"{self.label}@{device}", "cuda")
+
+    common.torch.cuda = types.SimpleNamespace(is_available=lambda: False, current_device=lambda: 3)
+
+    gathered = common.all_gather_param("module.module.decoder.layers.0.self_attention.weight", DummyTensor("w"))
+
+    assert gathered.label == "w@cuda:3"

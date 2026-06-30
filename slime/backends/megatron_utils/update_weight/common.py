@@ -90,9 +90,43 @@ def _to_current_cuda_if_available(tensor: torch.Tensor) -> torch.Tensor:
     device = getattr(tensor, "device", None)
     if getattr(device, "type", None) == "cuda":
         return tensor
-    if not getattr(torch.cuda, "is_available", lambda: False)():
-        return tensor
-    return tensor.to(device=f"cuda:{torch.cuda.current_device()}", non_blocking=True)
+    cuda_device = _current_cuda_device_for_update(tensor)
+    moved = tensor.to(device=cuda_device, non_blocking=True)
+    moved_device = getattr(moved, "device", None)
+    if getattr(moved_device, "type", None) == "cuda":
+        return moved
+    try:
+        copied = torch.empty_strided(
+            size=tuple(tensor.size()),
+            stride=tuple(tensor.stride()),
+            dtype=tensor.dtype,
+            device=cuda_device,
+        )
+        copied.copy_(tensor, non_blocking=True)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to materialize update-weight tensor on CUDA before NCCL/FP8 update: "
+            f"source_device={device}, target_device={cuda_device}, tensor_type={type(tensor)!r}"
+        ) from exc
+    copied_device = getattr(copied, "device", None)
+    if getattr(copied_device, "type", None) != "cuda":
+        raise RuntimeError(
+            "Update-weight tensor stayed off CUDA after materialization: "
+            f"source_device={device}, target_device={cuda_device}, result_device={copied_device}"
+        )
+    return copied
+
+
+def _current_cuda_device_for_update(tensor: torch.Tensor) -> str:
+    try:
+        current_device = torch.cuda.current_device()
+    except Exception as exc:
+        is_available = getattr(torch.cuda, "is_available", lambda: None)()
+        raise RuntimeError(
+            "Cannot materialize update-weight tensor on CUDA because current CUDA device is unavailable: "
+            f"source_device={getattr(tensor, 'device', None)}, cuda_available={is_available}"
+        ) from exc
+    return f"cuda:{current_device}"
 
 
 def all_gather_object_for_group_via_gloo(obj, group) -> list:

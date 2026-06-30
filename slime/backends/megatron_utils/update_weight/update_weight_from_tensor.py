@@ -15,6 +15,7 @@ from ray.actor import ActorHandle
 from slime.utils.distributed_utils import get_gloo_group
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
+from .colocated_payload import select_colocated_tensor_payload_ranks
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .update_weight_from_distributed import (
     connect_rollout_engines_from_distributed,
@@ -145,10 +146,22 @@ class UpdateWeightFromTensor:
         if self._ipc_gather_group is None:
             for i in range(colocate_engine_nums):
                 group_ranks = list(range(colocate_gpu_offsets[i], colocate_gpu_offsets[i] + colocate_gpu_counts[i]))
-                new_group = dist.new_group(ranks=group_ranks, backend="gloo")
-                if dist.get_rank() in group_ranks:
+                payload_group_ranks = select_colocated_tensor_payload_ranks(group_ranks, self.args)
+                new_group = dist.new_group(ranks=payload_group_ranks, backend="gloo")
+                if dist.get_rank() in payload_group_ranks:
                     self._ipc_gather_group = new_group
-                    self._ipc_gather_src = colocate_gpu_offsets[i]
+                    self._ipc_gather_src = payload_group_ranks[0]
+                if dist.get_rank() == payload_group_ranks[0] and len(payload_group_ranks) != len(group_ranks):
+                    logger.info(
+                        "Colocated tensor update will gather %d TP payload rank(s) for PP engine=%s "
+                        "instead of %d engine rank(s): payload_ranks=%s engine_ranks=%s sglang_pp_size=%s",
+                        len(payload_group_ranks),
+                        i,
+                        len(group_ranks),
+                        payload_group_ranks,
+                        group_ranks,
+                        getattr(self.args, "sglang_pp_size", 1),
+                    )
 
         # Map training ranks to colocated engine actors.
         for i, engine in enumerate(self.rollout_engines):
@@ -212,6 +225,10 @@ class UpdateWeightFromTensor:
         ):
             refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
             ray.get(refs)
+            # The colocated PP path may gather payloads only from the effective
+            # TP ranks because SGLang indexes payloads by tp_rank. Keep every
+            # Megatron rank chunk-synchronous before the next PP/TP collective.
+            dist.barrier(group=get_gloo_group())
             # Free GPU tensors so the caching allocator can reuse the blocks,
             # then release CUDA IPC cache entries whose consumers (sglang engines)
             # have already closed their IPC handles.

@@ -71,6 +71,7 @@ def train(args):
             # sync generate before update weights to prevent update weight in the middle of generation
             rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
             rollout_data_next_future = None
+            run_rollout_generation_quality_gate(rollout_manager, f"pre_update_{rollout_id}")
             actor_model.update_weights()
             run_rollout_generation_quality_gate(rollout_manager, f"post_update_{rollout_id}")
 

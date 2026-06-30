@@ -9,6 +9,16 @@ def test_initial_weight_update_does_not_resume_kv_before_sync():
     assert "onload_kv" not in before_initial_update
 
 
+def test_initial_weight_update_runs_quality_gate_after_weight_onload():
+    source = Path("slime/train.py").read_text()
+    before_initial_update = source.split("actor_model.update_weights()", 1)[0]
+
+    assert 'run_rollout_generation_quality_gate(rollout_manager, "pre_initial_update")' in before_initial_update
+    assert before_initial_update.index("rollout_manager.onload_weights.remote()") < before_initial_update.index(
+        '"pre_initial_update"'
+    )
+
+
 def test_initial_weight_update_resumes_kv_before_post_update_gate():
     source = Path("slime/train.py").read_text()
     initial_update_tail = source.split("actor_model.update_weights()", 1)[1]
@@ -26,6 +36,17 @@ def test_training_loop_still_resumes_kv_after_rollout_offload():
 
     assert "rollout_manager.offload.remote()" in train_loop
     assert "rollout_manager.onload_kv.remote()" in train_loop
+
+
+def test_training_loop_runs_pre_update_quality_gate_after_weight_onload():
+    source = Path("slime/train.py").read_text()
+    train_loop = source.split("for rollout_id in range", 1)[1]
+    before_loop_update = train_loop.split("actor_model.update_weights()", 1)[0]
+
+    assert 'run_rollout_generation_quality_gate(rollout_manager, f"pre_update_{rollout_id}")' in before_loop_update
+    assert before_loop_update.index("rollout_manager.onload_weights.remote()") < before_loop_update.index(
+        'f"pre_update_{rollout_id}"'
+    )
 
 
 def test_rollout_offload_pauses_generation_before_memory_release():

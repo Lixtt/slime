@@ -22,8 +22,7 @@ def train(args):
 
     if args.offload_rollout:
         ray.get(rollout_manager.onload_weights.remote())
-    else:
-        run_rollout_generation_quality_gate(rollout_manager, "pre_initial_update")
+    run_rollout_generation_quality_gate(rollout_manager, "pre_initial_update")
 
     # Always push actor weights to rollout once weights are loaded.
     actor_model.update_weights()
@@ -91,6 +90,7 @@ def train(args):
         offload_train(actor_trains_this_step)
         if args.offload_rollout:
             ray.get(rollout_manager.onload_weights.remote())
+        run_rollout_generation_quality_gate(rollout_manager, f"pre_update_{rollout_id}")
         actor_model.update_weights()
 
         if args.offload_rollout:

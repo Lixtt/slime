@@ -177,19 +177,21 @@ class UpdateWeightFromTensor:
             end = start + colocate_gpu_counts[i]
             if start <= dist.get_rank() < end:
                 self._ipc_engine = engine
-                spans_nodes = colocate_gpu_counts[i] > getattr(
-                    self.args, "num_gpus_per_node", colocate_gpu_counts[i]
-                )
+                group_ranks = list(range(start, end))
+                payload_group_ranks = select_colocated_tensor_payload_ranks(group_ranks, self.args)
+                num_gpus_per_node = int(getattr(self.args, "num_gpus_per_node", colocate_gpu_counts[i]) or 0)
+                engine_spans_nodes = _ranks_span_nodes(group_ranks, num_gpus_per_node)
+                payload_spans_nodes = _ranks_span_nodes(payload_group_ranks, num_gpus_per_node)
                 explicit_cpu_payload = getattr(self.args, "colocated_tensor_update_cpu_payload", False)
                 if (
-                    spans_nodes
+                    payload_spans_nodes
                     and not explicit_cpu_payload
                     and not _truthy_env("GLM52_ALLOW_UNSAFE_CROSS_NODE_CUDA_IPC", default=False)
                 ):
                     raise RuntimeError(
                         "Colocated tensor update would serialize CUDA IPC metadata for a rollout engine "
-                        f"spanning multiple nodes: engine={i} ranks={start}-{end - 1} "
-                        f"num_gpus_per_node={getattr(self.args, 'num_gpus_per_node', 'unknown')}. "
+                        f"whose payload ranks span multiple nodes: engine={i} ranks={start}-{end - 1} "
+                        f"payload_ranks={payload_group_ranks} num_gpus_per_node={num_gpus_per_node}. "
                         "CUDA IPC handles are host-local. Use colocated distributed/NCCL weight update, "
                         "set COLOCATED_TENSOR_UPDATE_CPU_PAYLOAD=1 for a labelled slow diagnostic, "
                         "or set GLM52_ALLOW_UNSAFE_CROSS_NODE_CUDA_IPC=1 only while developing host-local routing."
@@ -197,22 +199,28 @@ class UpdateWeightFromTensor:
                 self._ipc_force_cpu_payload = bool(explicit_cpu_payload)
                 if dist.get_rank() == start and self._ipc_force_cpu_payload:
                     logger.info(
-                        "Using CPU payload for colocated tensor update: engine=%s ranks=%s-%s spans_nodes=%s explicit=%s",
+                        "Using CPU payload for colocated tensor update: engine=%s ranks=%s-%s "
+                        "engine_spans_nodes=%s payload_spans_nodes=%s payload_ranks=%s explicit=%s",
                         i,
                         start,
                         end - 1,
-                        spans_nodes,
+                        engine_spans_nodes,
+                        payload_spans_nodes,
+                        payload_group_ranks,
                         explicit_cpu_payload,
                     )
-                elif dist.get_rank() == start and spans_nodes:
+                elif dist.get_rank() == start and engine_spans_nodes:
                     logger.info(
                         "Using CUDA IPC metadata for multi-node colocated tensor update: "
-                        "engine=%s logical_tp_ranks=%s-%s payload_count=%s. "
-                        "Remote TP workers deserialize the payload produced by the same-node Megatron rank.",
+                        "engine=%s logical_ranks=%s-%s payload_count=%s payload_ranks=%s "
+                        "payload_spans_nodes=%s. Remote PP stages deserialize payloads produced by "
+                        "the same-node effective TP Megatron ranks.",
                         i,
                         start,
                         end - 1,
-                        len(select_colocated_tensor_payload_ranks(list(range(start, end)), self.args)),
+                        len(payload_group_ranks),
+                        payload_group_ranks,
+                        payload_spans_nodes,
                     )
 
     def pop_metrics(self) -> dict[str, float]:
@@ -487,6 +495,12 @@ def _serialize_flattened_bucket(
 def _serialize_cpu_flattened_bucket(flattened_tensor_data: dict[str, Any]) -> str:
     payload = pickle.dumps(flattened_tensor_data, protocol=pickle.HIGHEST_PROTOCOL)
     return base64.b64encode(payload).decode("utf-8")
+
+
+def _ranks_span_nodes(ranks: list[int], num_gpus_per_node: int) -> bool:
+    if num_gpus_per_node <= 0 or not ranks:
+        return False
+    return len({rank // num_gpus_per_node for rank in ranks}) > 1
 
 
 def _truthy_env(name: str, *, default: bool = False) -> bool:

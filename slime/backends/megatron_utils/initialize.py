@@ -26,6 +26,9 @@ def _set_megatron_arg_defaults(args):
         "image_tag_type": None,
         "force_system_message": False,
         "sft_tokenizer_prompt_format": None,
+        "hybrid_layer_pattern": None,
+        "moe_latent_size": None,
+        "te_precision_config_file": None,
     }
     for name, value in defaults.items():
         if not hasattr(args, name):

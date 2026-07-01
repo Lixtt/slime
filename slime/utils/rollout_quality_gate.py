@@ -24,6 +24,23 @@ def _strict() -> bool:
     )
 
 
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %.1fs", name, raw, default)
+        return default
+
+
+def _ray_timeout_seconds() -> float:
+    request_timeout = _float_env("ROLLOUT_GENERATION_QUALITY_GATE_TIMEOUT_SEC", 120.0)
+    grace = _float_env("ROLLOUT_GENERATION_QUALITY_GATE_RAY_TIMEOUT_GRACE_SEC", 30.0)
+    return max(request_timeout + max(grace, 0.0), 1.0)
+
+
 def _write_artifact(label: str, payload: dict) -> None:
     run_root = os.environ.get("RUN_ROOT") or os.environ.get("A3S_CODE_RUN_ROOT")
     if not run_root:
@@ -50,7 +67,10 @@ def run_rollout_generation_quality_gate(rollout_manager, label: str) -> list[dic
 
     strict = _strict()
     try:
-        results = ray.get(rollout_manager.generation_quality_check.remote(label=label))
+        results = ray.get(
+            rollout_manager.generation_quality_check.remote(label=label),
+            timeout=_ray_timeout_seconds(),
+        )
     except Exception as exc:
         payload = {
             "label": label,

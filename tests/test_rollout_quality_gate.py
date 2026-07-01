@@ -18,7 +18,8 @@ def test_quality_gate_error_is_nonfatal_by_default(monkeypatch, tmp_path):
     monkeypatch.setenv("ROLLOUT_GENERATION_QUALITY_GATE_ENABLED", "1")
     monkeypatch.setenv("RUN_ROOT", str(tmp_path))
 
-    def raise_timeout(_ref):
+    def raise_timeout(_ref, timeout=None):
+        assert timeout == 150.0
         raise TimeoutError("probe timed out")
 
     monkeypatch.setattr(rollout_quality_gate.ray, "get", raise_timeout)
@@ -37,7 +38,8 @@ def test_quality_gate_strict_error_raises(monkeypatch, tmp_path):
     monkeypatch.setenv("ROLLOUT_GENERATION_QUALITY_GATE_STRICT", "1")
     monkeypatch.setenv("RUN_ROOT", str(tmp_path))
 
-    def raise_timeout(_ref):
+    def raise_timeout(_ref, timeout=None):
+        assert timeout == 150.0
         raise TimeoutError("probe timed out")
 
     monkeypatch.setattr(rollout_quality_gate.ray, "get", raise_timeout)

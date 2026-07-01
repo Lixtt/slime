@@ -30,6 +30,9 @@ def _set_megatron_arg_defaults(args):
         "moe_latent_size": None,
         "te_precision_config_file": None,
         "ddp_param_name_patterns_for_fp32_local_accumulation": [],
+        "megatron_fsdp_main_params_dtype": torch.float32,
+        "megatron_fsdp_main_grads_dtype": None,
+        "megatron_fsdp_grad_comm_dtype": None,
     }
     for name, value in defaults.items():
         if not hasattr(args, name):

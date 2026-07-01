@@ -240,6 +240,20 @@ class SGLangEngine(RayActor):
 
     def _init_normal(self, server_args_dict):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
+        if server_args_dict.get("enable_memory_saver"):
+            try:
+                from torch_memory_saver import torch_memory_saver
+
+                if getattr(torch_memory_saver, "_impl", None) is None:
+                    torch_memory_saver.hook_mode = "preload"
+                    logger.info("Reset torch_memory_saver hook_mode to preload for SGLang memory saver.")
+                else:
+                    logger.warning(
+                        "torch_memory_saver was already initialized before SGLang launch; "
+                        "cannot reset hook_mode to preload."
+                    )
+            except ImportError:
+                logger.warning("enable_memory_saver is set, but torch_memory_saver is not importable.")
         self.process = launch_server_process(ServerArgs(**server_args_dict))
         self._register_to_router(server_args_dict)
 

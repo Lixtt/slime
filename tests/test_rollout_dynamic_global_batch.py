@@ -2,13 +2,19 @@ import importlib
 import sys
 import types
 
+import numpy as np
+
 
 def _install_rollout_import_stubs():
     torch = types.ModuleType("torch")
 
     class FakeTensor:
         def __init__(self, value):
-            self.value = value
+            self.value = np.asarray(value)
+
+        @property
+        def shape(self):
+            return self.value.shape
 
         def detach(self):
             return self
@@ -19,17 +25,61 @@ def _install_rollout_import_stubs():
         def contiguous(self):
             return self
 
+        def reshape(self, *shape):
+            return FakeTensor(self.value.reshape(*shape))
+
+        def view(self, *shape):
+            return self.reshape(*shape)
+
+        def mean(self, dim=None, keepdim=False):
+            return FakeTensor(np.mean(self.value, axis=dim, keepdims=keepdim))
+
+        def std(self, dim=None, keepdim=False):
+            axis = dim
+            if axis is None:
+                ddof = 1 if self.value.size > 1 else 0
+            else:
+                size = self.value.shape[axis]
+                ddof = 1 if size > 1 else 0
+            return FakeTensor(np.std(self.value, axis=axis, ddof=ddof, keepdims=keepdim))
+
+        def flatten(self):
+            return FakeTensor(self.value.flatten())
+
+        def tolist(self):
+            return self.value.tolist()
+
+        def numel(self):
+            return self.value.size
+
+        def __sub__(self, other):
+            other_value = other.value if isinstance(other, FakeTensor) else other
+            return FakeTensor(self.value - other_value)
+
+        def __truediv__(self, other):
+            other_value = other.value if isinstance(other, FakeTensor) else other
+            return FakeTensor(self.value / other_value)
+
+        def __add__(self, other):
+            other_value = other.value if isinstance(other, FakeTensor) else other
+            return FakeTensor(self.value + other_value)
+
+        def __radd__(self, other):
+            return self.__add__(other)
+
     torch.Tensor = FakeTensor
     torch.dtype = type("dtype", (), {})
     torch.Size = type("Size", (tuple,), {})
     torch.long = "long"
     torch.int = "int"
     torch.int32 = "int32"
+    torch.float = "float"
     torch.float32 = "float32"
     torch.as_tensor = lambda value, dtype=None: FakeTensor(value)
+    torch.tensor = lambda value, dtype=None: FakeTensor(value)
     torch.is_tensor = lambda value: isinstance(value, FakeTensor)
     torch.load = lambda *args, **kwargs: None
-    torch.zeros_like = lambda value: value
+    torch.zeros_like = lambda value: FakeTensor(np.zeros_like(value.value))
     sys.modules["torch"] = torch
 
     ray = types.ModuleType("ray")
@@ -168,6 +218,117 @@ def test_dynamic_global_batch_keeps_short_rollout_until_dummy_padding():
     assert len(rollout_data_refs) == 2
     assert rollout_data_refs[0]["global_batch_sizes"] == [2]
     assert rollout_data_refs[1]["global_batch_sizes"] == [2]
+
+
+def test_reward_normalization_groups_by_canonical_sample_group_id_even_for_full_batches():
+    _install_rollout_import_stubs()
+    rollout = importlib.import_module("slime.ray.rollout")
+    from slime.utils.types import Sample
+
+    manager = object.__new__(rollout.RolloutManager)
+    manager.custom_reward_post_process_func = None
+    manager.args = types.SimpleNamespace(
+        advantage_estimator="grpo",
+        rewards_normalization=True,
+        grpo_std_normalization=False,
+        n_samples_per_prompt=2,
+        rollout_batch_size=2,
+        reward_key=None,
+    )
+    samples = [
+        Sample(group_index=0, index=0, reward=1.0),
+        Sample(group_index=1, index=1, reward=10.0),
+        Sample(group_index=0, index=2, reward=3.0),
+        Sample(group_index=1, index=3, reward=14.0),
+    ]
+
+    raw_rewards, normalized_rewards = manager._post_process_rewards(samples)
+
+    assert raw_rewards == [1.0, 10.0, 3.0, 14.0]
+    assert normalized_rewards == [-1.0, -2.0, 1.0, 2.0]
+
+
+def test_reward_normalization_prefers_group_id_over_group_index():
+    _install_rollout_import_stubs()
+    rollout = importlib.import_module("slime.ray.rollout")
+    from slime.utils.types import Sample
+
+    manager = object.__new__(rollout.RolloutManager)
+    manager.custom_reward_post_process_func = None
+    manager.args = types.SimpleNamespace(
+        advantage_estimator="grpo",
+        rewards_normalization=True,
+        grpo_std_normalization=False,
+        n_samples_per_prompt=2,
+        rollout_batch_size=2,
+        reward_key=None,
+    )
+    samples = [
+        Sample(group_id=10, group_index=0, index=0, reward=1.0),
+        Sample(group_id=20, group_index=0, index=1, reward=10.0),
+        Sample(group_id=10, group_index=1, index=2, reward=3.0),
+        Sample(group_id=20, group_index=1, index=3, reward=14.0),
+    ]
+
+    raw_rewards, normalized_rewards = manager._post_process_rewards(samples)
+
+    assert raw_rewards == [1.0, 10.0, 3.0, 14.0]
+    assert normalized_rewards == [-1.0, -2.0, 1.0, 2.0]
+
+
+def test_convert_samples_keeps_train_metadata_from_sample_metadata():
+    _install_rollout_import_stubs()
+    rollout = importlib.import_module("slime.ray.rollout")
+    from slime.utils.types import Sample
+
+    manager = object.__new__(rollout.RolloutManager)
+    manager.custom_convert_samples_to_train_data_func = None
+    manager.custom_reward_post_process_func = None
+    manager.train_parallel_config = {
+        "dp_size": 1,
+        "cp_size": 1,
+        "vpp_size": 1,
+        "microbatch_group_size_per_vp_stage": 1,
+    }
+    manager.args = types.SimpleNamespace(
+        use_dynamic_global_batch_size=False,
+        disable_rollout_trim_samples=False,
+        global_batch_size=2,
+        reward_key=None,
+        advantage_estimator="grpo",
+        rewards_normalization=False,
+        n_samples_per_prompt=2,
+        rollout_batch_size=1,
+        grpo_std_normalization=False,
+    )
+    samples = [
+        Sample(
+            group_index=0,
+            index=0,
+            tokens=[1, 2],
+            response_length=1,
+            loss_mask=[1],
+            reward=1.0,
+            metadata={"train_metadata": {"sample_group_index": 0, "eligible_for_rl": True}},
+        ),
+        Sample(
+            group_index=0,
+            index=1,
+            tokens=[3, 4],
+            response_length=1,
+            loss_mask=[1],
+            reward=0.0,
+            train_metadata={"sample_group_index": 0, "eligible_for_rl": False},
+        ),
+    ]
+
+    train_data = manager._convert_samples_to_train_data(samples)
+
+    assert train_data["group_ids"] == [0, 0]
+    assert train_data["metadata"] == [
+        {"sample_group_index": 0, "eligible_for_rl": True},
+        {"sample_group_index": 0, "eligible_for_rl": False},
+    ]
 
 
 def test_dynamic_global_batch_infers_missing_train_parallel_config():

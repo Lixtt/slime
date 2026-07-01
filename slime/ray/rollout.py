@@ -1,10 +1,12 @@
 import dataclasses
+import importlib.util
 import itertools
 import logging
 import multiprocessing
 import os
 import random
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,24 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _torch_memory_saver_preload_env() -> dict[str, str]:
+    spec = importlib.util.find_spec("torch_memory_saver")
+    if spec is None or spec.submodule_search_locations is None:
+        return {}
+
+    package_dir = next(iter(spec.submodule_search_locations), "")
+    package_parent = os.path.dirname(package_dir)
+    for filename in (
+        "torch_memory_saver_hook_mode_preload_cu12.abi3.so",
+        "torch_memory_saver_hook_mode_preload.abi3.so",
+    ):
+        path = os.path.join(package_parent, filename)
+        if os.path.exists(path):
+            return {"LD_PRELOAD": path}
+    return {}
+
 
 _ROLLOUT_DATA_TENSOR_DTYPES = {
     "tokens": torch.long,
@@ -68,6 +88,14 @@ _SGLANG_DECODE_PERF_FIELDS = (
     ("decode/transfer_duration", "pd_decode_transfer_duration"),
     ("decode/forward_duration", "pd_decode_forward_duration"),
 )
+
+
+def _sample_group_id(sample: Sample) -> int | None:
+    if sample.group_id is not None:
+        return sample.group_id
+    if sample.group_index is not None:
+        return sample.group_index
+    return sample.index
 
 
 def _cpu_tensor(value, dtype: torch.dtype | None = None) -> torch.Tensor:
@@ -200,6 +228,14 @@ class ServerGroup:
                     "SLIME_ENABLE_PROFILING": "true",
                 }.items()
             }
+            if self.args.offload_rollout:
+                preload_env = _torch_memory_saver_preload_env()
+                if preload_env:
+                    env_vars.update(preload_env)
+                else:
+                    logger.warning(
+                        "offload_rollout is enabled, but torch_memory_saver preload library was not found."
+                    )
             rollout_engine = RolloutRayActor.options(
                 num_cpus=num_cpus,
                 num_gpus=num_gpus,
@@ -832,6 +868,37 @@ class RolloutManager:
             self.args.advantage_estimator in ["grpo", "gspo", "cispo", "reinforce_plus_plus_baseline"]
             and self.args.rewards_normalization
         ):
+            group_keys = []
+            has_explicit_group_key = False
+            for position, sample in enumerate(samples):
+                group_id = _sample_group_id(sample)
+                if sample.group_id is not None or sample.group_index is not None:
+                    group_keys.append(("group_id", group_id))
+                    has_explicit_group_key = True
+                else:
+                    group_keys.append(("position", position))
+
+            if has_explicit_group_key:
+                normalized_rewards = [0.0] * len(samples)
+                grouped: dict[tuple[str, int], list[tuple[int, float]]] = defaultdict(list)
+                for position, (group_key, reward) in enumerate(zip(group_keys, raw_rewards, strict=True)):
+                    grouped[group_key].append((position, reward))
+
+                for grouped_rewards in grouped.values():
+                    rewards = torch.tensor([reward for _, reward in grouped_rewards], dtype=torch.float)
+                    rewards = rewards - rewards.mean()
+                    if (
+                        self.args.advantage_estimator in ["grpo", "gspo", "cispo"]
+                        and self.args.grpo_std_normalization
+                        and len(grouped_rewards) > 1
+                    ):
+                        rewards = rewards / (rewards.std() + 1e-6)
+
+                    for (position, _), reward in zip(grouped_rewards, rewards.tolist(), strict=True):
+                        normalized_rewards[position] = reward
+
+                return raw_rewards, normalized_rewards
+
             # group norm
             rewards = torch.tensor(raw_rewards, dtype=torch.float)
             if rewards.shape[-1] == self.args.n_samples_per_prompt * self.args.rollout_batch_size:
@@ -856,9 +923,6 @@ class RolloutManager:
         """
         if self.custom_convert_samples_to_train_data_func is not None:
             return self.custom_convert_samples_to_train_data_func(self.args, samples)
-
-        def _sample_group_id(sample: Sample) -> int | None:
-            return sample.group_id if sample.group_id is not None else sample.index
 
         def _count_distinct_groups(items: list[Sample]) -> int:
             return len({_sample_group_id(sample) for sample in items})
@@ -914,7 +978,7 @@ class RolloutManager:
         assert len(raw_rewards) == len(samples)
         assert len(rewards) == len(samples)
 
-        group_ids = [sample.group_id if sample.group_id is not None else sample.index for sample in samples]
+        group_ids = [_sample_group_id(sample) for sample in samples]
         existed_group_id_values = set(group_id for group_id in group_ids if group_id is not None)
         tmp_id = 0
         for i in range(len(group_ids)):
@@ -1005,8 +1069,16 @@ class RolloutManager:
         if samples[0].rollout_routed_experts is not None:
             train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
 
-        if samples[0].train_metadata is not None:
-            train_data["metadata"] = [sample.train_metadata for sample in samples]
+        train_metadata = []
+        has_train_metadata = False
+        for sample in samples:
+            metadata = sample.train_metadata
+            if metadata is None and sample.metadata:
+                metadata = sample.metadata.get("train_metadata")
+            train_metadata.append(metadata)
+            has_train_metadata = has_train_metadata or metadata is not None
+        if has_train_metadata:
+            train_data["metadata"] = train_metadata
 
         if any(sample.multimodal_train_inputs is not None for sample in samples):
             train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
@@ -1024,8 +1096,8 @@ class RolloutManager:
         into a Ray Box. The schedule itself is computed by
         :func:`build_dp_schedule` so it stays unit-testable without Ray/sglang.
 
-        Step split is by group id (``samples[i].group_id``, falling back
-        to ``samples[i].index``); each step holds exactly
+        Step split is by canonical rollout group id (``samples[i].group_id``,
+        then ``samples[i].group_index``, then ``samples[i].index``); each step holds exactly
         ``global_batch_size`` groups so the training-step count per rollout is
         stable even when a rollout produced multiple training samples.
         """

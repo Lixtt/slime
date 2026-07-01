@@ -1,6 +1,12 @@
+import base64
+import pickle
+import sys
+import types
 from argparse import Namespace
 import importlib.util
 from pathlib import Path
+
+import torch
 
 
 def _load_payload_helper():
@@ -19,6 +25,77 @@ def _load_payload_helper():
     return module
 
 
+def _load_update_weight_module_with_stubs(monkeypatch):
+    def module(name, **attrs):
+        mod = types.ModuleType(name)
+        for key, value in attrs.items():
+            setattr(mod, key, value)
+        return mod
+
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "ray", module("ray", ObjectRef=object))
+    monkeypatch.setitem(sys.modules, "ray.actor", module("ray.actor", ActorHandle=object))
+    monkeypatch.setitem(sys.modules, "megatron", module("megatron"))
+    monkeypatch.setitem(sys.modules, "megatron.core", module("megatron.core", mpu=types.SimpleNamespace()))
+    monkeypatch.setitem(
+        sys.modules,
+        "slime.utils.distributed_utils",
+        module("slime.utils.distributed_utils", get_gloo_group=lambda: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "slime.backends.megatron_utils.sglang",
+        module(
+            "slime.backends.megatron_utils.sglang",
+            FlattenedTensorBucket=None,
+            MultiprocessingSerializer=types.SimpleNamespace(serialize=lambda obj, output_str=False: b""),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "slime.backends.megatron_utils.update_weight.colocated_payload",
+        module(
+            "slime.backends.megatron_utils.update_weight.colocated_payload",
+            get_sglang_pp_layer_ranges=lambda *args, **kwargs: [],
+            resolve_sglang_pp_layer_partition=lambda partition=None: partition,
+            select_colocated_tensor_payload_ranks=lambda ranks, args: ranks,
+            split_hf_named_tensors_for_sglang_pp=lambda tensors, **kwargs: [tensors],
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "slime.backends.megatron_utils.update_weight.hf_weight_iterator_base",
+        module("slime.backends.megatron_utils.update_weight.hf_weight_iterator_base", HfWeightIteratorBase=object),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "slime.backends.megatron_utils.update_weight.update_weight_from_distributed",
+        module(
+            "slime.backends.megatron_utils.update_weight.update_weight_from_distributed",
+            connect_rollout_engines_from_distributed=lambda *args, **kwargs: None,
+            disconnect_rollout_engines_from_distributed=lambda *args, **kwargs: None,
+            post_process_weights=lambda *args, **kwargs: None,
+            update_weights_from_distributed=lambda *args, **kwargs: [],
+        ),
+    )
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "slime"
+        / "backends"
+        / "megatron_utils"
+        / "update_weight"
+        / "update_weight_from_tensor.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "slime.backends.megatron_utils.update_weight.update_weight_from_tensor_under_test",
+        path,
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_select_colocated_tensor_payload_ranks_keeps_tp_for_pp_engine():
     select_colocated_tensor_payload_ranks = _load_payload_helper().select_colocated_tensor_payload_ranks
     args = Namespace(sglang_pp_size=5)
@@ -26,11 +103,110 @@ def test_select_colocated_tensor_payload_ranks_keeps_tp_for_pp_engine():
     assert select_colocated_tensor_payload_ranks(list(range(40)), args) == list(range(8))
 
 
+def test_serialize_flattened_bucket_falls_back_to_cpu_payload(monkeypatch):
+    module = _load_update_weight_module_with_stubs(monkeypatch)
+
+    class FakeFlattenedTensorBucket:
+        def __init__(self, named_tensors):
+            self.named_tensors = named_tensors
+
+        def get_metadata(self):
+            return [("weight", (2,), "float32")]
+
+        def get_flattened_tensor(self):
+            return torch.ones(2, dtype=torch.float32)
+
+    def raise_from_cuda_ipc(_obj, output_str=False):
+        raise RuntimeError("CUDA IPC unavailable")
+
+    monkeypatch.setenv("COLOCATED_TENSOR_UPDATE_CUDA_IPC_FALLBACK_TO_CPU", "1")
+    monkeypatch.setattr(module, "FlattenedTensorBucket", FakeFlattenedTensorBucket)
+    monkeypatch.setattr(module.MultiprocessingSerializer, "serialize", raise_from_cuda_ipc)
+
+    long_lived = []
+    payload = module._serialize_flattened_bucket(
+        [("weight", torch.ones(2, dtype=torch.float32))],
+        long_live_tensors=long_lived,
+        force_cpu_payload=False,
+    )
+
+    decoded = pickle.loads(base64.b64decode(payload))
+    assert decoded["flattened_tensor"].device.type == "cpu"
+    assert decoded["metadata"] == [("weight", (2,), "float32")]
+    assert long_lived[-1]["flattened_tensor"].device.type == "cpu"
+
+
+def test_multinode_colocated_tensor_update_rejects_cuda_ipc_by_default(monkeypatch):
+    module = _load_update_weight_module_with_stubs(monkeypatch)
+    updater = object.__new__(module.UpdateWeightFromTensor)
+    updater.args = Namespace(
+        actor_num_nodes=4,
+        actor_num_gpus_per_node=8,
+        rollout_num_gpus_per_engine=16,
+        num_gpus_per_node=8,
+        colocated_tensor_update_cpu_payload=False,
+        sglang_pp_size=1,
+    )
+    updater._model_update_groups = None
+    updater._ipc_gather_group = None
+
+    monkeypatch.setenv("GLM52_ALLOW_UNSAFE_CROSS_NODE_CUDA_IPC", "0")
+    monkeypatch.setattr(module.dist, "new_group", lambda *args, **kwargs: object())
+    monkeypatch.setattr(module.dist, "get_rank", lambda: 0)
+
+    try:
+        updater.connect_rollout_engines(
+            [object()],
+            object(),
+            engine_gpu_counts=[16],
+            engine_gpu_offsets=[0],
+        )
+    except RuntimeError as exc:
+        assert "CUDA IPC handles are host-local" in str(exc)
+    else:
+        raise AssertionError("expected multi-node colocated CUDA IPC update to be rejected")
+
+
+def test_multinode_colocated_tensor_update_allows_explicit_cpu_payload(monkeypatch):
+    module = _load_update_weight_module_with_stubs(monkeypatch)
+    updater = object.__new__(module.UpdateWeightFromTensor)
+    updater.args = Namespace(
+        actor_num_nodes=4,
+        actor_num_gpus_per_node=8,
+        rollout_num_gpus_per_engine=16,
+        num_gpus_per_node=8,
+        colocated_tensor_update_cpu_payload=True,
+        sglang_pp_size=1,
+    )
+    updater._model_update_groups = None
+    updater._ipc_gather_group = None
+    updater._ipc_engine = None
+
+    monkeypatch.setattr(module.dist, "new_group", lambda *args, **kwargs: object())
+    monkeypatch.setattr(module.dist, "get_rank", lambda: 0)
+
+    updater.connect_rollout_engines(
+        [object()],
+        object(),
+        engine_gpu_counts=[16],
+        engine_gpu_offsets=[0],
+    )
+
+    assert updater._ipc_force_cpu_payload is True
+
+
 def test_select_colocated_tensor_payload_ranks_keeps_all_ranks_without_pp():
     select_colocated_tensor_payload_ranks = _load_payload_helper().select_colocated_tensor_payload_ranks
     args = Namespace(sglang_pp_size=1)
 
     assert select_colocated_tensor_payload_ranks(list(range(8)), args) == list(range(8))
+
+
+def test_select_colocated_tensor_payload_ranks_keeps_all_tp16_ranks_without_pp():
+    select_colocated_tensor_payload_ranks = _load_payload_helper().select_colocated_tensor_payload_ranks
+    args = Namespace(sglang_pp_size=1)
+
+    assert select_colocated_tensor_payload_ranks(list(range(16)), args) == list(range(16))
 
 
 def test_select_colocated_tensor_payload_ranks_falls_back_on_irregular_shape():

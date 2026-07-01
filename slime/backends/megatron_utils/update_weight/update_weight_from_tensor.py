@@ -33,13 +33,14 @@ from .update_weight_from_distributed import (
 
 logger = logging.getLogger(__name__)
 _LOGGED_NESTED_PP_PAYLOAD = False
+_LOGGED_CUDA_IPC_CPU_FALLBACK = False
 
 
 class UpdateWeightFromTensor:
     """
     Update rollout engines from tensor dict:
     load(dict→GPU) → broadcast PP/EP(GPU NCCL) → gather TP(GPU NCCL) → convert HF(GPU) → send.
-    Colocated: GPU→CPU serialize → gather_object(Gloo CPU, collects from rollout_num_gpus_per_engine ranks) → Ray IPC to engine.
+    Colocated: serialize CUDA IPC metadata → gather_object(control-plane) → Ray request to engine.
     Distributed: GPU NCCL broadcast to remote engines.
     """
 
@@ -148,7 +149,7 @@ class UpdateWeightFromTensor:
         colocate_gpu_offsets = engine_gpu_offsets[:colocate_engine_nums]
         colocate_gpu_counts = engine_gpu_counts[:colocate_engine_nums]
 
-        # Create IPC Gloo gather groups (only on first call; partitioning is
+        # Create IPC metadata gather groups (only on first call; partitioning is
         # fixed across reconnects).
         if self._ipc_gather_group is None:
             for i in range(colocate_engine_nums):
@@ -180,7 +181,20 @@ class UpdateWeightFromTensor:
                     self.args, "num_gpus_per_node", colocate_gpu_counts[i]
                 )
                 explicit_cpu_payload = getattr(self.args, "colocated_tensor_update_cpu_payload", False)
-                self._ipc_force_cpu_payload = bool(explicit_cpu_payload or spans_nodes)
+                if (
+                    spans_nodes
+                    and not explicit_cpu_payload
+                    and not _truthy_env("GLM52_ALLOW_UNSAFE_CROSS_NODE_CUDA_IPC", default=False)
+                ):
+                    raise RuntimeError(
+                        "Colocated tensor update would serialize CUDA IPC metadata for a rollout engine "
+                        f"spanning multiple nodes: engine={i} ranks={start}-{end - 1} "
+                        f"num_gpus_per_node={getattr(self.args, 'num_gpus_per_node', 'unknown')}. "
+                        "CUDA IPC handles are host-local. Use colocated distributed/NCCL weight update, "
+                        "set COLOCATED_TENSOR_UPDATE_CPU_PAYLOAD=1 for a labelled slow diagnostic, "
+                        "or set GLM52_ALLOW_UNSAFE_CROSS_NODE_CUDA_IPC=1 only while developing host-local routing."
+                    )
+                self._ipc_force_cpu_payload = bool(explicit_cpu_payload)
                 if dist.get_rank() == start and self._ipc_force_cpu_payload:
                     logger.info(
                         "Using CPU payload for colocated tensor update: engine=%s ranks=%s-%s spans_nodes=%s explicit=%s",
@@ -189,6 +203,16 @@ class UpdateWeightFromTensor:
                         end - 1,
                         spans_nodes,
                         explicit_cpu_payload,
+                    )
+                elif dist.get_rank() == start and spans_nodes:
+                    logger.info(
+                        "Using CUDA IPC metadata for multi-node colocated tensor update: "
+                        "engine=%s logical_tp_ranks=%s-%s payload_count=%s. "
+                        "Remote TP workers deserialize the payload produced by the same-node Megatron rank.",
+                        i,
+                        start,
+                        end - 1,
+                        len(select_colocated_tensor_payload_ranks(list(range(start, end)), self.args)),
                     )
 
     def pop_metrics(self) -> dict[str, float]:
@@ -422,8 +446,8 @@ def _serialize_flattened_bucket(
         flattened_tensor = torch.empty(0, dtype=torch.uint8, device="cpu")
 
     if force_cpu_payload:
-        # CUDA IPC handles are node-local. A colocated PP rollout engine can
-        # span nodes, so serialize tensor data through CPU for that path.
+        # Diagnostic fallback only. For large GLM5.2 syncs this copies real
+        # tensor bytes through CPU/control-plane transport and is expected to be slow.
         flattened_tensor = flattened_tensor.detach().cpu().contiguous()
     flattened_tensor_data = {
         "flattened_tensor": flattened_tensor,
@@ -431,6 +455,42 @@ def _serialize_flattened_bucket(
     }
     long_live_tensors.append(flattened_tensor_data)
     if force_cpu_payload:
-        payload = pickle.dumps(flattened_tensor_data, protocol=pickle.HIGHEST_PROTOCOL)
-        return base64.b64encode(payload).decode("utf-8")
-    return MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+        return _serialize_cpu_flattened_bucket(flattened_tensor_data)
+    try:
+        return MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+    except Exception:
+        if not _truthy_env("COLOCATED_TENSOR_UPDATE_CUDA_IPC_FALLBACK_TO_CPU", default=True):
+            raise
+        global _LOGGED_CUDA_IPC_CPU_FALLBACK
+        tensor_bytes = flattened_tensor.numel() * flattened_tensor.element_size()
+        if not _LOGGED_CUDA_IPC_CPU_FALLBACK:
+            logger.warning(
+                "CUDA IPC serialization failed for colocated tensor update bucket "
+                "(num_tensors=%d flattened_bytes=%d dtype=%s device=%s). "
+                "Falling back to CPU payload for this bucket. Reduce UPDATE_WEIGHT_BUFFER_SIZE "
+                "if this warning appears during GLM5.2 full sync.",
+                len(named_tensors),
+                tensor_bytes,
+                flattened_tensor.dtype,
+                flattened_tensor.device,
+                exc_info=True,
+            )
+            _LOGGED_CUDA_IPC_CPU_FALLBACK = True
+        cpu_tensor_data = {
+            "flattened_tensor": flattened_tensor.detach().cpu().contiguous(),
+            "metadata": metadata,
+        }
+        long_live_tensors[-1] = cpu_tensor_data
+        return _serialize_cpu_flattened_bucket(cpu_tensor_data)
+
+
+def _serialize_cpu_flattened_bucket(flattened_tensor_data: dict[str, Any]) -> str:
+    payload = pickle.dumps(flattened_tensor_data, protocol=pickle.HIGHEST_PROTOCOL)
+    return base64.b64encode(payload).decode("utf-8")
+
+
+def _truthy_env(name: str, *, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}

@@ -35,6 +35,13 @@ def add_convertion_args(parser):
     return parser
 
 
+def _env_flag(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.lower() in {"1", "true", "yes", "y", "on"}
+
+
 def get_args():
     args = parse_args(add_convertion_args)
     args = set_default_megatron_args(args)
@@ -74,7 +81,23 @@ def get_args():
         f"Using pipeline model parallel size: {args.pipeline_model_parallel_size}, decoder last pipeline num layers: {args.decoder_last_pipeline_num_layers}"
     )
 
+    # Conversion only needs base model weights. Saving optimizer state or using
+    # Megatron's fully-parallel save path adds collectives that can fail on large
+    # multi-node conversions and is unnecessary for --ref-load initialization.
+    if _env_flag("CONVERT_NO_SAVE_OPTIM", True):
+        args.no_save_optim = True
+    if not _env_flag("CONVERT_CKPT_FULLY_PARALLEL_SAVE", False):
+        args.ckpt_fully_parallel_save = False
+        if hasattr(args, "ckpt_fully_parallel_save_deprecated"):
+            args.ckpt_fully_parallel_save_deprecated = False
+
     validate_args(args)
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(
+            "conversion_checkpoint_policy="
+            f"no_save_optim={args.no_save_optim} "
+            f"ckpt_fully_parallel_save={args.ckpt_fully_parallel_save}"
+        )
     return args
 
 

@@ -67,6 +67,45 @@ def load_slime_arguments_module(monkeypatch):
     return module
 
 
+def load_initialize_module(monkeypatch):
+    megatron_mod = types.ModuleType("megatron")
+    core_mod = types.ModuleType("megatron.core")
+    config_mod = types.ModuleType("megatron.core.config")
+    num_micro_mod = types.ModuleType("megatron.core.num_microbatches_calculator")
+    training_mod = types.ModuleType("megatron.training")
+    global_vars_mod = types.ModuleType("megatron.training.global_vars")
+
+    class MpuStub:
+        initialize_model_parallel = staticmethod(lambda *args, **kwargs: None)
+        get_pipeline_model_parallel_rank = staticmethod(lambda: 0)
+        get_data_parallel_rank = staticmethod(lambda with_context_parallel=False: 0)
+
+    tensor_parallel_mod = types.SimpleNamespace(model_parallel_cuda_manual_seed=lambda *args, **kwargs: None)
+
+    core_mod.mpu = MpuStub
+    core_mod.tensor_parallel = tensor_parallel_mod
+    config_mod.set_experimental_flag = lambda *args, **kwargs: None
+    num_micro_mod.init_num_microbatches_calculator = lambda *args, **kwargs: None
+    global_vars_mod._build_tokenizer = lambda *args, **kwargs: None
+    global_vars_mod.set_args = lambda *args, **kwargs: None
+
+    monkeypatch.setitem(sys.modules, "megatron", megatron_mod)
+    monkeypatch.setitem(sys.modules, "megatron.core", core_mod)
+    monkeypatch.setitem(sys.modules, "megatron.core.config", config_mod)
+    monkeypatch.setitem(sys.modules, "megatron.core.num_microbatches_calculator", num_micro_mod)
+    monkeypatch.setitem(sys.modules, "megatron.training", training_mod)
+    monkeypatch.setitem(sys.modules, "megatron.training.global_vars", global_vars_mod)
+
+    module_path = Path(__file__).resolve().parents[1] / "slime" / "backends" / "megatron_utils" / "initialize.py"
+    module_name = "test_megatron_initialize_module"
+    sys.modules.pop(module_name, None)
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def make_qwen3_6_args(**overrides):
     values = dict(
         hidden_size=2048,
@@ -108,6 +147,54 @@ def make_allgather_cp_args(**overrides):
     )
     values.update(overrides)
     return types.SimpleNamespace(**values)
+
+
+@pytest.mark.unit
+def test_megatron_initialize_fills_newer_tokenizer_defaults(monkeypatch):
+    module = load_initialize_module(monkeypatch)
+
+    args = types.SimpleNamespace()
+    module._set_megatron_arg_defaults(args)
+    assert args.tokenizer_special_tokens is None
+    assert args.tokenizer_hf_no_use_fast is False
+    assert args.tokenizer_hf_no_include_special_tokens is False
+    assert args.tokenizer_sentencepiece_legacy is False
+    assert args.tiktoken_pattern is None
+    assert args.tiktoken_num_special_tokens == 1000
+    assert args.tokenizer_metadata is None
+    assert args.special_tokens is None
+    assert args.tokenizer_prompt_format is None
+    assert args.image_tag_type is None
+    assert args.force_system_message is False
+    assert args.sft_tokenizer_prompt_format is None
+
+    args = types.SimpleNamespace(
+        tokenizer_special_tokens=["<extra>"],
+        tokenizer_hf_no_use_fast=True,
+        tokenizer_hf_no_include_special_tokens=True,
+        tokenizer_sentencepiece_legacy=True,
+        tiktoken_pattern="v2",
+        tiktoken_num_special_tokens=7,
+        tokenizer_metadata="metadata.json",
+        special_tokens={"bos": "<s>"},
+        tokenizer_prompt_format="prompt",
+        image_tag_type="plain",
+        force_system_message=True,
+        sft_tokenizer_prompt_format="sft",
+    )
+    module._set_megatron_arg_defaults(args)
+    assert args.tokenizer_special_tokens == ["<extra>"]
+    assert args.tokenizer_hf_no_use_fast is True
+    assert args.tokenizer_hf_no_include_special_tokens is True
+    assert args.tokenizer_sentencepiece_legacy is True
+    assert args.tiktoken_pattern == "v2"
+    assert args.tiktoken_num_special_tokens == 7
+    assert args.tokenizer_metadata == "metadata.json"
+    assert args.special_tokens == {"bos": "<s>"}
+    assert args.tokenizer_prompt_format == "prompt"
+    assert args.image_tag_type == "plain"
+    assert args.force_system_message is True
+    assert args.sft_tokenizer_prompt_format == "sft"
 
 
 @pytest.mark.unit

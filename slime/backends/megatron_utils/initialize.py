@@ -11,6 +11,27 @@ from megatron.training.global_vars import _build_tokenizer, set_args
 logger = logging.getLogger(__name__)
 
 
+def _set_megatron_arg_defaults(args):
+    """Fill defaults expected by newer Megatron versions."""
+    defaults = {
+        "tokenizer_special_tokens": None,
+        "tokenizer_hf_no_use_fast": False,
+        "tokenizer_hf_no_include_special_tokens": False,
+        "tokenizer_sentencepiece_legacy": False,
+        "tiktoken_pattern": None,
+        "tiktoken_num_special_tokens": 1000,
+        "tokenizer_metadata": None,
+        "special_tokens": None,
+        "tokenizer_prompt_format": None,
+        "image_tag_type": None,
+        "force_system_message": False,
+        "sft_tokenizer_prompt_format": None,
+    }
+    for name, value in defaults.items():
+        if not hasattr(args, name):
+            setattr(args, name, value)
+
+
 def _set_random_seed(
     seed_: int,
     data_parallel_random_init: bool = False,
@@ -54,6 +75,7 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
 
 
 def init(args):
+    _set_megatron_arg_defaults(args)
     set_args(args)
     if args.enable_experimental:
         logger.info("Enable megatron experimental")

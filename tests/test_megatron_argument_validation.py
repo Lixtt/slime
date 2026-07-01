@@ -170,6 +170,7 @@ def test_megatron_initialize_fills_newer_tokenizer_defaults(monkeypatch):
     assert args.hybrid_layer_pattern is None
     assert args.moe_latent_size is None
     assert args.te_precision_config_file is None
+    assert args.ddp_param_name_patterns_for_fp32_local_accumulation == []
 
     args = types.SimpleNamespace(
         tokenizer_special_tokens=["<extra>"],
@@ -187,6 +188,7 @@ def test_megatron_initialize_fills_newer_tokenizer_defaults(monkeypatch):
         hybrid_layer_pattern="M-M",
         moe_latent_size=128,
         te_precision_config_file="precision.yaml",
+        ddp_param_name_patterns_for_fp32_local_accumulation=["linear_q_down_proj"],
     )
     module._set_megatron_arg_defaults(args)
     assert args.tokenizer_special_tokens == ["<extra>"]
@@ -204,6 +206,7 @@ def test_megatron_initialize_fills_newer_tokenizer_defaults(monkeypatch):
     assert args.hybrid_layer_pattern == "M-M"
     assert args.moe_latent_size == 128
     assert args.te_precision_config_file == "precision.yaml"
+    assert args.ddp_param_name_patterns_for_fp32_local_accumulation == ["linear_q_down_proj"]
 
 
 @pytest.mark.unit

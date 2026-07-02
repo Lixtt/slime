@@ -216,6 +216,69 @@ def test_serialize_flattened_bucket_keeps_historical_direct_ipc_with_tms_preload
     assert calls == []
 
 
+def test_send_to_colocated_engine_uses_historical_direct_ipc_for_pp1(monkeypatch):
+    module = _load_update_weight_module_with_stubs(monkeypatch)
+
+    class FakeFlattenedTensorBucket:
+        def __init__(self, named_tensors):
+            self.named_tensors = named_tensors
+
+        def get_metadata(self):
+            return [("weight", (2,), "float32")]
+
+        def get_flattened_tensor(self):
+            return torch.ones(2, dtype=torch.float32)
+
+    serialize_calls = []
+
+    def serialize(obj, output_str=False):
+        serialize_calls.append((obj, output_str))
+        return "direct-ipc-payload"
+
+    def gather_object(obj, object_gather_list=None, dst=0, group=None):
+        object_gather_list[0] = obj
+
+    class FakeRemote:
+        def __init__(self):
+            self.kwargs = None
+
+        def remote(self, **kwargs):
+            self.kwargs = kwargs
+            return "ref"
+
+    fake_remote = FakeRemote()
+    fake_engine = types.SimpleNamespace(update_weights_from_tensor=fake_remote)
+    monkeypatch.setattr(module, "FlattenedTensorBucket", FakeFlattenedTensorBucket)
+    monkeypatch.setattr(module.MultiprocessingSerializer, "serialize", serialize)
+    monkeypatch.setattr(
+        module,
+        "_serialize_flattened_bucket",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("fallback helper should not run")),
+    )
+    monkeypatch.setattr(module.dist, "get_world_size", lambda group=None: 1)
+    monkeypatch.setattr(module.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(module.dist, "gather_object", gather_object)
+
+    refs, long_lived = module._send_to_colocated_engine(
+        [("weight", torch.ones(2, dtype=torch.float32))],
+        args=Namespace(sglang_pp_size=1, num_layers=78),
+        ipc_engine=fake_engine,
+        ipc_gather_src=0,
+        ipc_gather_group=object(),
+        weight_version=7,
+        force_cpu_payload=False,
+    )
+
+    assert refs == ["ref"]
+    assert len(long_lived) == 1
+    assert serialize_calls == [(long_lived[0], True)]
+    assert fake_remote.kwargs == {
+        "serialized_named_tensors": ["direct-ipc-payload"],
+        "load_format": "flattened_bucket",
+        "weight_version": "7",
+    }
+
+
 def test_multinode_colocated_tensor_update_rejects_cuda_ipc_by_default(monkeypatch):
     module = _load_update_weight_module_with_stubs(monkeypatch)
     updater = object.__new__(module.UpdateWeightFromTensor)

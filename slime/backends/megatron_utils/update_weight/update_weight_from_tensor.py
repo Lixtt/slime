@@ -1,11 +1,6 @@
-import base64
 import logging
-import os
-import pickle
-import sys
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import ray
@@ -18,12 +13,6 @@ from ray.actor import ActorHandle
 from slime.utils.distributed_utils import get_gloo_group
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
-from .colocated_payload import (
-    get_sglang_pp_layer_ranges,
-    resolve_sglang_pp_layer_partition,
-    select_colocated_tensor_payload_ranks,
-    split_hf_named_tensors_for_sglang_pp,
-)
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .update_weight_from_distributed import (
     connect_rollout_engines_from_distributed,
@@ -34,99 +23,14 @@ from .update_weight_from_distributed import (
 
 
 logger = logging.getLogger(__name__)
-_LOGGED_NESTED_PP_PAYLOAD = False
-_LOGGED_CUDA_IPC_CPU_FALLBACK = False
 _LOGGED_CUDA_IPC_FAILURE = False
-
-
-def _torch_memory_saver_is_active(torch_memory_saver: Any) -> bool:
-    impl = getattr(torch_memory_saver, "_impl", None)
-    binary_wrapper = getattr(impl, "_binary_wrapper", None)
-    cdll = getattr(binary_wrapper, "cdll", None)
-    get_interesting_region = getattr(cdll, "tms_get_interesting_region", None)
-    if get_interesting_region is None:
-        return True
-    try:
-        return bool(get_interesting_region())
-    except Exception:
-        return False
-
-
-def _is_tms_inactive_disable_assertion(exc: AssertionError) -> bool:
-    return "disable() should be called only when tms is active" in str(exc)
-
-
-def _debug_tms_interesting_region() -> str:
-    # Diagnostic only, used in the CUDA IPC failure log below to tell apart
-    # "torch_memory_saver's interesting_region was left True/unset because
-    # something re-enabled it mid-scope" from "it was correctly False and
-    # the failure has a different cause". See
-    # slime/backends/megatron_utils/__init__.py's deep_ep.Buffer.__init__
-    # patch for one known way interesting_region can flip back to True
-    # while nested inside an outer torch_memory_saver.disable().
-    try:
-        from torch_memory_saver import torch_memory_saver
-    except Exception as exc:
-        return f"<unavailable: {exc!r}>"
-    impl = getattr(torch_memory_saver, "_impl", None)
-    if impl is None:
-        return "<tms not initialized>"
-    try:
-        return str(bool(impl._binary_wrapper.cdll.tms_get_interesting_region()))
-    except Exception as exc:
-        return f"<error: {exc!r}>"
-
-
-@contextmanager
-def _cuda_ipc_allocation_context(force_cpu_payload: bool):
-    if force_cpu_payload:
-        with nullcontext():
-            yield
-        return
-    if "torch_memory_saver" not in os.environ.get("LD_PRELOAD", ""):
-        with nullcontext():
-            yield
-        return
-    try:
-        from torch_memory_saver import torch_memory_saver
-    except Exception:
-        with nullcontext():
-            yield
-        return
-    disable = getattr(torch_memory_saver, "disable", None)
-    if disable is None or not _torch_memory_saver_is_active(torch_memory_saver):
-        with nullcontext():
-            yield
-        return
-
-    disable_context = disable()
-    try:
-        disable_context.__enter__()
-    except AssertionError as exc:
-        if not _is_tms_inactive_disable_assertion(exc):
-            raise
-        logger.debug(
-            "Skipping torch_memory_saver.disable() around CUDA IPC serialization "
-            "because TMS is not active in this process."
-        )
-        with nullcontext():
-            yield
-        return
-
-    try:
-        yield
-    except BaseException:
-        if not disable_context.__exit__(*sys.exc_info()):
-            raise
-    else:
-        disable_context.__exit__(None, None, None)
 
 
 class UpdateWeightFromTensor:
     """
     Update rollout engines from tensor dict:
     load(dict→GPU) → broadcast PP/EP(GPU NCCL) → gather TP(GPU NCCL) → convert HF(GPU) → send.
-    Colocated: serialize CUDA IPC metadata → gather_object(control-plane) → Ray request to engine.
+    Colocated: GPU→CPU serialize → gather_object(Gloo CPU, collects from rollout_num_gpus_per_engine ranks) → Ray IPC to engine.
     Distributed: GPU NCCL broadcast to remote engines.
     """
 
@@ -174,7 +78,6 @@ class UpdateWeightFromTensor:
         self._ipc_gather_src = None
         self._ipc_engine = None
         self._model_update_groups = None
-        self._ipc_force_cpu_payload = False
 
     def connect_rollout_engines(
         self,
@@ -235,27 +138,15 @@ class UpdateWeightFromTensor:
         colocate_gpu_offsets = engine_gpu_offsets[:colocate_engine_nums]
         colocate_gpu_counts = engine_gpu_counts[:colocate_engine_nums]
 
-        # Create IPC metadata gather groups (only on first call; partitioning is
+        # Create IPC Gloo gather groups (only on first call; partitioning is
         # fixed across reconnects).
         if self._ipc_gather_group is None:
             for i in range(colocate_engine_nums):
                 group_ranks = list(range(colocate_gpu_offsets[i], colocate_gpu_offsets[i] + colocate_gpu_counts[i]))
-                payload_group_ranks = select_colocated_tensor_payload_ranks(group_ranks, self.args)
-                new_group = dist.new_group(ranks=payload_group_ranks, backend="gloo")
-                if dist.get_rank() in payload_group_ranks:
+                new_group = dist.new_group(ranks=group_ranks, backend="gloo")
+                if dist.get_rank() in group_ranks:
                     self._ipc_gather_group = new_group
-                    self._ipc_gather_src = payload_group_ranks[0]
-                if dist.get_rank() == payload_group_ranks[0] and len(payload_group_ranks) != len(group_ranks):
-                    logger.info(
-                        "Colocated tensor update will gather %d TP payload rank(s) for PP engine=%s "
-                        "instead of %d engine rank(s): payload_ranks=%s engine_ranks=%s sglang_pp_size=%s",
-                        len(payload_group_ranks),
-                        i,
-                        len(group_ranks),
-                        payload_group_ranks,
-                        group_ranks,
-                        getattr(self.args, "sglang_pp_size", 1),
-                    )
+                    self._ipc_gather_src = colocate_gpu_offsets[i]
 
         # Map training ranks to colocated engine actors.
         for i, engine in enumerate(self.rollout_engines):
@@ -263,51 +154,6 @@ class UpdateWeightFromTensor:
             end = start + colocate_gpu_counts[i]
             if start <= dist.get_rank() < end:
                 self._ipc_engine = engine
-                group_ranks = list(range(start, end))
-                payload_group_ranks = select_colocated_tensor_payload_ranks(group_ranks, self.args)
-                num_gpus_per_node = int(getattr(self.args, "num_gpus_per_node", colocate_gpu_counts[i]) or 0)
-                engine_spans_nodes = _ranks_span_nodes(group_ranks, num_gpus_per_node)
-                payload_spans_nodes = _ranks_span_nodes(payload_group_ranks, num_gpus_per_node)
-                explicit_cpu_payload = getattr(self.args, "colocated_tensor_update_cpu_payload", False)
-                if (
-                    payload_spans_nodes
-                    and not explicit_cpu_payload
-                    and not _truthy_env("GLM52_ALLOW_UNSAFE_CROSS_NODE_CUDA_IPC", default=False)
-                ):
-                    raise RuntimeError(
-                        "Colocated tensor update would serialize CUDA IPC metadata for a rollout engine "
-                        f"whose payload ranks span multiple nodes: engine={i} ranks={start}-{end - 1} "
-                        f"payload_ranks={payload_group_ranks} num_gpus_per_node={num_gpus_per_node}. "
-                        "CUDA IPC handles are host-local. Use colocated distributed/NCCL weight update, "
-                        "set COLOCATED_TENSOR_UPDATE_CPU_PAYLOAD=1 for a labelled slow diagnostic, "
-                        "or set GLM52_ALLOW_UNSAFE_CROSS_NODE_CUDA_IPC=1 only while developing host-local routing."
-                    )
-                self._ipc_force_cpu_payload = bool(explicit_cpu_payload)
-                if dist.get_rank() == start and self._ipc_force_cpu_payload:
-                    logger.info(
-                        "Using CPU payload for colocated tensor update: engine=%s ranks=%s-%s "
-                        "engine_spans_nodes=%s payload_spans_nodes=%s payload_ranks=%s explicit=%s",
-                        i,
-                        start,
-                        end - 1,
-                        engine_spans_nodes,
-                        payload_spans_nodes,
-                        payload_group_ranks,
-                        explicit_cpu_payload,
-                    )
-                elif dist.get_rank() == start and engine_spans_nodes:
-                    logger.info(
-                        "Using CUDA IPC metadata for multi-node colocated tensor update: "
-                        "engine=%s logical_ranks=%s-%s payload_count=%s payload_ranks=%s "
-                        "payload_spans_nodes=%s. Remote PP stages deserialize payloads produced by "
-                        "the same-node effective TP Megatron ranks.",
-                        i,
-                        start,
-                        end - 1,
-                        len(payload_group_ranks),
-                        payload_group_ranks,
-                        payload_spans_nodes,
-                    )
 
     def pop_metrics(self) -> dict[str, float]:
         """
@@ -350,10 +196,6 @@ class UpdateWeightFromTensor:
         ):
             refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
             ray.get(refs)
-            # The colocated PP path may gather payloads only from the effective
-            # TP ranks because SGLang indexes payloads by tp_rank. Keep every
-            # Megatron rank chunk-synchronous before the next PP/TP collective.
-            dist.barrier(group=get_gloo_group())
             # Free GPU tensors so the caching allocator can reuse the blocks,
             # then release CUDA IPC cache entries whose consumers (sglang engines)
             # have already closed their IPC handles.
@@ -386,12 +228,10 @@ class UpdateWeightFromTensor:
 
         refs_colocated, long_lived_tensors = _send_to_colocated_engine(
             hf_named_tensors,
-            args=self.args,
             ipc_engine=self._ipc_engine,
             ipc_gather_src=self._ipc_gather_src,
             ipc_gather_group=self._ipc_gather_group,
             weight_version=self.weight_version,
-            force_cpu_payload=self._ipc_force_cpu_payload,
         )
         all_refs.extend(refs_colocated)
 
@@ -412,12 +252,10 @@ class UpdateWeightFromTensor:
 def _send_to_colocated_engine(
     hf_named_tensors: list[tuple[str, torch.Tensor]],
     *,
-    args: Namespace | None,
     ipc_engine,
     ipc_gather_src,
     ipc_gather_group,
     weight_version,
-    force_cpu_payload: bool = False,
 ) -> tuple[list[ObjectRef], Any]:
     # Placeholder ranks (GPU slots reserved but no engine) have no gather group.
     # gather_object is only collective among group members, so we skip entirely.
@@ -425,19 +263,6 @@ def _send_to_colocated_engine(
         return [], None
 
     long_live_tensors = []
-    pp_size = int(getattr(args, "sglang_pp_size", 1) or 1) if args is not None else 1
-    num_layers = int(getattr(args, "num_layers", 0) or 0) if args is not None else 0
-    nested_pp_payload = pp_size > 1
-    if nested_pp_payload and num_layers <= 0:
-        raise ValueError("SGLang PP tensor update requires args.num_layers to split payloads by PP rank")
-    pp_partition_arg = getattr(args, "sglang_pp_layer_partition", None) if args is not None else None
-    pp_partition_env = os.getenv("SGLANG_PP_LAYER_PARTITION", "")
-    pp_partition = resolve_sglang_pp_layer_partition(pp_partition_arg)
-    pp_layer_ranges = (
-        get_sglang_pp_layer_ranges(num_layers=num_layers, pp_size=pp_size, partition=pp_partition)
-        if nested_pp_payload
-        else []
-    )
 
     if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
         converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors}
@@ -451,38 +276,14 @@ def _send_to_colocated_engine(
 
     serialized_tensors = []
     for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
-        if nested_pp_payload:
-            pp_named_tensors = split_hf_named_tensors_for_sglang_pp(
-                named_tensors,
-                pp_size=pp_size,
-                num_layers=num_layers,
-                partition=pp_partition,
-            )
-            serialized_tensors.append(
-                [
-                    _serialize_flattened_bucket(
-                        pp_tensors,
-                        long_live_tensors=long_live_tensors,
-                        force_cpu_payload=force_cpu_payload,
-                    )
-                    for pp_tensors in pp_named_tensors
-                ]
-            )
-        elif not force_cpu_payload:
-            serialized_tensors.append(
-                _serialize_flattened_bucket_direct_ipc(
-                    named_tensors,
-                    long_live_tensors=long_live_tensors,
-                )
-            )
-        else:
-            serialized_tensors.append(
-                _serialize_flattened_bucket(
-                    named_tensors,
-                    long_live_tensors=long_live_tensors,
-                    force_cpu_payload=force_cpu_payload,
-                )
-            )
+        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        metadata = flattened_tensor_bucket.get_metadata()
+        flattened_tensor_data = {
+            "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+            "metadata": metadata,
+        }
+        long_live_tensors.append(flattened_tensor_data)
+        serialized_tensors.append(_serialize_flattened_bucket(flattened_tensor_data, named_tensors))
 
     serialized_named_tensors = (
         [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == dist.get_rank() else None
@@ -498,32 +299,9 @@ def _send_to_colocated_engine(
     if dist.get_rank() == ipc_gather_src:
         # TODO: here we assume all ranks have the same number of dtypes, not sure if that is correct.
         num_dtypes = len(serialized_named_tensors[0])
-        if nested_pp_payload:
-            global _LOGGED_NESTED_PP_PAYLOAD
-            if not _LOGGED_NESTED_PP_PAYLOAD:
-                logger.info(
-                    "Colocated tensor update will send nested SGLang PP payloads: pp_size=%s "
-                    "tp_payload_ranks=%s num_layers=%s partition=%r partition_arg=%r "
-                    "partition_env=%r layer_ranges=%s",
-                    pp_size,
-                    len(serialized_named_tensors),
-                    num_layers,
-                    pp_partition,
-                    pp_partition_arg,
-                    pp_partition_env,
-                    pp_layer_ranges,
-                )
-                _LOGGED_NESTED_PP_PAYLOAD = True
         for i in range(num_dtypes):
-            if nested_pp_payload:
-                payload = [
-                    [rank_tensors[i][pp_rank] for rank_tensors in serialized_named_tensors]
-                    for pp_rank in range(pp_size)
-                ]
-            else:
-                payload = [tensors[i] for tensors in serialized_named_tensors]
             kwargs = {
-                "serialized_named_tensors": payload,
+                "serialized_named_tensors": [tensors[i] for tensors in serialized_named_tensors],
                 "load_format": "flattened_bucket",
                 "weight_version": str(weight_version),
             }
@@ -532,123 +310,22 @@ def _send_to_colocated_engine(
     return refs, long_live_tensors
 
 
-def _serialize_flattened_bucket_direct_ipc(
-    named_tensors: list[tuple[str, torch.Tensor]],
-    *,
-    long_live_tensors: list[Any],
-):
-    # PP=1 keeps the historical flat payload layout, but still needs the CUDA
-    # IPC allocation guard used by the general serializer.
-    return _serialize_flattened_bucket(
-        named_tensors,
-        long_live_tensors=long_live_tensors,
-        force_cpu_payload=False,
-    )
-
-
-def _serialize_flattened_bucket(
-    named_tensors: list[tuple[str, torch.Tensor]],
-    *,
-    long_live_tensors: list[Any],
-    force_cpu_payload: bool,
-):
-    with _cuda_ipc_allocation_context(force_cpu_payload):
-        return _serialize_flattened_bucket_impl(
-            named_tensors,
-            long_live_tensors=long_live_tensors,
-            force_cpu_payload=force_cpu_payload,
-        )
-
-
-def _serialize_flattened_bucket_impl(
-    named_tensors: list[tuple[str, torch.Tensor]],
-    *,
-    long_live_tensors: list[Any],
-    force_cpu_payload: bool,
-):
-    global _LOGGED_CUDA_IPC_CPU_FALLBACK, _LOGGED_CUDA_IPC_FAILURE
-
-    if named_tensors:
-        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-        metadata = flattened_tensor_bucket.get_metadata()
-        flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
-    else:
-        metadata = []
-        flattened_tensor = torch.empty(0, dtype=torch.uint8, device="cpu")
-
-    if force_cpu_payload:
-        # Diagnostic fallback only. For large GLM5.2 syncs this copies real
-        # tensor bytes through CPU/control-plane transport and is expected to be slow.
-        flattened_tensor = flattened_tensor.detach().cpu().contiguous()
-    elif not flattened_tensor.is_contiguous():
-        flattened_tensor = flattened_tensor.contiguous()
-
-    flattened_tensor_data = {
-        "flattened_tensor": flattened_tensor,
-        "metadata": metadata,
-    }
-    long_live_tensors.append(flattened_tensor_data)
-    if force_cpu_payload:
-        return _serialize_cpu_flattened_bucket(flattened_tensor_data)
-
-    tensor_bytes = flattened_tensor.numel() * flattened_tensor.element_size()
-    sample_names = [name for name, _ in named_tensors[:3]]
+def _serialize_flattened_bucket(flattened_tensor_data: dict[str, Any], named_tensors) -> str:
+    global _LOGGED_CUDA_IPC_FAILURE
     try:
-        if flattened_tensor.is_cuda:
-            torch.cuda.synchronize(flattened_tensor.device)
         return MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
     except Exception:
-        if not _truthy_env("COLOCATED_TENSOR_UPDATE_CUDA_IPC_FALLBACK_TO_CPU", default=False):
-            if not _LOGGED_CUDA_IPC_FAILURE:
-                logger.error(
-                    "CUDA IPC serialization failed for colocated tensor update bucket "
-                    "(num_tensors=%d flattened_bytes=%d dtype=%s device=%s sample_names=%s "
-                    "tms_interesting_region=%s). "
-                    "CPU fallback is disabled, so update_weights will fail.",
-                    len(named_tensors),
-                    tensor_bytes,
-                    flattened_tensor.dtype,
-                    flattened_tensor.device,
-                    sample_names,
-                    _debug_tms_interesting_region(),
-                    exc_info=True,
-                )
-                _LOGGED_CUDA_IPC_FAILURE = True
-            raise
-        if not _LOGGED_CUDA_IPC_CPU_FALLBACK:
-            logger.warning(
+        if not _LOGGED_CUDA_IPC_FAILURE:
+            flattened_tensor = flattened_tensor_data["flattened_tensor"]
+            logger.error(
                 "CUDA IPC serialization failed for colocated tensor update bucket "
-                "(num_tensors=%d flattened_bytes=%d dtype=%s device=%s sample_names=%s). "
-                "Falling back to CPU payload for this bucket; this is a slow diagnostic path.",
+                "(num_tensors=%d flattened_bytes=%d dtype=%s device=%s sample_names=%s).",
                 len(named_tensors),
-                tensor_bytes,
+                flattened_tensor.numel() * flattened_tensor.element_size(),
                 flattened_tensor.dtype,
                 flattened_tensor.device,
-                sample_names,
+                [name for name, _ in named_tensors[:3]],
                 exc_info=True,
             )
-            _LOGGED_CUDA_IPC_CPU_FALLBACK = True
-        cpu_tensor_data = {
-            "flattened_tensor": flattened_tensor.detach().cpu().contiguous(),
-            "metadata": metadata,
-        }
-        long_live_tensors[-1] = cpu_tensor_data
-        return _serialize_cpu_flattened_bucket(cpu_tensor_data)
-
-
-def _serialize_cpu_flattened_bucket(flattened_tensor_data: dict[str, Any]) -> str:
-    payload = pickle.dumps(flattened_tensor_data, protocol=pickle.HIGHEST_PROTOCOL)
-    return base64.b64encode(payload).decode("utf-8")
-
-
-def _ranks_span_nodes(ranks: list[int], num_gpus_per_node: int) -> bool:
-    if num_gpus_per_node <= 0 or not ranks:
-        return False
-    return len({rank // num_gpus_per_node for rank in ranks}) > 1
-
-
-def _truthy_env(name: str, *, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+            _LOGGED_CUDA_IPC_FAILURE = True
+        raise

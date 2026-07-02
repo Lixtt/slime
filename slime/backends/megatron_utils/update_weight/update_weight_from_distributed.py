@@ -269,7 +269,11 @@ class UpdateWeightFromDistributed:
         """
         names = [name for name, _ in named_tensors]
         all_names = [
-            names for _rank, names in all_gather_object_for_group_via_gloo(names, mpu.get_expert_model_parallel_group())
+            names
+            for _rank, names in all_gather_object_for_group_via_gloo(
+                (dist.get_rank(), names),
+                mpu.get_expert_model_parallel_group(),
+            )
         ]
         assert len(all_names) == mpu.get_expert_model_parallel_world_size(), (
             f"Expected {mpu.get_expert_model_parallel_world_size()} EP name payloads, got {len(all_names)}"

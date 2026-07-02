@@ -86,6 +86,28 @@ def test_all_gather_object_for_group_via_gloo_filters_target_group(monkeypatch):
 
 
 @pytest.mark.unit
+def test_all_gather_object_for_group_via_gloo_rejects_non_rank_payload(monkeypatch):
+    common = _load_common_with_stubbed_deps(monkeypatch)
+    target_group = object()
+    gloo_group = object()
+
+    common.get_gloo_group = lambda: gloo_group
+    common.dist.get_world_size = lambda group=None: 2
+    common.dist.get_process_group_ranks = lambda group: [0, 1]
+
+    def fake_all_gather_object(*, obj, object_list, group):
+        object_list[:] = [
+            ["name.from.bad.caller"],
+            ["another.bad.payload"],
+        ]
+
+    common.dist.all_gather_object = fake_all_gather_object
+
+    with pytest.raises(ValueError, match="expects every gathered object"):
+        common.all_gather_object_for_group_via_gloo(["name.from.bad.caller"], target_group)
+
+
+@pytest.mark.unit
 def test_get_gloo_group_for_process_group_creates_reported_subgroups_in_order(monkeypatch):
     common = _load_common_with_stubbed_deps(monkeypatch)
     target_group = object()
@@ -178,9 +200,8 @@ def test_named_params_and_buffers_trainable_only_filters_frozen_params_and_buffe
 
 
 @pytest.mark.unit
-def test_all_gather_param_moves_cpu_non_tp_param_to_current_cuda(monkeypatch):
+def test_all_gather_param_returns_cpu_non_tp_param_without_materialization(monkeypatch):
     common = _load_common_with_stubbed_deps(monkeypatch)
-    calls = {}
 
     class DummyDevice:
         def __init__(self, device_type):
@@ -196,39 +217,34 @@ def test_all_gather_param_moves_cpu_non_tp_param_to_current_cuda(monkeypatch):
             self.device = DummyDevice(device_type)
 
         def to(self, *, device, non_blocking):
-            calls["device"] = device
-            calls["non_blocking"] = non_blocking
-            return DummyTensor(f"{self.label}@{device}", "cuda")
+            raise AssertionError("all_gather_param should not materialize non-TP tensors to CUDA")
 
     common.torch.cuda = types.SimpleNamespace(is_available=lambda: True, current_device=lambda: 5)
 
-    gathered = common.all_gather_param("module.module.decoder.layers.0.self_attention.weight", DummyTensor("w"))
+    tensor = DummyTensor("w")
+    gathered = common.all_gather_param("module.module.decoder.layers.0.self_attention.weight", tensor)
 
-    assert gathered.label == "w@cuda:5"
-    assert calls == {"device": "cuda:5", "non_blocking": True}
+    assert gathered is tensor.data
 
 
 @pytest.mark.unit
-def test_all_gather_param_uses_current_cuda_even_if_is_available_is_false(monkeypatch):
+def test_all_gather_params_async_returns_direct_params_without_materialization(monkeypatch):
     common = _load_common_with_stubbed_deps(monkeypatch)
-
-    class DummyDevice:
-        type = "cpu"
 
     class DummyTensor:
         tensor_model_parallel = False
         parallel_mode = None
 
-        def __init__(self, label, device_type="cpu"):
+        def __init__(self, label):
             self.label = label
             self.data = self
-            self.device = types.SimpleNamespace(type=device_type)
 
         def to(self, *, device, non_blocking):
-            return DummyTensor(f"{self.label}@{device}", "cuda")
+            raise AssertionError("all_gather_params_async should not materialize non-TP tensors to CUDA")
 
-    common.torch.cuda = types.SimpleNamespace(is_available=lambda: False, current_device=lambda: 3)
+    info = types.SimpleNamespace(name="module.module.decoder.layers.0.self_attention.weight")
+    tensor = DummyTensor("w")
 
-    gathered = common.all_gather_param("module.module.decoder.layers.0.self_attention.weight", DummyTensor("w"))
+    gathered = common.all_gather_params_async([(info, tensor)])
 
-    assert gathered.label == "w@cuda:3"
+    assert gathered == [tensor.data]

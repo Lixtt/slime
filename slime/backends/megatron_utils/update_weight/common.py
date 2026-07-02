@@ -54,11 +54,11 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
     Uses expert-TP for ".experts.", else regular-TP. linear_fc1 rechunked (GLU), linear_fc2 dim fix.
     """
     if "expert_bias" in name:
-        return _to_current_cuda_if_available(param.data if hasattr(param, "data") else param)
+        return param
 
     assert hasattr(param, "tensor_model_parallel"), f"{name} does not have tensor_model_parallel attribute"
     if not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated":
-        return _to_current_cuda_if_available(param.data)
+        return param.data
 
     if ".experts." in name:
         tp_size = mpu.get_expert_tensor_parallel_world_size()
@@ -67,9 +67,8 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
         tp_size = mpu.get_tensor_model_parallel_world_size()
         tp_group = mpu.get_tensor_model_parallel_group()
 
-    local_param = _to_current_cuda_if_available(param.data)
-    param_partitions = [torch.empty_like(local_param) for _ in range(tp_size)]
-    dist.all_gather(param_partitions, local_param, group=tp_group)
+    param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
+    dist.all_gather(param_partitions, param.data, group=tp_group)
     partition_dim = param.partition_dim
     assert param.partition_stride == 1 or (
         param.partition_stride == 2 and "linear_fc1" in name
@@ -127,51 +126,6 @@ def group_fused_qkv_a_sync_items(items: Sequence, name_getter) -> list[list]:
     return groups
 
 
-def _to_current_cuda_if_available(tensor: torch.Tensor) -> torch.Tensor:
-    """Materialize an offloaded tensor on the current CUDA device before NCCL/update."""
-
-    device = getattr(tensor, "device", None)
-    if getattr(device, "type", None) == "cuda":
-        return tensor
-    cuda_device = _current_cuda_device_for_update(tensor)
-    moved = tensor.to(device=cuda_device, non_blocking=True)
-    moved_device = getattr(moved, "device", None)
-    if getattr(moved_device, "type", None) == "cuda":
-        return moved
-    try:
-        copied = torch.empty_strided(
-            size=tuple(tensor.size()),
-            stride=tuple(tensor.stride()),
-            dtype=tensor.dtype,
-            device=cuda_device,
-        )
-        copied.copy_(tensor, non_blocking=True)
-    except Exception as exc:
-        raise RuntimeError(
-            "Failed to materialize update-weight tensor on CUDA before NCCL/FP8 update: "
-            f"source_device={device}, target_device={cuda_device}, tensor_type={type(tensor)!r}"
-        ) from exc
-    copied_device = getattr(copied, "device", None)
-    if getattr(copied_device, "type", None) != "cuda":
-        raise RuntimeError(
-            "Update-weight tensor stayed off CUDA after materialization: "
-            f"source_device={device}, target_device={cuda_device}, result_device={copied_device}"
-        )
-    return copied
-
-
-def _current_cuda_device_for_update(tensor: torch.Tensor) -> str:
-    try:
-        current_device = torch.cuda.current_device()
-    except Exception as exc:
-        is_available = getattr(torch.cuda, "is_available", lambda: None)()
-        raise RuntimeError(
-            "Cannot materialize update-weight tensor on CUDA because current CUDA device is unavailable: "
-            f"source_device={getattr(tensor, 'device', None)}, cuda_available={is_available}"
-        ) from exc
-    return f"cuda:{current_device}"
-
-
 def all_gather_object_for_group_via_gloo(obj, group) -> list:
     """Gather Python metadata over world Gloo, then keep members of ``group``.
 
@@ -183,7 +137,16 @@ def all_gather_object_for_group_via_gloo(obj, group) -> list:
     target_ranks = set(dist.get_process_group_ranks(group))
     gathered = [None] * dist.get_world_size(get_gloo_group())
     dist.all_gather_object(obj=obj, object_list=gathered, group=get_gloo_group())
-    return [item for item in gathered if item[0] in target_ranks]
+    filtered = []
+    for item in gathered:
+        if not isinstance(item, tuple) or len(item) < 2 or not isinstance(item[0], int):
+            raise ValueError(
+                "all_gather_object_for_group_via_gloo expects every gathered object "
+                f"to be a (rank, payload) tuple, got {item!r}"
+            )
+        if item[0] in target_ranks:
+            filtered.append(item)
+    return filtered
 
 
 def all_gather_params_async(
@@ -201,11 +164,10 @@ def all_gather_params_async(
     for info, param in param_infos_and_params:
         # Prepare async all_gather
         if "expert_bias" in info.name:
-            tensor = param.data if hasattr(param, "data") else param
-            gather_tasks.append((info, _to_current_cuda_if_available(tensor), None, None, None))
+            gather_tasks.append((info, param, None, None, None))
             handles.append(None)
         elif not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated":
-            gather_tasks.append((info, _to_current_cuda_if_available(param.data), None, None, None))
+            gather_tasks.append((info, param.data, None, None, None))
             handles.append(None)
         else:
             # Start async all_gather
@@ -216,9 +178,8 @@ def all_gather_params_async(
                 tp_size = mpu.get_tensor_model_parallel_world_size()
                 tp_group = mpu.get_tensor_model_parallel_group()
 
-            local_param = _to_current_cuda_if_available(param.data)
-            param_partitions = [torch.empty_like(local_param) for _ in range(tp_size)]
-            handle = dist.all_gather(param_partitions, local_param, group=tp_group, async_op=True)
+            param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
+            handle = dist.all_gather(param_partitions, param.data, group=tp_group, async_op=True)
             gather_tasks.append((info, None, handle, param_partitions, param.partition_dim))
             handles.append(handle)
 

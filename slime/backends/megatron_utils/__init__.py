@@ -9,12 +9,26 @@ try:
     old_init = deep_ep.Buffer.__init__
 
     def new_init(self, *args, **kwargs):
+        # Save/restore the prior interesting_region instead of unconditionally
+        # forcing it back to True. deep_ep.Buffer() can be constructed while
+        # already nested inside an outer torch_memory_saver.disable() (e.g.
+        # during colocated weight sync for MoE/EP models like GLM5.2, where
+        # weights_getter()'s EP gather step touches DeepEP buffers). Forcing
+        # True unconditionally silently re-enables the memory-saver's
+        # VMM-backed allocator for the rest of that disable() scope, which
+        # makes any tensor allocated afterward (e.g. the CUDA-IPC flattened
+        # weight bucket) fail _share_cuda_ with "invalid argument" even
+        # though the caller believes it is still inside disable().
+        cdll = None
+        prior_interesting_region = None
         if torch_memory_saver._impl is not None:
-            torch_memory_saver._impl._binary_wrapper.cdll.tms_set_interesting_region(False)
+            cdll = torch_memory_saver._impl._binary_wrapper.cdll
+            prior_interesting_region = cdll.tms_get_interesting_region()
+            cdll.tms_set_interesting_region(False)
         old_init(self, *args, **kwargs)
         torch.cuda.synchronize()
-        if torch_memory_saver._impl is not None:
-            torch_memory_saver._impl._binary_wrapper.cdll.tms_set_interesting_region(True)
+        if cdll is not None:
+            cdll.tms_set_interesting_region(prior_interesting_region)
 
     deep_ep.Buffer.__init__ = new_init
 except ImportError:

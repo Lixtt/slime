@@ -516,16 +516,13 @@ def _serialize_flattened_bucket_direct_ipc(
     *,
     long_live_tensors: list[Any],
 ):
-    # Keep the validated SGLang PP=1 colocated path close to the historical
-    # implementation. PP/fallback layouts use the wrapped helper below.
-    flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-    metadata = flattened_tensor_bucket.get_metadata()
-    flattened_tensor_data = {
-        "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
-        "metadata": metadata,
-    }
-    long_live_tensors.append(flattened_tensor_data)
-    return MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+    # PP=1 keeps the historical flat payload layout, but still needs the CUDA
+    # IPC allocation guard used by the general serializer.
+    return _serialize_flattened_bucket(
+        named_tensors,
+        long_live_tensors=long_live_tensors,
+        force_cpu_payload=False,
+    )
 
 
 def _serialize_flattened_bucket(

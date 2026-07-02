@@ -1,4 +1,5 @@
 import base64
+import contextlib
 import pickle
 import sys
 import types
@@ -369,7 +370,7 @@ def test_send_to_colocated_engine_uses_direct_ipc_serializer_for_pp1(monkeypatch
     }
 
 
-def test_direct_ipc_serializer_keeps_historical_fast_path(monkeypatch):
+def test_direct_ipc_serializer_uses_cuda_ipc_allocation_context(monkeypatch):
     module = _load_update_weight_module_with_stubs(monkeypatch)
 
     class FakeFlattenedTensorBucket:
@@ -388,8 +389,16 @@ def test_direct_ipc_serializer_keeps_historical_fast_path(monkeypatch):
         serialized.append((obj, output_str))
         return "direct-ipc-payload"
 
+    calls = []
+
+    @contextlib.contextmanager
+    def allocation_context(force_cpu_payload):
+        calls.append(force_cpu_payload)
+        yield
+
     monkeypatch.setenv("COLOCATED_TENSOR_UPDATE_CUDA_IPC_FALLBACK_TO_CPU", "1")
     monkeypatch.setattr(module, "FlattenedTensorBucket", FakeFlattenedTensorBucket)
+    monkeypatch.setattr(module, "_cuda_ipc_allocation_context", allocation_context)
     monkeypatch.setattr(module.MultiprocessingSerializer, "serialize", serialize)
 
     long_lived = []
@@ -399,6 +408,7 @@ def test_direct_ipc_serializer_keeps_historical_fast_path(monkeypatch):
     )
 
     assert payload == "direct-ipc-payload"
+    assert calls == [False]
     assert len(serialized) == 1
     assert serialized[0][1] is True
     assert long_lived[-1] is serialized[0][0]

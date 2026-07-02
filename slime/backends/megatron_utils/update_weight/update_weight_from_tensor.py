@@ -2,9 +2,10 @@ import base64
 import logging
 import os
 import pickle
+import sys
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import ray
@@ -38,19 +39,66 @@ _LOGGED_CUDA_IPC_CPU_FALLBACK = False
 _LOGGED_CUDA_IPC_FAILURE = False
 
 
+def _torch_memory_saver_is_active(torch_memory_saver: Any) -> bool:
+    impl = getattr(torch_memory_saver, "_impl", None)
+    binary_wrapper = getattr(impl, "_binary_wrapper", None)
+    cdll = getattr(binary_wrapper, "cdll", None)
+    get_interesting_region = getattr(cdll, "tms_get_interesting_region", None)
+    if get_interesting_region is None:
+        return True
+    try:
+        return bool(get_interesting_region())
+    except Exception:
+        return False
+
+
+def _is_tms_inactive_disable_assertion(exc: AssertionError) -> bool:
+    return "disable() should be called only when tms is active" in str(exc)
+
+
+@contextmanager
 def _cuda_ipc_allocation_context(force_cpu_payload: bool):
     if force_cpu_payload:
-        return nullcontext()
+        with nullcontext():
+            yield
+        return
     if "torch_memory_saver" not in os.environ.get("LD_PRELOAD", ""):
-        return nullcontext()
+        with nullcontext():
+            yield
+        return
     try:
         from torch_memory_saver import torch_memory_saver
     except Exception:
-        return nullcontext()
+        with nullcontext():
+            yield
+        return
     disable = getattr(torch_memory_saver, "disable", None)
-    if disable is None:
-        return nullcontext()
-    return disable()
+    if disable is None or not _torch_memory_saver_is_active(torch_memory_saver):
+        with nullcontext():
+            yield
+        return
+
+    disable_context = disable()
+    try:
+        disable_context.__enter__()
+    except AssertionError as exc:
+        if not _is_tms_inactive_disable_assertion(exc):
+            raise
+        logger.debug(
+            "Skipping torch_memory_saver.disable() around CUDA IPC serialization "
+            "because TMS is not active in this process."
+        )
+        with nullcontext():
+            yield
+        return
+
+    try:
+        yield
+    except BaseException:
+        if not disable_context.__exit__(*sys.exc_info()):
+            raise
+    else:
+        disable_context.__exit__(None, None, None)
 
 
 class UpdateWeightFromTensor:

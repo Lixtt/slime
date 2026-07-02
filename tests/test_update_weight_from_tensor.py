@@ -170,6 +170,55 @@ def test_serialize_flattened_bucket_logs_context_without_cpu_fallback(monkeypatc
     assert "sample_names=['weight']" in caplog.text
 
 
+def test_serialize_flattened_bucket_disables_tms_for_cuda_ipc(monkeypatch):
+    module = _load_update_weight_module_with_stubs(monkeypatch)
+    calls = []
+
+    class FakeDisableContext:
+        def __enter__(self):
+            calls.append("enter")
+
+        def __exit__(self, exc_type, exc, tb):
+            calls.append("exit")
+
+    fake_tms = types.SimpleNamespace(disable=lambda: FakeDisableContext())
+    monkeypatch.setenv("LD_PRELOAD", "/tmp/torch_memory_saver_hook.so")
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_memory_saver",
+        types.SimpleNamespace(torch_memory_saver=fake_tms),
+    )
+
+    class FakeFlattenedTensorBucket:
+        def __init__(self, named_tensors):
+            self.named_tensors = named_tensors
+
+        def get_metadata(self):
+            return [("weight", (2,), "float32")]
+
+        def get_flattened_tensor(self):
+            return torch.ones(2, dtype=torch.float32)
+
+    serialize_calls = []
+
+    def serialize(_obj, output_str=False):
+        serialize_calls.append(list(calls))
+        return "ipc-payload"
+
+    monkeypatch.setattr(module, "FlattenedTensorBucket", FakeFlattenedTensorBucket)
+    monkeypatch.setattr(module.MultiprocessingSerializer, "serialize", serialize)
+
+    payload = module._serialize_flattened_bucket(
+        [("weight", torch.ones(2, dtype=torch.float32))],
+        long_live_tensors=[],
+        force_cpu_payload=False,
+    )
+
+    assert payload == "ipc-payload"
+    assert serialize_calls == [["enter"]]
+    assert calls == ["enter", "exit"]
+
+
 def test_multinode_colocated_tensor_update_rejects_cuda_ipc_by_default(monkeypatch):
     module = _load_update_weight_module_with_stubs(monkeypatch)
     updater = object.__new__(module.UpdateWeightFromTensor)

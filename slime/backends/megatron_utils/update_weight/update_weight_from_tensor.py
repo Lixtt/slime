@@ -4,6 +4,7 @@ import os
 import pickle
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from typing import Any
 
 import ray
@@ -35,6 +36,21 @@ logger = logging.getLogger(__name__)
 _LOGGED_NESTED_PP_PAYLOAD = False
 _LOGGED_CUDA_IPC_CPU_FALLBACK = False
 _LOGGED_CUDA_IPC_FAILURE = False
+
+
+def _cuda_ipc_allocation_context(force_cpu_payload: bool):
+    if force_cpu_payload:
+        return nullcontext()
+    if "torch_memory_saver" not in os.environ.get("LD_PRELOAD", ""):
+        return nullcontext()
+    try:
+        from torch_memory_saver import torch_memory_saver
+    except Exception:
+        return nullcontext()
+    disable = getattr(torch_memory_saver, "disable", None)
+    if disable is None:
+        return nullcontext()
+    return disable()
 
 
 class UpdateWeightFromTensor:
@@ -441,6 +457,20 @@ def _send_to_colocated_engine(
 
 
 def _serialize_flattened_bucket(
+    named_tensors: list[tuple[str, torch.Tensor]],
+    *,
+    long_live_tensors: list[Any],
+    force_cpu_payload: bool,
+):
+    with _cuda_ipc_allocation_context(force_cpu_payload):
+        return _serialize_flattened_bucket_impl(
+            named_tensors,
+            long_live_tensors=long_live_tensors,
+            force_cpu_payload=force_cpu_payload,
+        )
+
+
+def _serialize_flattened_bucket_impl(
     named_tensors: list[tuple[str, torch.Tensor]],
     *,
     long_live_tensors: list[Any],

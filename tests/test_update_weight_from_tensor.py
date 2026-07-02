@@ -311,19 +311,21 @@ def test_serialize_flattened_bucket_tolerates_tms_inactive_assertion(monkeypatch
     assert calls == ["enter"]
 
 
-def test_send_to_colocated_engine_uses_guarded_serializer_for_pp1(monkeypatch):
+def test_send_to_colocated_engine_uses_direct_ipc_serializer_for_pp1(monkeypatch):
     module = _load_update_weight_module_with_stubs(monkeypatch)
-    serialize_calls = []
+    direct_calls = []
 
-    def serialize_bucket(named_tensors, *, long_live_tensors, force_cpu_payload):
-        serialize_calls.append(
+    def serialize_direct_ipc(named_tensors, *, long_live_tensors):
+        direct_calls.append(
             {
                 "named_tensors": named_tensors,
-                "force_cpu_payload": force_cpu_payload,
             }
         )
         long_live_tensors.append({"flattened_tensor": torch.ones(2), "metadata": []})
-        return "guarded-ipc-payload"
+        return "direct-ipc-payload"
+
+    def serialize_bucket(*_args, **_kwargs):
+        raise AssertionError("PP=1 tensor IPC should use the direct serializer")
 
     def gather_object(obj, object_gather_list=None, dst=0, group=None):
         object_gather_list[0] = obj
@@ -338,6 +340,7 @@ def test_send_to_colocated_engine_uses_guarded_serializer_for_pp1(monkeypatch):
 
     fake_remote = FakeRemote()
     fake_engine = types.SimpleNamespace(update_weights_from_tensor=fake_remote)
+    monkeypatch.setattr(module, "_serialize_flattened_bucket_direct_ipc", serialize_direct_ipc)
     monkeypatch.setattr(module, "_serialize_flattened_bucket", serialize_bucket)
     monkeypatch.setattr(module.dist, "get_world_size", lambda group=None: 1)
     monkeypatch.setattr(module.dist, "get_rank", lambda: 0)
@@ -355,13 +358,12 @@ def test_send_to_colocated_engine_uses_guarded_serializer_for_pp1(monkeypatch):
 
     assert refs == ["ref"]
     assert len(long_lived) == 1
-    assert len(serialize_calls) == 1
-    assert serialize_calls[0]["force_cpu_payload"] is False
-    assert len(serialize_calls[0]["named_tensors"]) == 1
-    assert serialize_calls[0]["named_tensors"][0][0] == "weight"
-    assert torch.equal(serialize_calls[0]["named_tensors"][0][1], torch.ones(2, dtype=torch.float32))
+    assert len(direct_calls) == 1
+    assert len(direct_calls[0]["named_tensors"]) == 1
+    assert direct_calls[0]["named_tensors"][0][0] == "weight"
+    assert torch.equal(direct_calls[0]["named_tensors"][0][1], torch.ones(2, dtype=torch.float32))
     assert fake_remote.kwargs == {
-        "serialized_named_tensors": ["guarded-ipc-payload"],
+        "serialized_named_tensors": ["direct-ipc-payload"],
         "load_format": "flattened_bucket",
         "weight_version": "7",
     }

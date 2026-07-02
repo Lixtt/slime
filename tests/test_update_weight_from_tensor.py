@@ -369,7 +369,7 @@ def test_send_to_colocated_engine_uses_direct_ipc_serializer_for_pp1(monkeypatch
     }
 
 
-def test_direct_ipc_serializer_uses_cpu_fallback_guard(monkeypatch):
+def test_direct_ipc_serializer_keeps_historical_fast_path(monkeypatch):
     module = _load_update_weight_module_with_stubs(monkeypatch)
 
     class FakeFlattenedTensorBucket:
@@ -382,12 +382,15 @@ def test_direct_ipc_serializer_uses_cpu_fallback_guard(monkeypatch):
         def get_flattened_tensor(self):
             return torch.ones(2, dtype=torch.float32)
 
-    def raise_from_cuda_ipc(_obj, output_str=False):
-        raise RuntimeError("CUDA IPC unavailable")
+    serialized = []
+
+    def serialize(obj, output_str=False):
+        serialized.append((obj, output_str))
+        return "direct-ipc-payload"
 
     monkeypatch.setenv("COLOCATED_TENSOR_UPDATE_CUDA_IPC_FALLBACK_TO_CPU", "1")
     monkeypatch.setattr(module, "FlattenedTensorBucket", FakeFlattenedTensorBucket)
-    monkeypatch.setattr(module.MultiprocessingSerializer, "serialize", raise_from_cuda_ipc)
+    monkeypatch.setattr(module.MultiprocessingSerializer, "serialize", serialize)
 
     long_lived = []
     payload = module._serialize_flattened_bucket_direct_ipc(
@@ -395,9 +398,11 @@ def test_direct_ipc_serializer_uses_cpu_fallback_guard(monkeypatch):
         long_live_tensors=long_lived,
     )
 
-    decoded = pickle.loads(base64.b64decode(payload))
-    assert decoded["flattened_tensor"].device.type == "cpu"
-    assert long_lived[-1]["flattened_tensor"].device.type == "cpu"
+    assert payload == "direct-ipc-payload"
+    assert len(serialized) == 1
+    assert serialized[0][1] is True
+    assert long_lived[-1] is serialized[0][0]
+    assert torch.equal(long_lived[-1]["flattened_tensor"], torch.ones(2, dtype=torch.float32))
 
 
 def test_multinode_colocated_tensor_update_rejects_cuda_ipc_by_default(monkeypatch):

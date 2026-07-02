@@ -34,6 +34,7 @@ from .update_weight_from_distributed import (
 logger = logging.getLogger(__name__)
 _LOGGED_NESTED_PP_PAYLOAD = False
 _LOGGED_CUDA_IPC_CPU_FALLBACK = False
+_LOGGED_CUDA_IPC_FAILURE = False
 
 
 class UpdateWeightFromTensor:
@@ -445,6 +446,8 @@ def _serialize_flattened_bucket(
     long_live_tensors: list[Any],
     force_cpu_payload: bool,
 ):
+    global _LOGGED_CUDA_IPC_CPU_FALLBACK, _LOGGED_CUDA_IPC_FAILURE
+
     if named_tensors:
         flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
         metadata = flattened_tensor_bucket.get_metadata()
@@ -457,6 +460,9 @@ def _serialize_flattened_bucket(
         # Diagnostic fallback only. For large GLM5.2 syncs this copies real
         # tensor bytes through CPU/control-plane transport and is expected to be slow.
         flattened_tensor = flattened_tensor.detach().cpu().contiguous()
+    elif not flattened_tensor.is_contiguous():
+        flattened_tensor = flattened_tensor.contiguous()
+
     flattened_tensor_data = {
         "flattened_tensor": flattened_tensor,
         "metadata": metadata,
@@ -464,23 +470,40 @@ def _serialize_flattened_bucket(
     long_live_tensors.append(flattened_tensor_data)
     if force_cpu_payload:
         return _serialize_cpu_flattened_bucket(flattened_tensor_data)
+
+    tensor_bytes = flattened_tensor.numel() * flattened_tensor.element_size()
+    sample_names = [name for name, _ in named_tensors[:3]]
     try:
+        if flattened_tensor.is_cuda:
+            torch.cuda.synchronize(flattened_tensor.device)
         return MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
     except Exception:
         if not _truthy_env("COLOCATED_TENSOR_UPDATE_CUDA_IPC_FALLBACK_TO_CPU", default=True):
+            if not _LOGGED_CUDA_IPC_FAILURE:
+                logger.error(
+                    "CUDA IPC serialization failed for colocated tensor update bucket "
+                    "(num_tensors=%d flattened_bytes=%d dtype=%s device=%s sample_names=%s). "
+                    "CPU fallback is disabled, so update_weights will fail.",
+                    len(named_tensors),
+                    tensor_bytes,
+                    flattened_tensor.dtype,
+                    flattened_tensor.device,
+                    sample_names,
+                    exc_info=True,
+                )
+                _LOGGED_CUDA_IPC_FAILURE = True
             raise
-        global _LOGGED_CUDA_IPC_CPU_FALLBACK
-        tensor_bytes = flattened_tensor.numel() * flattened_tensor.element_size()
         if not _LOGGED_CUDA_IPC_CPU_FALLBACK:
             logger.warning(
                 "CUDA IPC serialization failed for colocated tensor update bucket "
-                "(num_tensors=%d flattened_bytes=%d dtype=%s device=%s). "
+                "(num_tensors=%d flattened_bytes=%d dtype=%s device=%s sample_names=%s). "
                 "Falling back to CPU payload for this bucket. Reduce UPDATE_WEIGHT_BUFFER_SIZE "
                 "if this warning appears during GLM5.2 full sync.",
                 len(named_tensors),
                 tensor_bytes,
                 flattened_tensor.dtype,
                 flattened_tensor.device,
+                sample_names,
                 exc_info=True,
             )
             _LOGGED_CUDA_IPC_CPU_FALLBACK = True

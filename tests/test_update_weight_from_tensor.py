@@ -6,6 +6,7 @@ from argparse import Namespace
 import importlib.util
 from pathlib import Path
 
+import pytest
 import torch
 
 
@@ -134,6 +135,39 @@ def test_serialize_flattened_bucket_falls_back_to_cpu_payload(monkeypatch):
     assert decoded["flattened_tensor"].device.type == "cpu"
     assert decoded["metadata"] == [("weight", (2,), "float32")]
     assert long_lived[-1]["flattened_tensor"].device.type == "cpu"
+
+
+def test_serialize_flattened_bucket_logs_context_without_cpu_fallback(monkeypatch, caplog):
+    module = _load_update_weight_module_with_stubs(monkeypatch)
+
+    class FakeFlattenedTensorBucket:
+        def __init__(self, named_tensors):
+            self.named_tensors = named_tensors
+
+        def get_metadata(self):
+            return [("weight", (2,), "float32")]
+
+        def get_flattened_tensor(self):
+            return torch.ones(2, dtype=torch.float32)
+
+    def raise_from_cuda_ipc(_obj, output_str=False):
+        raise RuntimeError("CUDA IPC unavailable")
+
+    monkeypatch.setenv("COLOCATED_TENSOR_UPDATE_CUDA_IPC_FALLBACK_TO_CPU", "0")
+    monkeypatch.setattr(module, "FlattenedTensorBucket", FakeFlattenedTensorBucket)
+    monkeypatch.setattr(module.MultiprocessingSerializer, "serialize", raise_from_cuda_ipc)
+    caplog.set_level("ERROR", logger=module.__name__)
+
+    with pytest.raises(RuntimeError, match="CUDA IPC unavailable"):
+        module._serialize_flattened_bucket(
+            [("weight", torch.ones(2, dtype=torch.float32))],
+            long_live_tensors=[],
+            force_cpu_payload=False,
+        )
+
+    assert "CPU fallback is disabled" in caplog.text
+    assert "num_tensors=1" in caplog.text
+    assert "sample_names=['weight']" in caplog.text
 
 
 def test_multinode_colocated_tensor_update_rejects_cuda_ipc_by_default(monkeypatch):

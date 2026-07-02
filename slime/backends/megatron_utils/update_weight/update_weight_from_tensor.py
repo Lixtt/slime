@@ -56,6 +56,27 @@ def _is_tms_inactive_disable_assertion(exc: AssertionError) -> bool:
     return "disable() should be called only when tms is active" in str(exc)
 
 
+def _debug_tms_interesting_region() -> str:
+    # Diagnostic only, used in the CUDA IPC failure log below to tell apart
+    # "torch_memory_saver's interesting_region was left True/unset because
+    # something re-enabled it mid-scope" from "it was correctly False and
+    # the failure has a different cause". See
+    # slime/backends/megatron_utils/__init__.py's deep_ep.Buffer.__init__
+    # patch for one known way interesting_region can flip back to True
+    # while nested inside an outer torch_memory_saver.disable().
+    try:
+        from torch_memory_saver import torch_memory_saver
+    except Exception as exc:
+        return f"<unavailable: {exc!r}>"
+    impl = getattr(torch_memory_saver, "_impl", None)
+    if impl is None:
+        return "<tms not initialized>"
+    try:
+        return str(bool(impl._binary_wrapper.cdll.tms_get_interesting_region()))
+    except Exception as exc:
+        return f"<error: {exc!r}>"
+
+
 @contextmanager
 def _cuda_ipc_allocation_context(force_cpu_payload: bool):
     if force_cpu_payload:
@@ -581,13 +602,15 @@ def _serialize_flattened_bucket_impl(
             if not _LOGGED_CUDA_IPC_FAILURE:
                 logger.error(
                     "CUDA IPC serialization failed for colocated tensor update bucket "
-                    "(num_tensors=%d flattened_bytes=%d dtype=%s device=%s sample_names=%s). "
+                    "(num_tensors=%d flattened_bytes=%d dtype=%s device=%s sample_names=%s "
+                    "tms_interesting_region=%s). "
                     "CPU fallback is disabled, so update_weights will fail.",
                     len(named_tensors),
                     tensor_bytes,
                     flattened_tensor.dtype,
                     flattened_tensor.device,
                     sample_names,
+                    _debug_tms_interesting_region(),
                     exc_info=True,
                 )
                 _LOGGED_CUDA_IPC_FAILURE = True

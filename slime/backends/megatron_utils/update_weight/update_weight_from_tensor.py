@@ -2,8 +2,10 @@ import base64
 import logging
 import os
 import pickle
+import sys
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import ray
@@ -35,6 +37,68 @@ logger = logging.getLogger(__name__)
 _LOGGED_NESTED_PP_PAYLOAD = False
 _LOGGED_CUDA_IPC_CPU_FALLBACK = False
 _LOGGED_CUDA_IPC_FAILURE = False
+
+
+def _torch_memory_saver_is_active(torch_memory_saver: Any) -> bool:
+    impl = getattr(torch_memory_saver, "_impl", None)
+    binary_wrapper = getattr(impl, "_binary_wrapper", None)
+    cdll = getattr(binary_wrapper, "cdll", None)
+    get_interesting_region = getattr(cdll, "tms_get_interesting_region", None)
+    if get_interesting_region is None:
+        return True
+    try:
+        return bool(get_interesting_region())
+    except Exception:
+        return False
+
+
+def _is_tms_inactive_disable_assertion(exc: AssertionError) -> bool:
+    return "disable() should be called only when tms is active" in str(exc)
+
+
+@contextmanager
+def _cuda_ipc_allocation_context(force_cpu_payload: bool):
+    if force_cpu_payload:
+        with nullcontext():
+            yield
+        return
+    if "torch_memory_saver" not in os.environ.get("LD_PRELOAD", ""):
+        with nullcontext():
+            yield
+        return
+    try:
+        from torch_memory_saver import torch_memory_saver
+    except Exception:
+        with nullcontext():
+            yield
+        return
+    disable = getattr(torch_memory_saver, "disable", None)
+    if disable is None or not _torch_memory_saver_is_active(torch_memory_saver):
+        with nullcontext():
+            yield
+        return
+
+    disable_context = disable()
+    try:
+        disable_context.__enter__()
+    except AssertionError as exc:
+        if not _is_tms_inactive_disable_assertion(exc):
+            raise
+        logger.debug(
+            "Skipping torch_memory_saver.disable() around CUDA IPC serialization "
+            "because TMS is not active in this process."
+        )
+        with nullcontext():
+            yield
+        return
+
+    try:
+        yield
+    except BaseException:
+        if not disable_context.__exit__(*sys.exc_info()):
+            raise
+    else:
+        disable_context.__exit__(None, None, None)
 
 
 class UpdateWeightFromTensor:
@@ -383,13 +447,6 @@ def _send_to_colocated_engine(
                     for pp_tensors in pp_named_tensors
                 ]
             )
-        elif not force_cpu_payload:
-            serialized_tensors.append(
-                _serialize_flattened_bucket_direct_ipc(
-                    named_tensors,
-                    long_live_tensors=long_live_tensors,
-                )
-            )
         else:
             serialized_tensors.append(
                 _serialize_flattened_bucket(
@@ -447,25 +504,21 @@ def _send_to_colocated_engine(
     return refs, long_live_tensors
 
 
-def _serialize_flattened_bucket_direct_ipc(
+def _serialize_flattened_bucket(
     named_tensors: list[tuple[str, torch.Tensor]],
     *,
     long_live_tensors: list[Any],
+    force_cpu_payload: bool,
 ):
-    # Keep the validated SGLang PP=1 colocated path byte-for-byte close to the
-    # historical implementation. The PP/fallback helper below is for explicit
-    # debug layouts and should not wrap the node-local TP8 fast path.
-    flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-    metadata = flattened_tensor_bucket.get_metadata()
-    flattened_tensor_data = {
-        "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
-        "metadata": metadata,
-    }
-    long_live_tensors.append(flattened_tensor_data)
-    return MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+    with _cuda_ipc_allocation_context(force_cpu_payload):
+        return _serialize_flattened_bucket_impl(
+            named_tensors,
+            long_live_tensors=long_live_tensors,
+            force_cpu_payload=force_cpu_payload,
+        )
 
 
-def _serialize_flattened_bucket(
+def _serialize_flattened_bucket_impl(
     named_tensors: list[tuple[str, torch.Tensor]],
     *,
     long_live_tensors: list[Any],
@@ -499,6 +552,8 @@ def _serialize_flattened_bucket(
     tensor_bytes = flattened_tensor.numel() * flattened_tensor.element_size()
     sample_names = [name for name, _ in named_tensors[:3]]
     try:
+        if flattened_tensor.is_cuda:
+            torch.cuda.synchronize(flattened_tensor.device)
         return MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
     except Exception:
         if not _truthy_env("COLOCATED_TENSOR_UPDATE_CUDA_IPC_FALLBACK_TO_CPU", default=False):

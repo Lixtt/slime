@@ -170,15 +170,18 @@ def test_serialize_flattened_bucket_logs_context_without_cpu_fallback(monkeypatc
     assert "sample_names=['weight']" in caplog.text
 
 
-def test_serialize_flattened_bucket_keeps_historical_direct_ipc_with_tms_preload(monkeypatch):
+def test_serialize_flattened_bucket_disables_tms_for_cuda_ipc(monkeypatch):
     module = _load_update_weight_module_with_stubs(monkeypatch)
     calls = []
 
-    def disable():
-        calls.append("disable")
-        raise AssertionError("TMS disable should not be used by default")
+    class FakeDisableContext:
+        def __enter__(self):
+            calls.append("enter")
 
-    fake_tms = types.SimpleNamespace(disable=disable)
+        def __exit__(self, exc_type, exc, tb):
+            calls.append("exit")
+
+    fake_tms = types.SimpleNamespace(disable=lambda: FakeDisableContext())
     monkeypatch.setenv("LD_PRELOAD", "/tmp/torch_memory_saver_hook.so")
     monkeypatch.setitem(
         sys.modules,
@@ -199,7 +202,7 @@ def test_serialize_flattened_bucket_keeps_historical_direct_ipc_with_tms_preload
     serialize_calls = []
 
     def serialize(_obj, output_str=False):
-        serialize_calls.append("serialize")
+        serialize_calls.append(list(calls))
         return "ipc-payload"
 
     monkeypatch.setattr(module, "FlattenedTensorBucket", FakeFlattenedTensorBucket)
@@ -212,12 +215,35 @@ def test_serialize_flattened_bucket_keeps_historical_direct_ipc_with_tms_preload
     )
 
     assert payload == "ipc-payload"
-    assert serialize_calls == ["serialize"]
-    assert calls == []
+    assert serialize_calls == [["enter"]]
+    assert calls == ["enter", "exit"]
 
 
-def test_send_to_colocated_engine_uses_historical_direct_ipc_for_pp1(monkeypatch):
+def test_serialize_flattened_bucket_skips_tms_disable_when_inactive(monkeypatch):
     module = _load_update_weight_module_with_stubs(monkeypatch)
+    calls = []
+
+    class FakeCdll:
+        @staticmethod
+        def tms_get_interesting_region():
+            return 0
+
+    def disable():
+        calls.append("disable")
+        raise AssertionError("disable should not be called")
+
+    fake_tms = types.SimpleNamespace(
+        disable=disable,
+        _impl=types.SimpleNamespace(
+            _binary_wrapper=types.SimpleNamespace(cdll=FakeCdll())
+        ),
+    )
+    monkeypatch.setenv("LD_PRELOAD", "/tmp/torch_memory_saver_hook.so")
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_memory_saver",
+        types.SimpleNamespace(torch_memory_saver=fake_tms),
+    )
 
     class FakeFlattenedTensorBucket:
         def __init__(self, named_tensors):
@@ -229,11 +255,75 @@ def test_send_to_colocated_engine_uses_historical_direct_ipc_for_pp1(monkeypatch
         def get_flattened_tensor(self):
             return torch.ones(2, dtype=torch.float32)
 
+    monkeypatch.setattr(module, "FlattenedTensorBucket", FakeFlattenedTensorBucket)
+    monkeypatch.setattr(module.MultiprocessingSerializer, "serialize", lambda _obj, output_str=False: "ipc-payload")
+
+    payload = module._serialize_flattened_bucket(
+        [("weight", torch.ones(2, dtype=torch.float32))],
+        long_live_tensors=[],
+        force_cpu_payload=False,
+    )
+
+    assert payload == "ipc-payload"
+    assert calls == []
+
+
+def test_serialize_flattened_bucket_tolerates_tms_inactive_assertion(monkeypatch):
+    module = _load_update_weight_module_with_stubs(monkeypatch)
+    calls = []
+
+    class FakeDisableContext:
+        def __enter__(self):
+            calls.append("enter")
+            raise AssertionError("disable() should be called only when tms is active")
+
+        def __exit__(self, exc_type, exc, tb):
+            calls.append("exit")
+
+    fake_tms = types.SimpleNamespace(disable=lambda: FakeDisableContext())
+    monkeypatch.setenv("LD_PRELOAD", "/tmp/torch_memory_saver_hook.so")
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_memory_saver",
+        types.SimpleNamespace(torch_memory_saver=fake_tms),
+    )
+
+    class FakeFlattenedTensorBucket:
+        def __init__(self, named_tensors):
+            self.named_tensors = named_tensors
+
+        def get_metadata(self):
+            return [("weight", (2,), "float32")]
+
+        def get_flattened_tensor(self):
+            return torch.ones(2, dtype=torch.float32)
+
+    monkeypatch.setattr(module, "FlattenedTensorBucket", FakeFlattenedTensorBucket)
+    monkeypatch.setattr(module.MultiprocessingSerializer, "serialize", lambda _obj, output_str=False: "ipc-payload")
+
+    payload = module._serialize_flattened_bucket(
+        [("weight", torch.ones(2, dtype=torch.float32))],
+        long_live_tensors=[],
+        force_cpu_payload=False,
+    )
+
+    assert payload == "ipc-payload"
+    assert calls == ["enter"]
+
+
+def test_send_to_colocated_engine_uses_guarded_serializer_for_pp1(monkeypatch):
+    module = _load_update_weight_module_with_stubs(monkeypatch)
     serialize_calls = []
 
-    def serialize(obj, output_str=False):
-        serialize_calls.append((obj, output_str))
-        return "direct-ipc-payload"
+    def serialize_bucket(named_tensors, *, long_live_tensors, force_cpu_payload):
+        serialize_calls.append(
+            {
+                "named_tensors": named_tensors,
+                "force_cpu_payload": force_cpu_payload,
+            }
+        )
+        long_live_tensors.append({"flattened_tensor": torch.ones(2), "metadata": []})
+        return "guarded-ipc-payload"
 
     def gather_object(obj, object_gather_list=None, dst=0, group=None):
         object_gather_list[0] = obj
@@ -248,13 +338,7 @@ def test_send_to_colocated_engine_uses_historical_direct_ipc_for_pp1(monkeypatch
 
     fake_remote = FakeRemote()
     fake_engine = types.SimpleNamespace(update_weights_from_tensor=fake_remote)
-    monkeypatch.setattr(module, "FlattenedTensorBucket", FakeFlattenedTensorBucket)
-    monkeypatch.setattr(module.MultiprocessingSerializer, "serialize", serialize)
-    monkeypatch.setattr(
-        module,
-        "_serialize_flattened_bucket",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("fallback helper should not run")),
-    )
+    monkeypatch.setattr(module, "_serialize_flattened_bucket", serialize_bucket)
     monkeypatch.setattr(module.dist, "get_world_size", lambda group=None: 1)
     monkeypatch.setattr(module.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(module.dist, "gather_object", gather_object)
@@ -271,9 +355,13 @@ def test_send_to_colocated_engine_uses_historical_direct_ipc_for_pp1(monkeypatch
 
     assert refs == ["ref"]
     assert len(long_lived) == 1
-    assert serialize_calls == [(long_lived[0], True)]
+    assert len(serialize_calls) == 1
+    assert serialize_calls[0]["force_cpu_payload"] is False
+    assert len(serialize_calls[0]["named_tensors"]) == 1
+    assert serialize_calls[0]["named_tensors"][0][0] == "weight"
+    assert torch.equal(serialize_calls[0]["named_tensors"][0][1], torch.ones(2, dtype=torch.float32))
     assert fake_remote.kwargs == {
-        "serialized_named_tensors": ["direct-ipc-payload"],
+        "serialized_named_tensors": ["guarded-ipc-payload"],
         "load_format": "flattened_bucket",
         "weight_version": "7",
     }

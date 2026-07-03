@@ -1,4 +1,3 @@
-import logging
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -20,10 +19,6 @@ from .update_weight_from_distributed import (
     post_process_weights,
     update_weights_from_distributed,
 )
-
-
-logger = logging.getLogger(__name__)
-_LOGGED_CUDA_IPC_FAILURE = False
 
 
 class UpdateWeightFromTensor:
@@ -56,23 +51,8 @@ class UpdateWeightFromTensor:
         self.update_weight_metrics: dict[str, float] = {}
 
         self._hf_weight_iterator = HfWeightIteratorBase.create(
-            args=args,
-            model=model,
-            model_name=model_name,
-            quantization_config=quantization_config,
-            trainable_only=getattr(args, "update_weights_trainable_only", False),
+            args=args, model=model, model_name=model_name, quantization_config=quantization_config
         )
-        self._full_hf_weight_iterator = None
-        if getattr(args, "update_weights_trainable_only", False) and getattr(
-            args, "update_weights_initial_full_sync", False
-        ):
-            self._full_hf_weight_iterator = HfWeightIteratorBase.create(
-                args=args,
-                model=model,
-                model_name=model_name,
-                quantization_config=quantization_config,
-                trainable_only=False,
-            )
 
         self._ipc_gather_group = None
         self._ipc_gather_src = None
@@ -184,16 +164,7 @@ class UpdateWeightFromTensor:
 
         megatron_local_weights = self.weights_getter()
 
-        weight_iterator = self._hf_weight_iterator
-        progress_desc = "Update weights"
-        if self.weight_version == 1 and self._full_hf_weight_iterator is not None:
-            weight_iterator = self._full_hf_weight_iterator
-            progress_desc = "Initial full update weights"
-
-        for hf_named_tensors in weight_iterator.get_hf_weight_chunks(
-            megatron_local_weights,
-            progress_desc=progress_desc,
-        ):
+        for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
             refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
             ray.get(refs)
             # Free GPU tensors so the caching allocator can reuse the blocks,
@@ -207,14 +178,9 @@ class UpdateWeightFromTensor:
         # IPC handles are now released by the consumers.  Clean them up.
         torch.cuda.ipc_collect()
 
+        # int4/fp4 post_process
         if rank == 0:
-            # Quantized rollout weights need the same post-load processing that
-            # SGLang runs during initial model load. FP8 uses it to refresh
-            # packed/fused derived tensors after online trainable-only updates.
-            if self.quantization_config and self.quantization_config["quant_method"] in [
-                "compressed-tensors",
-                "fp8",
-            ]:
+            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
                     restore_weights_before_load=False,
                     post_process_quantization=True,
@@ -283,7 +249,7 @@ def _send_to_colocated_engine(
             "metadata": metadata,
         }
         long_live_tensors.append(flattened_tensor_data)
-        serialized_tensors.append(_serialize_flattened_bucket(flattened_tensor_data, named_tensors))
+        serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
 
     serialized_named_tensors = (
         [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == dist.get_rank() else None
@@ -308,24 +274,3 @@ def _send_to_colocated_engine(
             refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))
 
     return refs, long_live_tensors
-
-
-def _serialize_flattened_bucket(flattened_tensor_data: dict[str, Any], named_tensors) -> str:
-    global _LOGGED_CUDA_IPC_FAILURE
-    try:
-        return MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
-    except Exception:
-        if not _LOGGED_CUDA_IPC_FAILURE:
-            flattened_tensor = flattened_tensor_data["flattened_tensor"]
-            logger.error(
-                "CUDA IPC serialization failed for colocated tensor update bucket "
-                "(num_tensors=%d flattened_bytes=%d dtype=%s device=%s sample_names=%s).",
-                len(named_tensors),
-                flattened_tensor.numel() * flattened_tensor.element_size(),
-                flattened_tensor.dtype,
-                flattened_tensor.device,
-                [name for name, _ in named_tensors[:3]],
-                exc_info=True,
-            )
-            _LOGGED_CUDA_IPC_FAILURE = True
-        raise

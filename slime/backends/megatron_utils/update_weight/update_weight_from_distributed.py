@@ -17,12 +17,7 @@ from slime.utils.distributed_utils import get_gloo_group, init_process_group
 
 from ..megatron_to_hf import convert_to_hf
 from ..sglang import DeltaSpec
-from .common import (
-    all_gather_object_for_group_via_gloo,
-    all_gather_param,
-    group_fused_qkv_a_sync_items,
-    named_params_and_buffers,
-)
+from .common import all_gather_param, named_params_and_buffers
 
 
 class UpdateWeightFromDistributed:
@@ -46,7 +41,6 @@ class UpdateWeightFromDistributed:
         """
         self.args = args
         self.model = model
-        self.weights_getter = weights_getter
         self.model_name = model_name
         self.quantization_config = quantization_config
         self.weight_version = 0
@@ -128,13 +122,8 @@ class UpdateWeightFromDistributed:
         self._send_weights(pbar)
 
         if dist.get_rank() == 0:
-            # Quantized rollout weights need the same post-load processing that
-            # SGLang runs during initial model load. FP8 uses it to refresh
-            # packed/fused derived tensors after online trainable-only updates.
-            if self.quantization_config and self.quantization_config["quant_method"] in [
-                "compressed-tensors",
-                "fp8",
-            ]:
+            # int4/fp4 post_process
+            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
                     restore_weights_before_load=False,
                     post_process_quantization=True,
@@ -160,14 +149,6 @@ class UpdateWeightFromDistributed:
         Hook for each HF chunk in ``_send_weights`` before its broadcast. No-op by default.
         """
 
-    def _trainable_only_for_current_update(self) -> bool:
-        if not getattr(self.args, "update_weights_trainable_only", False):
-            return False
-        return not (
-            self.weight_version == 1
-            and getattr(self.args, "update_weights_initial_full_sync", False)
-        )
-
     def _iter_non_expert_chunks(self) -> Iterator[list[tuple[str, torch.Tensor]]]:
         """
         Yield broadcast-sized HF chunks of non-expert params: TP all-gather +
@@ -176,19 +157,13 @@ class UpdateWeightFromDistributed:
         """
         buffer_size = 0
         buffer: list[tuple[str, torch.Tensor]] = []
-        non_expert_params = [
-            (name, param)
-            for name, param in self._iter_named_params_for_current_update()
-            if ".experts." not in name
-        ]
-        for param_group in group_fused_qkv_a_sync_items(non_expert_params, lambda item: item[0]):
-            hf_chunk: list[tuple[str, torch.Tensor]] = []
-            for name, param in param_group:
-                param = all_gather_param(name, param)
-                if self._is_pp_src_rank:
-                    hf_chunk.extend(convert_to_hf(self.args, self.model_name, name, param, self.quantization_config))
+        for name, param in named_params_and_buffers(self.args, self.model):
+            if ".experts." in name:
+                continue
+            param = all_gather_param(name, param)
             if not self._is_pp_src_rank:
                 continue
+            hf_chunk = convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
             chunk_bytes = sum(t.numel() * t.element_size() for _, t in hf_chunk)
             if buffer and buffer_size + chunk_bytes > self.args.update_weight_buffer_size:
                 yield buffer
@@ -210,11 +185,7 @@ class UpdateWeightFromDistributed:
         defaults to all expert params on this rank.
         """
         if params is None:
-            params = (
-                (n, p)
-                for n, p in self._iter_named_params_for_current_update()
-                if ".experts." in n
-            )
+            params = ((n, p) for n, p in named_params_and_buffers(self.args, self.model) if ".experts." in n)
         buffer_size = 0
         batch: list[tuple[str, torch.Tensor]] = []
         for name, param in params:
@@ -235,49 +206,14 @@ class UpdateWeightFromDistributed:
             if hf_chunk:
                 yield hf_chunk
 
-    def _iter_named_params_for_current_update(self) -> Iterator[tuple[str, torch.Tensor]]:
-        """
-        Yield Megatron parameter metadata paired with update payload tensors.
-
-        In colocated offload mode the Megatron model tensors can be paused by
-        torch_memory_saver while rollout weights are resident. The actor keeps
-        an up-to-date CPU backup after every train step, so online sync streams
-        from that backup instead of globally resuming the paused model.
-        """
-
-        local_weights = self.weights_getter()
-        for name, model_param in named_params_and_buffers(
-            self.args,
-            self.model,
-            trainable_only=self._trainable_only_for_current_update(),
-        ):
-            backup = local_weights.get(name)
-            if backup is None:
-                if getattr(self.args, "offload_train", False):
-                    raise KeyError(
-                        f"Missing CPU actor weight backup for {name!r} during offloaded rollout weight sync. "
-                        "Refusing to read the paused Megatron model tensor."
-                    )
-                yield name, model_param
-                continue
-            yield name, _copy_megatron_param_attrs(backup, model_param)
-
     def _ep_gather_and_convert(self, named_tensors: list[tuple[str, torch.Tensor]]) -> list[tuple[str, torch.Tensor]]:
         """
         EP all-gather a buffered batch + HF convert on PP source. Returns HF tensors on
         PP source, [] elsewhere. Clears ``named_tensors``.
         """
         names = [name for name, _ in named_tensors]
-        all_names = [
-            names
-            for _rank, names in all_gather_object_for_group_via_gloo(
-                (dist.get_rank(), names),
-                mpu.get_expert_model_parallel_group(),
-            )
-        ]
-        assert len(all_names) == mpu.get_expert_model_parallel_world_size(), (
-            f"Expected {mpu.get_expert_model_parallel_world_size()} EP name payloads, got {len(all_names)}"
-        )
+        all_names = [None] * mpu.get_expert_model_parallel_world_size()
+        dist.all_gather_object(all_names, names, group=mpu.get_expert_model_parallel_group())
 
         for names in all_names:
             assert len(named_tensors) == len(names), f"mismatch names length: {len(named_tensors)} != {len(names)}"
@@ -336,16 +272,6 @@ class UpdateWeightFromDistributed:
         converted_named_tensors.clear()
         ray.get(self.rollout_engine_lock.release.remote())
         pbar.update(1)
-
-
-_MEGATRON_PARAM_ATTRS = ("tensor_model_parallel", "partition_dim", "partition_stride", "parallel_mode")
-
-
-def _copy_megatron_param_attrs(tensor: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
-    for attr in _MEGATRON_PARAM_ATTRS:
-        if hasattr(reference, attr):
-            setattr(tensor, attr, getattr(reference, attr))
-    return tensor
 
 
 def connect_rollout_engines_from_distributed(
@@ -447,7 +373,7 @@ def post_process_weights(
     rollout_engines: Sequence[ActorHandle],
 ):
     """
-    Trigger quantization post-process on all rollout engines.
+    Trigger post-process for int4/fp4 quantization on all rollout engines.
     """
     ray.get(
         [

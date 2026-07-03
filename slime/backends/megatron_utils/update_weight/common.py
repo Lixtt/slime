@@ -9,43 +9,7 @@ from megatron.core import mpu
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
 from slime.backends.megatron_utils.misc_utils import strip_param_name_prefix
-from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.types import ParamInfo
-
-_GLOO_SUBGROUP_CACHE = {}
-_FUSED_QKV_A_RE = re.compile(
-    r"^(?P<prefix>.*\.self_attention\.)(?P<proj>linear_q_down_proj|linear_kv_down_proj)(?P<suffix>\.weight)$"
-)
-
-
-def get_gloo_group_for_process_group(group):
-    """Return a Gloo subgroup with the same ranks as ``group``.
-
-    The train backend normally owns NCCL Megatron groups, while metadata and
-    CPU byte tensors need Gloo.  Creating only the caller's subgroup can violate
-    PyTorch's global ``new_group`` ordering requirement, so every rank first
-    reports its target ranks over the already-initialized world Gloo group and
-    then creates all reported subgroups in deterministic order.
-    """
-
-    target_ranks = tuple(dist.get_process_group_ranks(group))
-    if target_ranks in _GLOO_SUBGROUP_CACHE:
-        return _GLOO_SUBGROUP_CACHE[target_ranks]
-
-    world_gloo_group = get_gloo_group()
-    gathered_rank_groups = [None] * dist.get_world_size(world_gloo_group)
-    dist.all_gather_object(gathered_rank_groups, target_ranks, group=world_gloo_group)
-
-    unique_rank_groups = sorted({tuple(ranks) for ranks in gathered_rank_groups})
-    for ranks in unique_rank_groups:
-        if ranks not in _GLOO_SUBGROUP_CACHE:
-            _GLOO_SUBGROUP_CACHE[ranks] = dist.new_group(ranks=list(ranks), backend="gloo")
-
-    if target_ranks not in _GLOO_SUBGROUP_CACHE:
-        # Defensive fallback for mocked or partially initialized distributed
-        # environments. Real training should have created it in the loop above.
-        _GLOO_SUBGROUP_CACHE[target_ranks] = dist.new_group(ranks=list(target_ranks), backend="gloo")
-    return _GLOO_SUBGROUP_CACHE[target_ranks]
 
 
 def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
@@ -84,69 +48,6 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
             partition_dim = 1
     param = torch.cat(param_partitions, dim=partition_dim)
     return param
-
-
-def group_fused_qkv_a_sync_items(items: Sequence, name_getter) -> list[list]:
-    """Keep GLM/DeepSeek MLA q-a and kv-a projection updates in one RPC.
-
-    SGLang's DeepSeek-style loader fuses HF ``q_a_proj`` and
-    ``kv_a_proj_with_mqa`` inside a single ``load_weights`` call. If Slime splits
-    Megatron ``linear_q_down_proj`` and ``linear_kv_down_proj`` across update
-    buckets, the receiver caches only one side and silently leaves the fused
-    tensor stale. Grouping the Megatron pair before bucketization preserves the
-    loader contract without changing unrelated parameter order.
-    """
-
-    item_list = list(items)
-    pair_members: dict[str, dict[str, tuple[int, object]]] = {}
-    for idx, item in enumerate(item_list):
-        match = _FUSED_QKV_A_RE.match(name_getter(item))
-        if match is None:
-            continue
-        key = f"{match.group('prefix')}{match.group('suffix')}"
-        pair_members.setdefault(key, {})[match.group("proj")] = (idx, item)
-
-    emitted: set[int] = set()
-    groups: list[list] = []
-    required = {"linear_q_down_proj", "linear_kv_down_proj"}
-    for idx, item in enumerate(item_list):
-        if idx in emitted:
-            continue
-        match = _FUSED_QKV_A_RE.match(name_getter(item))
-        if match is not None:
-            key = f"{match.group('prefix')}{match.group('suffix')}"
-            pair = pair_members.get(key, {})
-            if required.issubset(pair):
-                ordered = sorted(pair.values(), key=lambda pair_item: pair_item[0])
-                groups.append([pair_item for pair_idx, pair_item in ordered])
-                emitted.update(pair_idx for pair_idx, _ in ordered)
-                continue
-        groups.append([item])
-        emitted.add(idx)
-    return groups
-
-
-def all_gather_object_for_group_via_gloo(obj, group) -> list:
-    """Gather Python metadata over world Gloo, then keep members of ``group``.
-
-    Object collectives over Megatron's NCCL PP/EP groups can trip NCCL watchdogs
-    during large-model init. This path is CPU metadata only, so use the already
-    initialized world-size Gloo group and filter back to the intended subgroup.
-    """
-
-    target_ranks = set(dist.get_process_group_ranks(group))
-    gathered = [None] * dist.get_world_size(get_gloo_group())
-    dist.all_gather_object(obj=obj, object_list=gathered, group=get_gloo_group())
-    filtered = []
-    for item in gathered:
-        if not isinstance(item, tuple) or len(item) < 2 or not isinstance(item[0], int):
-            raise ValueError(
-                "all_gather_object_for_group_via_gloo expects every gathered object "
-                f"to be a (rank, payload) tuple, got {item!r}"
-            )
-        if item[0] in target_ranks:
-            filtered.append(item)
-    return filtered
 
 
 def all_gather_params_async(
@@ -219,15 +120,11 @@ def named_params_and_buffers(
     model: Sequence[torch.nn.Module],
     convert_to_global_name: bool = True,
     translate_gpu_to_cpu: bool = False,
-    trainable_only: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     if convert_to_global_name:
         ans = _named_params_and_buffers_global(args, model)
     else:
         ans = _named_params_and_buffers_vanilla(model)
-
-    if trainable_only:
-        ans = ((name, tensor) for name, tensor in ans if getattr(tensor, "requires_grad", False))
 
     if translate_gpu_to_cpu:
         ans = ((name, _maybe_get_cpu_backup(tensor)) for name, tensor in ans)

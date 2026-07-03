@@ -1,12 +1,17 @@
 import argparse
+import os
+from datetime import timedelta
 from pathlib import Path
 
+import torch
 import torch.distributed as dist
 from megatron.core import mpu
 
-import slime.backends.megatron_utils as megatron_utils
+from slime.backends.megatron_utils.initialize import init as init_megatron
+from slime.backends.megatron_utils.model import initialize_model_and_optimizer
 from slime.backends.megatron_utils.hf_checkpoint_saver import save_hf_model_to_path
 from slime.utils.arguments import parse_args
+from slime.utils.distributed_utils import init_gloo_group
 
 
 def add_export_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -26,6 +31,20 @@ def add_export_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     return parser
 
 
+def _init_torch_distributed(args) -> None:
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend=args.distributed_backend,
+            timeout=timedelta(minutes=args.distributed_timeout_minutes),
+        )
+    args.rank = dist.get_rank()
+    args.world_size = dist.get_world_size()
+    args.local_rank = local_rank
+    init_gloo_group()
+
+
 def main() -> None:
     args = parse_args(add_custom_arguments=add_export_args)
 
@@ -39,8 +58,9 @@ def main() -> None:
     args.no_load_rng = True
     args.save = args.save or str(Path(args.output_dir).with_suffix(".dummy_megatron_save"))
 
-    megatron_utils.init(args)
-    model, optimizer, _, _ = megatron_utils.initialize_model_and_optimizer(args)
+    _init_torch_distributed(args)
+    init_megatron(args)
+    model, optimizer, _, _ = initialize_model_and_optimizer(args)
     if optimizer is not None:
         del optimizer
 

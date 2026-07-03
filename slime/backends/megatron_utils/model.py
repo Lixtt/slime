@@ -1040,6 +1040,23 @@ def _load_trainable_only_checkpoint_if_requested(
         raise ValueError(
             f"Trainable-only checkpoint world_size mismatch: checkpoint={checkpoint_world_size}, runtime={world_size}"
         )
+    parallel_size_checks = {
+        "tensor_model_parallel_size": _safe_mpu_value("get_tensor_model_parallel_world_size"),
+        "pipeline_model_parallel_size": _safe_mpu_value("get_pipeline_model_parallel_world_size"),
+        "expert_model_parallel_size": _safe_mpu_value("get_expert_model_parallel_world_size"),
+        "data_parallel_size": _safe_mpu_value("get_data_parallel_world_size", with_context_parallel=True),
+    }
+    for key, runtime_value in parallel_size_checks.items():
+        checkpoint_value = common.get(key)
+        if checkpoint_value is None or runtime_value is None:
+            continue
+        if int(checkpoint_value) != int(runtime_value):
+            raise ValueError(
+                f"Trainable-only checkpoint {key} mismatch: "
+                f"checkpoint={checkpoint_value}, runtime={runtime_value}. "
+                "Load the matching trainable-only checkpoint for this Megatron layout, "
+                "or start from the full base checkpoint."
+            )
 
     rank_files = common.get("rank_files") or []
     rank_file_name = rank_files[rank] if rank < len(rank_files) else f"trainable_rank_{rank:05d}.pt"

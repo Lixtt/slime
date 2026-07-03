@@ -60,10 +60,14 @@ class TrainRayActor(RayActor):
 
         backend = args.distributed_backend
 
-        dist.init_process_group(
-            backend=backend,
-            timeout=timedelta(minutes=args.distributed_timeout_minutes),
-        )
+        init_process_group_kwargs = {
+            "backend": backend,
+            "timeout": timedelta(minutes=args.distributed_timeout_minutes),
+        }
+        if backend == "nccl" and torch.cuda.is_available():
+            init_process_group_kwargs["device_id"] = torch.device(f"cuda:{local_rank}")
+
+        dist.init_process_group(**init_process_group_kwargs)
         init_gloo_group()
 
         args.rank = dist.get_rank()

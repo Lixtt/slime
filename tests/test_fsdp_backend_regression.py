@@ -212,7 +212,7 @@ def test_slime_extra_args_include_fsdp_lora_defaults(monkeypatch):
 
 
 def test_runtime_lora_backend_switches_are_explicit():
-    source = (SLIME_ROOT.parent / "a3s-code-rl/scripts/runtime/run_a3s_code_rl.sh").read_text()
+    source = (SLIME_ROOT.parent / "a3s-code-rl/scripts/runtime/launch_a3s_code_rl.sh").read_text()
 
     assert "--use-lora" in source
     assert "--use-megatron-lora" in source
@@ -280,6 +280,9 @@ def test_dataset_len_and_micro_batch_helper(monkeypatch):
     timer_mod = types.ModuleType("slime.utils.timer")
     timer_mod.Timer = type("Timer", (), {})
     monkeypatch.setitem(sys.modules, "slime.utils.timer", timer_mod)
+    httpx_mod = types.ModuleType("httpx")
+    httpx_mod.AsyncClient = type("AsyncClient", (), {})
+    monkeypatch.setitem(sys.modules, "httpx", httpx_mod)
 
     sys.modules.pop("slime.utils.data", None)
     data = importlib.import_module("slime.utils.data")

@@ -211,10 +211,7 @@ def sglang_parse_args():
     parser.set_defaults(sglang_tensor_parallel_size=sglang_tp_size)
 
     args, _ = parser.parse_known_args()
-    # Router args are parsed by the main slime parser via RouterArgs.add_cli_args.
-    # Keep this SGLang-only pre-parse from overwriting explicit --router-* values
-    # with defaults during the later namespace merge.
-    for key in list(vars(args)):
-        if key.startswith("router_"):
-            delattr(args, key)
+    # Keep router args in this pre-parse namespace. Megatron's parser ignores
+    # unknown --router-* options, so dropping them here silently reverts Slime's
+    # internally launched router to its defaults.
     return args

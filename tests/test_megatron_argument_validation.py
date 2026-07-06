@@ -67,6 +67,61 @@ def load_slime_arguments_module(monkeypatch):
     return module
 
 
+def load_sglang_arguments_module(monkeypatch):
+    sglang_mod = types.ModuleType("sglang")
+    srt_mod = types.ModuleType("sglang.srt")
+    server_args_mod = types.ModuleType("sglang.srt.server_args")
+    router_pkg_mod = types.ModuleType("sglang_router")
+    router_launch_mod = types.ModuleType("sglang_router.launch_router")
+    http_utils_mod = types.ModuleType("slime.utils.http_utils")
+
+    class ServerArgs:
+        @staticmethod
+        def add_cli_args(parser):
+            parser.add_argument("--data-parallel-size", type=int, default=1)
+            parser.add_argument("--pipeline-parallel-size", type=int, default=1)
+            parser.add_argument("--expert-parallel-size", type=int, default=1)
+
+    class RouterArgs:
+        @staticmethod
+        def add_cli_args(parser, *, use_router_prefix=False, exclude_host_port=False):
+            prefix = "router-" if use_router_prefix else ""
+            parser.add_argument(f"--{prefix}policy", dest="router_policy", default="cache_aware")
+            parser.add_argument(
+                f"--{prefix}max-concurrent-requests",
+                dest="router_max_concurrent_requests",
+                type=int,
+                default=-1,
+            )
+            parser.add_argument(f"--{prefix}queue-size", dest="router_queue_size", type=int, default=100)
+            parser.add_argument(
+                f"--{prefix}queue-timeout-secs",
+                dest="router_queue_timeout_secs",
+                type=int,
+                default=60,
+            )
+
+    server_args_mod.ServerArgs = ServerArgs
+    router_launch_mod.RouterArgs = RouterArgs
+    http_utils_mod._wrap_ipv6 = lambda host: host
+
+    monkeypatch.setitem(sys.modules, "sglang", sglang_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt", srt_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.server_args", server_args_mod)
+    monkeypatch.setitem(sys.modules, "sglang_router", router_pkg_mod)
+    monkeypatch.setitem(sys.modules, "sglang_router.launch_router", router_launch_mod)
+    monkeypatch.setitem(sys.modules, "slime.utils.http_utils", http_utils_mod)
+
+    module_path = Path(__file__).resolve().parents[1] / "slime" / "backends" / "sglang_utils" / "arguments.py"
+    module_name = "test_sglang_argument_validation_module"
+    sys.modules.pop(module_name, None)
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def load_initialize_module(monkeypatch):
     megatron_mod = types.ModuleType("megatron")
     core_mod = types.ModuleType("megatron.core")
@@ -216,6 +271,37 @@ def test_megatron_initialize_fills_newer_tokenizer_defaults(monkeypatch):
     assert args.megatron_fsdp_main_params_dtype is module.torch.bfloat16
     assert args.megatron_fsdp_main_grads_dtype is module.torch.float32
     assert args.megatron_fsdp_grad_comm_dtype is module.torch.float16
+
+
+@pytest.mark.unit
+def test_sglang_parse_args_preserves_router_cli_values(monkeypatch):
+    module = load_sglang_arguments_module(monkeypatch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prog",
+            "--rollout-num-gpus-per-engine",
+            "8",
+            "--sglang-pp-size",
+            "1",
+            "--router-policy",
+            "round_robin",
+            "--router-max-concurrent-requests",
+            "20",
+            "--router-queue-size",
+            "40",
+            "--router-queue-timeout-secs",
+            "1800",
+        ],
+    )
+
+    args = module.sglang_parse_args()
+
+    assert args.router_policy == "round_robin"
+    assert args.router_max_concurrent_requests == 20
+    assert args.router_queue_size == 40
+    assert args.router_queue_timeout_secs == 1800
 
 
 @pytest.mark.unit

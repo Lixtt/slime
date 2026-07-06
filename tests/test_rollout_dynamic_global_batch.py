@@ -276,6 +276,34 @@ def test_reward_normalization_prefers_group_id_over_group_index():
     assert normalized_rewards == [-1.0, -2.0, 1.0, 2.0]
 
 
+def test_reward_normalization_ignores_removed_padding_samples():
+    _install_rollout_import_stubs()
+    rollout = importlib.import_module("slime.ray.rollout")
+    from slime.utils.types import Sample
+
+    manager = object.__new__(rollout.RolloutManager)
+    manager.custom_reward_post_process_func = None
+    manager.args = types.SimpleNamespace(
+        advantage_estimator="grpo",
+        rewards_normalization=True,
+        grpo_std_normalization=False,
+        n_samples_per_prompt=4,
+        rollout_batch_size=1,
+        reward_key=None,
+    )
+    samples = [
+        Sample(group_index=0, index=0, reward=1.0),
+        Sample(group_index=0, index=1, reward=3.0),
+        Sample(group_index=0, index=-1, reward=-1.0, remove_sample=True),
+        Sample(group_index=0, index=-2, reward=-1.0, remove_sample=True),
+    ]
+
+    raw_rewards, normalized_rewards = manager._post_process_rewards(samples)
+
+    assert raw_rewards == [1.0, 3.0, -1.0, -1.0]
+    assert normalized_rewards == [-1.0, 1.0, 0.0, 0.0]
+
+
 def test_convert_samples_keeps_train_metadata_from_sample_metadata():
     _install_rollout_import_stubs()
     rollout = importlib.import_module("slime.ray.rollout")

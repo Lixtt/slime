@@ -885,16 +885,23 @@ class RolloutManager:
                     grouped[group_key].append((position, reward))
 
                 for grouped_rewards in grouped.values():
-                    rewards = torch.tensor([reward for _, reward in grouped_rewards], dtype=torch.float)
+                    active_grouped_rewards = [
+                        (position, reward)
+                        for position, reward in grouped_rewards
+                        if not getattr(samples[position], "remove_sample", False)
+                    ]
+                    if not active_grouped_rewards:
+                        continue
+                    rewards = torch.tensor([reward for _, reward in active_grouped_rewards], dtype=torch.float)
                     rewards = rewards - rewards.mean()
                     if (
                         self.args.advantage_estimator in ["grpo", "gspo", "cispo"]
                         and self.args.grpo_std_normalization
-                        and len(grouped_rewards) > 1
+                        and len(active_grouped_rewards) > 1
                     ):
                         rewards = rewards / (rewards.std() + 1e-6)
 
-                    for (position, _), reward in zip(grouped_rewards, rewards.tolist(), strict=True):
+                    for (position, _), reward in zip(active_grouped_rewards, rewards.tolist(), strict=True):
                         normalized_rewards[position] = reward
 
                 return raw_rewards, normalized_rewards

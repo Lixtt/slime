@@ -72,6 +72,16 @@ def test_rollout_onload_continues_generation_after_kv_cache_resume():
     assert onload_body.index("resume_memory_occupation") < onload_body.index("continue_generation")
 
 
+def test_sglang_engine_actor_has_startup_retries():
+    source = Path("slime/slime/ray/rollout.py").read_text()
+    start_engines_body = source.split("    def start_engines", 1)[1].split("\n    def offload", 1)[0]
+
+    assert 'SLIME_SGLANG_ENGINE_MAX_RESTARTS", 2' in start_engines_body
+    assert 'SLIME_SGLANG_ENGINE_MAX_TASK_RETRIES", 2' in start_engines_body
+    assert "max_restarts=max_restarts" in start_engines_body
+    assert "max_task_retries=max_task_retries" in start_engines_body
+
+
 def test_megatron_update_does_not_resume_all_paused_actor_weights_before_sync():
     source = Path("slime/slime/backends/megatron_utils/actor.py").read_text()
     update_body = source.split("    def update_weights(self) -> None:", 1)[1].split(

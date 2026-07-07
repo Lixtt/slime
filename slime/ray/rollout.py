@@ -39,6 +39,16 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+def _ray_retry_option_from_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+
+
 def _torch_memory_saver_preload_env() -> dict[str, str]:
     spec = importlib.util.find_spec("torch_memory_saver")
     if spec is None or spec.submodule_search_locations is None:
@@ -194,6 +204,8 @@ class ServerGroup:
         )
 
         RolloutRayActor = ray.remote(SGLangEngine)
+        max_restarts = _ray_retry_option_from_env("SLIME_SGLANG_ENGINE_MAX_RESTARTS", 2)
+        max_task_retries = _ray_retry_option_from_env("SLIME_SGLANG_ENGINE_MAX_TASK_RETRIES", 2)
 
         rollout_engines = []
         for i in range(len(self.all_engines)):
@@ -239,6 +251,8 @@ class ServerGroup:
             rollout_engine = RolloutRayActor.options(
                 num_cpus=num_cpus,
                 num_gpus=num_gpus,
+                max_restarts=max_restarts,
+                max_task_retries=max_task_retries,
                 scheduling_strategy=scheduling_strategy,
                 runtime_env={
                     "env_vars": add_default_ray_env_vars(env_vars),

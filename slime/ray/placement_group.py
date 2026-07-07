@@ -1,6 +1,8 @@
 import copy
 import logging
+import os
 import socket
+import time
 
 import ray
 from ray.util.placement_group import placement_group
@@ -66,20 +68,46 @@ def _create_placement_group(num_gpus):
             f"{total:g} GPUs registered with Ray, {available:g} available."
         )
 
-    # use info actor to get the GPU id
-    info_actors = []
-    for i in range(num_bundles):
-        info_actors.append(
-            InfoActor.options(
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=pg,
-                    placement_group_bundle_index=i,
-                ),
-            ).remote()
-        )
-    gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
-    for actor in info_actors:
-        ray.kill(actor)
+    # Use short-lived info actors to get the GPU id. On busy multi-node Ray
+    # startups, worker processes can occasionally die before the actor body runs;
+    # retry the discovery step so a transient actor crash does not abort the run
+    # after the placement group has already been scheduled.
+    info_actor_max_attempts = int(os.environ.get("SLIME_PLACEMENT_INFO_ACTOR_MAX_ATTEMPTS", "5"))
+    info_actor_retry_delay = float(os.environ.get("SLIME_PLACEMENT_INFO_ACTOR_RETRY_DELAY_SEC", "10"))
+    last_info_actor_error = None
+    for attempt in range(1, info_actor_max_attempts + 1):
+        info_actors = []
+        try:
+            for i in range(num_bundles):
+                info_actors.append(
+                    InfoActor.options(
+                        scheduling_strategy=PlacementGroupSchedulingStrategy(
+                            placement_group=pg,
+                            placement_group_bundle_index=i,
+                        ),
+                    ).remote()
+                )
+            gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
+            break
+        except Exception as exc:
+            last_info_actor_error = exc
+            logger.warning(
+                "Placement group GPU-id discovery failed on attempt %d/%d: %r",
+                attempt,
+                info_actor_max_attempts,
+                exc,
+            )
+            if attempt == info_actor_max_attempts:
+                raise
+            time.sleep(info_actor_retry_delay)
+        finally:
+            for actor in info_actors:
+                try:
+                    ray.kill(actor, no_restart=True)
+                except Exception:
+                    logger.debug("Ignoring error while cleaning up placement info actor.", exc_info=True)
+    else:
+        raise RuntimeError("Placement group GPU-id discovery failed.") from last_info_actor_error
 
     bundle_infos = [(i, gpu_ids[i][0], gpu_ids[i][1]) for i in range(num_bundles)]
     sorted_bundle_infos = sorted(bundle_infos, key=sort_key)

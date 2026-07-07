@@ -2625,6 +2625,55 @@ index 6c77ff64f92..706161ab928 100644
          parser.add_argument(
              "--remote-instance-weight-loader-seed-instance-ip",
              type=str,
+diff --git a/python/sglang/srt/layers/attention/dsa_backend.py b/python/sglang/srt/layers/attention/dsa_backend.py
+index 69da56d5d67..1c2d7beeb9a 100644
+--- a/python/sglang/srt/layers/attention/dsa_backend.py
++++ b/python/sglang/srt/layers/attention/dsa_backend.py
+@@ -1844,2 +1844,3 @@ class DsaAttnBackend(AttentionBackend):
+         cache_seqlens = metadata.dsa_cache_seqlens_int32
+         assert metadata.flashmla_metadata is not None
++        flashmla_metadata = metadata.flashmla_metadata
+@@ -1868,3 +1869,30 @@ class DsaAttnBackend(AttentionBackend):
+         assert (
+             indices.shape[-1] == self.dsa_index_topk
+         )  # requirement of FlashMLA decode kernel
++        q_rows = q_input.shape[0]
++        if flashmla_metadata.num_splits.shape[0] != q_rows + 1:
++            if cache_seqlens.shape[0] < q_rows:
++                logger.warning(
++                    "FlashMLA-KV metadata shape mismatch cannot be repaired: "
++                    "q_rows=%s num_splits=%s cache_seqlens=%s indices=%s",
++                    q_rows,
++                    tuple(flashmla_metadata.num_splits.shape),
++                    tuple(cache_seqlens.shape),
++                    tuple(indices.shape),
++                )
++            else:
++                if not getattr(self, "_warned_flashmla_kv_num_splits_rebuild", False):
++                    logger.warning(
++                        "Rebuilding FlashMLA-KV metadata for actual q rows: "
++                        "q_rows=%s num_splits=%s cache_seqlens=%s indices=%s",
++                        q_rows,
++                        tuple(flashmla_metadata.num_splits.shape),
++                        tuple(cache_seqlens.shape),
++                        tuple(indices.shape),
++                    )
++                    self._warned_flashmla_kv_num_splits_rebuild = True
++                cache_seqlens = cache_seqlens[:q_rows].contiguous()
++                flashmla_metadata = self._compute_flashmla_metadata(
++                    cache_seqlens=cache_seqlens,
++                    seq_len_q=q_input.shape[1],
++                )
+@@ -1877,8 +1905,8 @@ class DsaAttnBackend(AttentionBackend):
+             cache_seqlens=cache_seqlens,
+             head_dim_v=v_head_dim,
+-            tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
+-            num_splits=metadata.flashmla_metadata.num_splits,
++            tile_scheduler_metadata=flashmla_metadata.flashmla_metadata,
++            num_splits=flashmla_metadata.num_splits,
+             softmax_scale=sm_scale,
+             indices=indices,
+             # doc says it is not used, but if pass in None then error
 diff --git a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
 index 96c7286af76..9e3e2bd7142 100644
 --- a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py

@@ -23,3 +23,13 @@ def test_latest_scheduler_tensor_update_and_post_process_cover_draft_worker():
     assert "self.draft_worker.update_weights_from_tensor" in text
     assert "self.tp_worker.post_process_weights(recv_req)" in text
     assert "self.draft_worker.post_process_weights(recv_req)" in text
+
+
+def test_latest_flashmla_kv_rebuilds_metadata_for_actual_q_rows():
+    text = (SLIME_ROOT / "docker/patch/latest/sglang.patch").read_text()
+
+    assert "Rebuilding FlashMLA-KV metadata for actual q rows" in text
+    assert "flashmla_metadata.num_splits.shape[0] != q_rows + 1" in text
+    assert "cache_seqlens = cache_seqlens[:q_rows].contiguous()" in text
+    assert "tile_scheduler_metadata=flashmla_metadata.flashmla_metadata" in text
+    assert "num_splits=flashmla_metadata.num_splits" in text

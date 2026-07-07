@@ -22,7 +22,7 @@ Cluster-level preemption, trainer-rank failure, and full-job resume should still
 
 ## Rollout Health Checks
 
-During rollout, slime periodically sends heartbeat requests (`/health_generate`) to all SGLang servers. If a heartbeat times out, the unhealthy SGLang server is stopped. After the current rollout round completes, slime restarts the server and updates it with the correct parameters before it serves future rollout requests.
+During rollout, slime periodically sends heartbeat requests to all SGLang servers. By default, this uses the non-generating `/health` endpoint when `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=false`; set `SLIME_SGLANG_ENABLE_HEALTH_GENERATE=true` to use the generating `/health_generate` probe explicitly. If a heartbeat times out, the unhealthy SGLang server is stopped. After the current rollout round completes, slime restarts the server and updates it with the correct parameters before it serves future rollout requests.
 
 The main arguments are:
 

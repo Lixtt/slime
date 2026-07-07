@@ -22,7 +22,7 @@ slime 当前提供 rollout-engine fault tolerance：
 
 ## Rollout Health Checks
 
-rollout 过程中，slime 会定期向所有 SGLang server 发送 heartbeat 请求（`/health_generate`）。如果 heartbeat timeout，异常 SGLang server 会被停止。当前 rollout round 完成后，slime 会重启 server，并在其继续服务后续 rollout 请求前更新到正确参数。
+rollout 过程中，slime 会定期向所有 SGLang server 发送 heartbeat 请求。默认情况下，如果 `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=false`，heartbeat 使用非生成式 `/health`；只有显式设置 `SLIME_SGLANG_ENABLE_HEALTH_GENERATE=true` 时才使用生成式 `/health_generate`。如果 heartbeat timeout，异常 SGLang server 会被停止。当前 rollout round 完成后，slime 会重启 server，并在其继续服务后续 rollout 请求前更新到正确参数。
 
 主要参数：
 

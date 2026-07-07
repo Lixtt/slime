@@ -22,6 +22,26 @@ from slime.utils.http_utils import get_host_info
 logger = logging.getLogger(__name__)
 
 
+def _env_flag_enabled(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _use_generation_health_probe() -> bool:
+    return _env_flag_enabled(
+        "SLIME_SGLANG_ENABLE_HEALTH_GENERATE",
+        default=_env_flag_enabled("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", True),
+    )
+
+
+def _health_check_endpoints() -> tuple[str, ...]:
+    if _use_generation_health_probe():
+        return ("/health", "/health_generate")
+    return ("/health",)
+
+
 def get_base_gpu_id(args, rank):
     num_gpus = min(args.num_gpus_per_node, args.rollout_num_gpus_per_engine)
     if args.colocate:
@@ -100,7 +120,7 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
         while True:
             try:
                 healthy = False
-                for endpoint in ("/health", "/health_generate"):
+                for endpoint in _health_check_endpoints():
                     response = session.get(f"{base_url}{endpoint}", headers=headers, timeout=5)
                     if response.status_code == 200:
                         healthy = True
@@ -316,7 +336,7 @@ class SGLangEngine(RayActor):
         return process.is_alive()
 
     def health_generate(self, timeout: float = 5.0) -> bool:
-        """Run /health_generate on the underlying SGLang HTTP server.
+        """Run the configured health endpoint on the underlying SGLang HTTP server.
 
         Args:
             timeout: Timeout for the health request in seconds.
@@ -330,10 +350,8 @@ class SGLangEngine(RayActor):
         if self.node_rank != 0:
             return True
 
-        response = requests.get(
-            f"http://{self.server_host}:{self.server_port}/health_generate",
-            timeout=timeout,
-        )
+        endpoint = "/health_generate" if _use_generation_health_probe() else "/health"
+        response = requests.get(f"http://{self.server_host}:{self.server_port}{endpoint}", timeout=timeout)
         response.raise_for_status()
         return True
 

@@ -50,16 +50,17 @@ def _load_sglang_engine(monkeypatch):
 
 
 class _Response:
-    def __init__(self, status_code: int):
+    def __init__(self, status_code: int, data: dict | None = None):
         self.status_code = status_code
         self.text = "OK"
+        self._data = data or {}
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
             raise RuntimeError(f"HTTP {self.status_code}")
 
     def json(self) -> dict:
-        return {}
+        return self._data
 
 
 def test_wait_server_healthy_skips_generation_probe_when_disabled(monkeypatch) -> None:
@@ -119,3 +120,44 @@ def test_slime_override_can_reenable_generation_health_probe(monkeypatch) -> Non
     module = _load_sglang_engine(monkeypatch)
 
     assert module._health_check_endpoints() == ("/health", "/health_generate")
+
+
+def test_get_weight_version_uses_model_info(monkeypatch) -> None:
+    module = _load_sglang_engine(monkeypatch)
+    calls: list[str] = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        return _Response(200, {"weight_version": "7"})
+
+    monkeypatch.setattr(module.requests, "get", fake_get)
+    engine = object.__new__(module.SGLangEngine)
+    engine.node_rank = 0
+    engine.server_host = "127.0.0.1"
+    engine.server_port = 30000
+
+    assert engine.get_weight_version() == "7"
+    assert calls == ["http://127.0.0.1:30000/model_info"]
+
+
+def test_get_weight_version_falls_back_for_legacy_sglang(monkeypatch) -> None:
+    module = _load_sglang_engine(monkeypatch)
+    calls: list[str] = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        if url.endswith("/model_info"):
+            return _Response(404)
+        return _Response(200, {"weight_version": "3"})
+
+    monkeypatch.setattr(module.requests, "get", fake_get)
+    engine = object.__new__(module.SGLangEngine)
+    engine.node_rank = 0
+    engine.server_host = "127.0.0.1"
+    engine.server_port = 30000
+
+    assert engine.get_weight_version() == "3"
+    assert calls == [
+        "http://127.0.0.1:30000/model_info",
+        "http://127.0.0.1:30000/get_weight_version",
+    ]

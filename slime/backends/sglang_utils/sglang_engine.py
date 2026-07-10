@@ -525,8 +525,12 @@ class SGLangEngine(RayActor):
     def get_weight_version(self):
         if self.node_rank != 0:
             return
-        url = f"http://{self.server_host}:{self.server_port}/get_weight_version"
-        response = requests.get(url)
+        base_url = f"http://{self.server_host}:{self.server_port}"
+        response = requests.get(f"{base_url}/model_info")
+        if response.status_code == 404:
+            # SGLang exposed the version through this endpoint before
+            # consolidating model metadata under /model_info.
+            response = requests.get(f"{base_url}/get_weight_version")
         response.raise_for_status()
         return response.json()["weight_version"]
 

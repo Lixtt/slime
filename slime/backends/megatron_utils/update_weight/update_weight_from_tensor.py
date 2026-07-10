@@ -1,5 +1,7 @@
+import logging
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 import ray
@@ -21,11 +23,15 @@ from .update_weight_from_distributed import (
 )
 
 
+logger = logging.getLogger(__name__)
+_LOGGED_CUDA_IPC_FAILURE = False
+
+
 class UpdateWeightFromTensor:
     """
     Update rollout engines from tensor dict:
     load(dict→GPU) → broadcast PP/EP(GPU NCCL) → gather TP(GPU NCCL) → convert HF(GPU) → send.
-    Colocated: GPU→CPU serialize → gather_object(Gloo CPU, collects from rollout_num_gpus_per_engine ranks) → Ray IPC to engine.
+    Colocated: CUDA IPC metadata → gather_object(Gloo control plane) → Ray request to engine.
     Distributed: GPU NCCL broadcast to remote engines.
     """
 
@@ -242,14 +248,9 @@ def _send_to_colocated_engine(
 
     serialized_tensors = []
     for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
-        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-        metadata = flattened_tensor_bucket.get_metadata()
-        flattened_tensor_data = {
-            "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
-            "metadata": metadata,
-        }
-        long_live_tensors.append(flattened_tensor_data)
-        serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
+        serialized_tensor, allocation_owner = _flatten_and_serialize_for_cuda_ipc(named_tensors)
+        long_live_tensors.append(allocation_owner)
+        serialized_tensors.append(serialized_tensor)
 
     serialized_named_tensors = (
         [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == dist.get_rank() else None
@@ -274,3 +275,75 @@ def _send_to_colocated_engine(
             refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))
 
     return refs, long_live_tensors
+
+
+def _flatten_and_serialize_for_cuda_ipc(named_tensors):
+    """Allocate the exported bucket in a dedicated, live CUDA memory pool."""
+    with _cuda_ipc_export_pool(named_tensors) as export_pool:
+        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        flattened_tensor_data = {
+            "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+            "metadata": flattened_tensor_bucket.get_metadata(),
+        }
+        flattened_tensor = flattened_tensor_data["flattened_tensor"]
+        if flattened_tensor.is_cuda:
+            torch.cuda.synchronize(flattened_tensor.device)
+        serialized_tensor = _serialize_flattened_bucket(flattened_tensor_data, named_tensors)
+
+    # Keep both the tensor and its private pool alive until the SGLang actor has
+    # consumed the CUDA IPC handle and returned from update_weights_from_tensor.
+    return serialized_tensor, (flattened_tensor_data, export_pool)
+
+
+@contextmanager
+def _cuda_ipc_export_pool(named_tensors):
+    is_cuda = any(tensor.is_cuda for _, tensor in named_tensors)
+    if not is_cuda:
+        yield None
+        return
+
+    tms_state = _torch_memory_saver_interesting_region()
+    if tms_state is True:
+        raise RuntimeError(
+            "CUDA IPC weight export entered while torch_memory_saver is active. "
+            "The caller must enter torch_memory_saver.disable() before flattening weights."
+        )
+
+    export_pool = torch.cuda.MemPool()
+    with torch.cuda.use_mem_pool(export_pool):
+        yield export_pool
+
+
+def _serialize_flattened_bucket(flattened_tensor_data: dict[str, Any], named_tensors) -> str:
+    global _LOGGED_CUDA_IPC_FAILURE
+    try:
+        return MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+    except Exception:
+        if not _LOGGED_CUDA_IPC_FAILURE:
+            flattened_tensor = flattened_tensor_data["flattened_tensor"]
+            logger.error(
+                "CUDA IPC serialization failed for colocated tensor update bucket "
+                "(num_tensors=%d flattened_bytes=%d dtype=%s device=%s "
+                "tms_interesting_region=%s sample_names=%s).",
+                len(named_tensors),
+                flattened_tensor.numel() * flattened_tensor.element_size(),
+                flattened_tensor.dtype,
+                flattened_tensor.device,
+                _torch_memory_saver_interesting_region(),
+                [name for name, _ in named_tensors[:3]],
+                exc_info=True,
+            )
+            _LOGGED_CUDA_IPC_FAILURE = True
+        raise
+
+
+def _torch_memory_saver_interesting_region() -> bool | None:
+    try:
+        from torch_memory_saver import torch_memory_saver
+    except ImportError:
+        return None
+
+    impl = getattr(torch_memory_saver, "_impl", None)
+    if impl is None:
+        return None
+    return bool(impl._binary_wrapper.cdll.tms_get_interesting_region())

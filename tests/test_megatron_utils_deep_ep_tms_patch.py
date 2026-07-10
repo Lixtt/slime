@@ -53,6 +53,9 @@ def _load_megatron_utils_init(monkeypatch, *, initial_interesting_region: bool):
 
     monkeypatch.setitem(sys.modules, "deep_ep", fake_deep_ep)
     monkeypatch.setitem(sys.modules, "torch_memory_saver", fake_tms_module)
+    # Keep this unit test isolated from the real Megatron Bridge import graph.
+    # The production module treats a missing bridge as optional.
+    monkeypatch.setitem(sys.modules, "megatron", types.ModuleType("megatron"))
 
     # from . import megatron_patch is unconditional in __init__.py; stub it
     # out so loading the file doesn't require a real Megatron installation.

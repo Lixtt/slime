@@ -10,7 +10,7 @@ def eval_only(args):
     pgs = create_placement_groups(args)
     init_tracking(args)
 
-    rollout_manager, _ = create_rollout_manager(args, pgs["rollout"], pgs.get("prm"))
+    rollout_manager, _ = create_rollout_manager(args, pgs["rollout"])
 
     ray.get(rollout_manager.eval.remote(0))
     ray.get(rollout_manager.dispose.remote())

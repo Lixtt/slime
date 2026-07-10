@@ -17,12 +17,18 @@ def train(args):
     # need to initialize rollout manager first to calculate num_rollout
     rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
 
+    # Probe while rollout still has weights, KV cache, and CUDA graphs loaded.
+    # A weights-only onload intentionally keeps generation paused for sync.
+    run_rollout_generation_quality_gate(rollout_manager, "pre_initial_update")
+
+    if args.offload_rollout:
+        ray.get(rollout_manager.offload.remote())
+
     # create the actor and critic models
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
 
     if args.offload_rollout:
         ray.get(rollout_manager.onload_weights.remote())
-    run_rollout_generation_quality_gate(rollout_manager, "pre_initial_update")
 
     # Always push actor weights to rollout once weights are loaded.
     actor_model.update_weights()
@@ -70,6 +76,9 @@ def train(args):
 
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
 
+        # Validate the current rollout version before its memory is released.
+        run_rollout_generation_quality_gate(rollout_manager, f"pre_update_{rollout_id}")
+
         if args.offload_rollout:
             ray.get(rollout_manager.offload.remote())
 
@@ -90,7 +99,6 @@ def train(args):
         offload_train(actor_trains_this_step)
         if args.offload_rollout:
             ray.get(rollout_manager.onload_weights.remote())
-        run_rollout_generation_quality_gate(rollout_manager, f"pre_update_{rollout_id}")
         actor_model.update_weights()
 
         if args.offload_rollout:

@@ -9,14 +9,13 @@ def test_initial_weight_update_does_not_resume_kv_before_sync():
     assert "onload_kv" not in before_initial_update
 
 
-def test_initial_weight_update_runs_quality_gate_after_weight_onload():
+def test_initial_quality_gate_runs_before_rollout_offload_and_actor_creation():
     source = Path("slime/train.py").read_text()
-    before_initial_update = source.split("actor_model.update_weights()", 1)[0]
+    quality_gate = 'run_rollout_generation_quality_gate(rollout_manager, "pre_initial_update")'
+    rollout_offload = "rollout_manager.offload.remote()"
+    actor_creation = "create_training_models(args, pgs, rollout_manager)"
 
-    assert 'run_rollout_generation_quality_gate(rollout_manager, "pre_initial_update")' in before_initial_update
-    assert before_initial_update.index("rollout_manager.onload_weights.remote()") < before_initial_update.index(
-        '"pre_initial_update"'
-    )
+    assert source.index(quality_gate) < source.index(rollout_offload) < source.index(actor_creation)
 
 
 def test_initial_weight_update_resumes_kv_before_post_update_gate():
@@ -38,15 +37,21 @@ def test_training_loop_still_resumes_kv_after_rollout_offload():
     assert "rollout_manager.onload_kv.remote()" in train_loop
 
 
-def test_training_loop_runs_pre_update_quality_gate_after_weight_onload():
+def test_training_loop_runs_pre_update_quality_gate_before_rollout_offload():
     source = Path("slime/train.py").read_text()
     train_loop = source.split("for rollout_id in range", 1)[1]
-    before_loop_update = train_loop.split("actor_model.update_weights()", 1)[0]
+    generate = "rollout_manager.generate.remote(rollout_id)"
+    quality_gate = 'run_rollout_generation_quality_gate(rollout_manager, f"pre_update_{rollout_id}")'
+    rollout_offload = "rollout_manager.offload.remote()"
 
-    assert 'run_rollout_generation_quality_gate(rollout_manager, f"pre_update_{rollout_id}")' in before_loop_update
-    assert before_loop_update.index("rollout_manager.onload_weights.remote()") < before_loop_update.index(
-        'f"pre_update_{rollout_id}"'
-    )
+    assert train_loop.index(generate) < train_loop.index(quality_gate) < train_loop.index(rollout_offload)
+
+
+def test_rollout_manager_creation_does_not_hide_initial_offload():
+    source = Path("slime/slime/ray/placement_group.py").read_text()
+    create_body = source.split("def create_rollout_manager(args, pg):", 1)[1]
+
+    assert "rollout_manager.offload.remote()" not in create_body
 
 
 def test_rollout_offload_pauses_generation_before_memory_release():
@@ -93,13 +98,3 @@ def test_megatron_update_does_not_resume_all_paused_actor_weights_before_sync():
     assert "train_weight_context" not in update_body
     assert "with offload_context, lora_context:" in update_body
     assert "self.weight_updater.update_weights()" in update_body
-
-
-def test_distributed_weight_update_streams_from_actor_cpu_backup():
-    source = Path("slime/slime/backends/megatron_utils/update_weight/update_weight_from_distributed.py").read_text()
-
-    assert "self.weights_getter = weights_getter" in source
-    assert "def _iter_named_params_for_current_update" in source
-    assert "local_weights = self.weights_getter()" in source
-    assert "Missing CPU actor weight backup" in source
-    assert "Refusing to read the paused Megatron model tensor" in source

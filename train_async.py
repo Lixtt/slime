@@ -19,10 +19,13 @@ def train(args):
     # need to initialize rollout manager first to calculate num_rollout
     rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
 
+    run_rollout_generation_quality_gate(rollout_manager, "pre_initial_update")
+
+    if args.offload_rollout:
+        ray.get(rollout_manager.offload.remote())
+
     # create the actor and critic models
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
-
-    run_rollout_generation_quality_gate(rollout_manager, "pre_initial_update")
 
     # Always push actor weights to rollout once weights are loaded.
     actor_model.update_weights()

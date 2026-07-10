@@ -453,7 +453,15 @@ class MegatronTrainRayActor(TrainRayActor):
         with timer("data_preprocess"):
             rollout_data = self._get_rollout_data(rollout_data_ref)
 
-        if self.role == "critic":
+        has_trainable_tokens = self._has_global_trainable_tokens(rollout_data)
+        if not has_trainable_tokens:
+            if dist.get_rank() == 0:
+                logger.warning(
+                    "Skipping rollout %s because every data-parallel rank received only zero-loss-mask samples.",
+                    rollout_id,
+                )
+            result = {} if self.role == "critic" else None
+        elif self.role == "critic":
             result = self.train_critic(rollout_id, rollout_data)
         else:
             self.train_actor(rollout_id, rollout_data, external_data=external_data)
@@ -464,6 +472,19 @@ class MegatronTrainRayActor(TrainRayActor):
             self.sleep()
 
         return result
+
+    def _has_global_trainable_tokens(self, rollout_data: RolloutBatch) -> bool:
+        loss_masks = rollout_data.get("loss_masks", [])
+        if loss_masks:
+            count_tensor = torch.stack([loss_mask.sum(dtype=torch.float32) for loss_mask in loss_masks]).sum()
+        else:
+            count_tensor = torch.zeros((), device=torch.cuda.current_device(), dtype=torch.float32)
+        dist.all_reduce(
+            count_tensor,
+            op=dist.ReduceOp.SUM,
+            group=mpu.get_data_parallel_group(with_context_parallel=False),
+        )
+        return bool(count_tensor.item() > 0)
 
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch):
         """Train critic and return CPU values (used as old-values for the next actor train)."""

@@ -2,11 +2,26 @@ import json
 import logging
 import os
 import re
+from collections import Counter
 from pathlib import Path
 
 import ray
 
 logger = logging.getLogger(__name__)
+
+
+def repetition_check(text: str, *, max_ratio: float, min_chars: int) -> tuple[float, bool]:
+    """Return the dominant-character ratio and whether it is suspicious.
+
+    Very short known-answer probes such as ``"2"`` naturally have a ratio of
+    1.0. They do not contain enough evidence to diagnose corrupted generation.
+    """
+
+    compact = "".join(ch for ch in text if not ch.isspace())
+    if not compact:
+        return 0.0, False
+    ratio = max(Counter(compact).values()) / len(compact)
+    return ratio, len(compact) >= max(1, min_chars) and ratio > max_ratio
 
 
 def _truthy(value: str | None) -> bool:

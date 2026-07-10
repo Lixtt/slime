@@ -51,3 +51,17 @@ def test_quality_gate_strict_error_raises(monkeypatch, tmp_path):
     payload = json.loads(artifact.read_text(encoding="utf-8"))
     assert payload["ok"] is False
     assert payload["strict"] is True
+
+
+def test_repetition_check_ignores_short_known_answer():
+    ratio, suspicious = rollout_quality_gate.repetition_check("2", max_ratio=0.8, min_chars=8)
+
+    assert ratio == 1.0
+    assert suspicious is False
+
+
+def test_repetition_check_rejects_long_repeated_output():
+    ratio, suspicious = rollout_quality_gate.repetition_check("2" * 8, max_ratio=0.8, min_chars=8)
+
+    assert ratio == 1.0
+    assert suspicious is True

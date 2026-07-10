@@ -165,6 +165,15 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.args.update_weight_mode == "full" and self.args.update_weight_transport == "nccl"
                 ), f"unsupported weight sync mode/transport: {self.args.update_weight_mode!r}/{self.args.update_weight_transport!r}"
                 update_weight_cls = UpdateWeightFromDistributed
+        if is_megatron_main_rank():
+            logger.info(
+                "Selected rollout weight updater: %s (mode=%s, transport=%s, colocate=%s, offload_train=%s)",
+                update_weight_cls.__name__,
+                self.args.update_weight_mode,
+                self.args.update_weight_transport,
+                self.args.colocate,
+                self.args.offload_train,
+            )
         self.weight_updater = update_weight_cls(
             self.args,
             self.model,
@@ -688,13 +697,16 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weight_updater.update_weights()
             print_memory("after update_weights")
 
-            if self.args.ci_test and len(rollout_engines) > 0 and self.weight_updater.weight_version > 0:
+            verify_weight_version = self.args.ci_test or self.args.verify_rollout_weight_version_after_update
+            if verify_weight_version and len(rollout_engines) > 0 and self.weight_updater.weight_version > 0:
                 engine = random.choice(rollout_engines)
                 engine_version = ray.get(engine.get_weight_version.remote())
                 if str(engine_version) != str(self.weight_updater.weight_version):
                     raise RuntimeError(
                         f"Weight version mismatch! Engine: {engine_version}, Updater: {self.weight_updater.weight_version}"
                     )
+                if dist.get_rank() == 0:
+                    logger.info("Verified rollout weight version after update: %s", engine_version)
 
             if getattr(self.args, "keep_old_actor", False):
                 if self.args.update_weights_interval == 1:

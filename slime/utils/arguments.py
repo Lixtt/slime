@@ -202,6 +202,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--verify-rollout-weight-version-after-update",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help=(
+                    "After every actor-to-rollout weight update, query one rollout engine and fail if its "
+                    "recorded version differs from the actor updater version."
+                ),
+            )
+            parser.add_argument(
                 "--update-weight-disk-dir",
                 type=str,
                 default=None,

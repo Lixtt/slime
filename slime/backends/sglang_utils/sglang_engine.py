@@ -6,7 +6,6 @@ import multiprocessing
 import os
 import re
 import time
-from collections import Counter
 from urllib.parse import quote
 
 import requests
@@ -18,6 +17,7 @@ from .qwen3_5 import is_qwen35_model_path, maybe_prepare_qwen35_text_model, patc
 from slime.backends.sglang_utils.external import get_server_info
 from slime.ray.ray_actor import RayActor
 from slime.utils.http_utils import get_host_info
+from slime.utils.rollout_quality_gate import repetition_check
 
 logger = logging.getLogger(__name__)
 
@@ -364,6 +364,7 @@ class SGLangEngine(RayActor):
         max_tokens = int(os.environ.get("ROLLOUT_GENERATION_QUALITY_GATE_MAX_TOKENS", "16"))
         timeout = float(os.environ.get("ROLLOUT_GENERATION_QUALITY_GATE_TIMEOUT_SEC", "120"))
         max_repeat_ratio = float(os.environ.get("ROLLOUT_GENERATION_QUALITY_GATE_MAX_REPEAT_CHAR_RATIO", "0.8"))
+        min_repeat_chars = int(os.environ.get("ROLLOUT_GENERATION_QUALITY_GATE_MIN_REPEAT_CHARS", "8"))
         require_nonempty_content = str(
             os.environ.get("ROLLOUT_GENERATION_QUALITY_GATE_REQUIRE_NONEMPTY_CONTENT", "1")
         ).lower() in {"1", "true", "yes", "on"}
@@ -411,12 +412,13 @@ class SGLangEngine(RayActor):
         if expected_regex and not re.search(expected_regex, content, flags=re.DOTALL):
             errors.append(f"content does not match {expected_regex!r}")
 
-        repeat_text = "".join(ch for ch in (content + reasoning) if not ch.isspace())
-        repeat_ratio = 0.0
-        if repeat_text:
-            repeat_ratio = max(Counter(repeat_text).values()) / len(repeat_text)
-            if repeat_ratio > max_repeat_ratio:
-                errors.append(f"repeat_char_ratio {repeat_ratio:.3f} exceeds {max_repeat_ratio:.3f}")
+        repeat_ratio, suspicious_repetition = repetition_check(
+            content + reasoning,
+            max_ratio=max_repeat_ratio,
+            min_chars=min_repeat_chars,
+        )
+        if suspicious_repetition:
+            errors.append(f"repeat_char_ratio {repeat_ratio:.3f} exceeds {max_repeat_ratio:.3f}")
 
         return {
             "ok": not errors,

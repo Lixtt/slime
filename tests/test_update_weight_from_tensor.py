@@ -2,7 +2,6 @@ import importlib.util
 import sys
 import types
 from argparse import Namespace
-from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -167,40 +166,32 @@ def test_send_to_colocated_engine_skips_when_no_gather_group(monkeypatch):
     assert long_lived is None
 
 
-def test_flattened_cuda_ipc_bucket_owns_export_pool(monkeypatch):
+def test_flattened_cuda_ipc_bucket_reuses_caller_allocator_pool(monkeypatch):
     module = _load_update_weight_module_with_stubs(monkeypatch)
     monkeypatch.setattr(module, "FlattenedTensorBucket", FakeFlattenedTensorBucket)
     monkeypatch.setattr(module.MultiprocessingSerializer, "serialize", lambda _obj, output_str=False: "ipc-payload")
     monkeypatch.setattr(module, "_torch_memory_saver_interesting_region", lambda: False)
-
-    events = []
-    fake_pool = object()
-    monkeypatch.setattr(module.torch.cuda, "MemPool", lambda: fake_pool)
-
-    @contextmanager
-    def fake_use_mem_pool(pool):
-        events.append(("enter", pool))
-        yield
-        events.append(("exit", pool))
-
-    monkeypatch.setattr(module.torch.cuda, "use_mem_pool", fake_use_mem_pool)
+    monkeypatch.setattr(
+        module.torch.cuda,
+        "MemPool",
+        lambda: pytest.fail("CUDA IPC export must not create a nested MemPool"),
+    )
     fake_cuda_tensor = types.SimpleNamespace(is_cuda=True)
 
     payload, owner = module._flatten_and_serialize_for_cuda_ipc([("weight", fake_cuda_tensor)])
 
     assert payload == "ipc-payload"
-    assert owner[1] is fake_pool
-    assert events == [("enter", fake_pool), ("exit", fake_pool)]
+    assert owner["flattened_tensor"].shape == (2,)
 
 
-def test_cuda_ipc_export_rejects_active_tms(monkeypatch):
+def test_flattened_cuda_ipc_bucket_rejects_active_tms(monkeypatch):
     module = _load_update_weight_module_with_stubs(monkeypatch)
+    monkeypatch.setattr(module, "FlattenedTensorBucket", FakeFlattenedTensorBucket)
     monkeypatch.setattr(module, "_torch_memory_saver_interesting_region", lambda: True)
     fake_cuda_tensor = types.SimpleNamespace(is_cuda=True)
 
     with pytest.raises(RuntimeError, match="torch_memory_saver is active"):
-        with module._cuda_ipc_export_pool([("weight", fake_cuda_tensor)]):
-            pass
+        module._flatten_and_serialize_for_cuda_ipc([("weight", fake_cuda_tensor)])
 
 
 def test_connect_rollout_engines_maps_single_node_colocated_engine(monkeypatch):

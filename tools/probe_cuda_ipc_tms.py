@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from contextlib import contextmanager
+from pathlib import Path
 
 import torch
 from sglang.srt.utils import MultiprocessingSerializer
@@ -89,7 +90,7 @@ def _run_case(name, size_bytes, context_factory):
         torch.cuda.ipc_collect()
 
 
-def _run_after_tms_pause(size_bytes: int, paused_allocation_bytes: int):
+def _run_after_tms_pause(size_bytes: int, paused_allocation_bytes: int, repeats: int):
     resident = []
     paused = False
     try:
@@ -104,12 +105,20 @@ def _run_after_tms_pause(size_bytes: int, paused_allocation_bytes: int):
         paused = True
         with torch_memory_saver.disable():
             state_during = _interesting_region()
-            payload_bytes = _serialize_bucket(size_bytes)
+            payload_bytes = []
+            for _ in range(repeats):
+                payload_bytes.append(_serialize_bucket(size_bytes))
+                from torch.multiprocessing import reductions
+
+                reductions.shared_cache.clear()
+                gc.collect()
+                torch.cuda.ipc_collect()
         return {
             "name": "after_tms_pause",
             "ok": True,
             "tms_interesting_region": state_during,
             "paused_allocation_bytes": paused_allocation_bytes,
+            "repeats": repeats,
             "payload_chars": payload_bytes,
         }
     except Exception as exc:
@@ -143,6 +152,12 @@ def main() -> int:
     parser.add_argument("--size-mib", type=int, default=216)
     parser.add_argument("--size-bytes", type=int)
     parser.add_argument("--paused-allocation-mib", type=int, default=1024)
+    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--output-json")
+    parser.add_argument(
+        "--cases",
+        default="after_tms_pause,tms_active,tms_disable_mem_pool,tms_disable_nested_export_pool,tms_hook_only_disabled",
+    )
     parser.add_argument("--require-tms-disable-pass", action="store_true")
     args = parser.parse_args()
 
@@ -152,13 +167,28 @@ def main() -> int:
     size_bytes = args.size_bytes if args.size_bytes is not None else args.size_mib * 1024 * 1024
 
     initial_state = _interesting_region()
-    results = [
-        _run_after_tms_pause(size_bytes, args.paused_allocation_mib * 1024 * 1024),
-        _run_case("tms_active", size_bytes, _no_context),
-        _run_case("tms_disable_mem_pool", size_bytes, torch_memory_saver.disable),
-        _run_case("tms_disable_nested_export_pool", size_bytes, _disable_tms_with_export_pool),
-        _run_case("tms_hook_only_disabled", size_bytes, _disable_tms_hook_only),
-    ]
+    case_runners = {
+        "after_tms_pause": lambda: _run_after_tms_pause(
+            size_bytes,
+            args.paused_allocation_mib * 1024 * 1024,
+            args.repeats,
+        ),
+        "tms_active": lambda: _run_case("tms_active", size_bytes, _no_context),
+        "tms_disable_mem_pool": lambda: _run_case(
+            "tms_disable_mem_pool", size_bytes, torch_memory_saver.disable
+        ),
+        "tms_disable_nested_export_pool": lambda: _run_case(
+            "tms_disable_nested_export_pool", size_bytes, _disable_tms_with_export_pool
+        ),
+        "tms_hook_only_disabled": lambda: _run_case(
+            "tms_hook_only_disabled", size_bytes, _disable_tms_hook_only
+        ),
+    }
+    selected_cases = [case.strip() for case in args.cases.split(",") if case.strip()]
+    unknown_cases = sorted(set(selected_cases) - set(case_runners))
+    if unknown_cases:
+        raise ValueError(f"Unknown cases: {unknown_cases}")
+    results = [case_runners[case]() for case in selected_cases]
     report = {
         "schema": "openclaw.cuda-ipc-tms-probe/v1",
         "pid": os.getpid(),
@@ -168,12 +198,17 @@ def main() -> int:
         "initial_tms_interesting_region": initial_state,
         "results": results,
     }
+    if args.output_json:
+        output_path = Path(args.output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2, sort_keys=True), flush=True)
 
     exit_code = 0
     if args.require_tms_disable_pass:
-        disabled = next(item for item in results if item["name"] == "tms_disable_mem_pool")
-        exit_code = 0 if disabled["ok"] else 1
+        required_names = {"after_tms_pause", "tms_disable_mem_pool"}
+        required = [item for item in results if item["name"] in required_names]
+        exit_code = 0 if len(required) == len(required_names) and all(item["ok"] for item in required) else 1
 
     # This probe intentionally creates producer-only CUDA IPC handles. Avoid
     # PyTorch's process-exit warning/segfault for handles with no real consumer.

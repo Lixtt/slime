@@ -1,7 +1,6 @@
 import logging
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import contextmanager
 from typing import Any
 
 import ray
@@ -173,9 +172,9 @@ class UpdateWeightFromTensor:
         for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
             refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
             ray.get(refs)
-            # Free GPU tensors so the caching allocator can reuse the blocks,
-            # then release CUDA IPC cache entries whose consumers (sglang engines)
-            # have already closed their IPC handles.
+            # Free GPU tensors so the outer torch_memory_saver.disable() pool
+            # can reuse the blocks, then collect IPC entries whose consumers
+            # have already closed their handles.
             del long_lived_tensors, hf_named_tensors
             torch.cuda.ipc_collect()
 
@@ -278,40 +277,31 @@ def _send_to_colocated_engine(
 
 
 def _flatten_and_serialize_for_cuda_ipc(named_tensors):
-    """Allocate the exported bucket in a dedicated, live CUDA memory pool."""
-    with _cuda_ipc_export_pool(named_tensors) as export_pool:
-        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-        flattened_tensor_data = {
-            "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
-            "metadata": flattened_tensor_bucket.get_metadata(),
-        }
-        flattened_tensor = flattened_tensor_data["flattened_tensor"]
-        if flattened_tensor.is_cuda:
-            torch.cuda.synchronize(flattened_tensor.device)
-        serialized_tensor = _serialize_flattened_bucket(flattened_tensor_data, named_tensors)
-
-    # Keep both the tensor and its private pool alive until the SGLang actor has
-    # consumed the CUDA IPC handle and returned from update_weights_from_tensor.
-    return serialized_tensor, (flattened_tensor_data, export_pool)
-
-
-@contextmanager
-def _cuda_ipc_export_pool(named_tensors):
+    """Flatten in the caller's live allocator pool and serialize as CUDA IPC."""
     is_cuda = any(tensor.is_cuda for _, tensor in named_tensors)
-    if not is_cuda:
-        yield None
-        return
-
-    tms_state = _torch_memory_saver_interesting_region()
-    if tms_state is True:
+    if is_cuda and _torch_memory_saver_interesting_region() is True:
         raise RuntimeError(
             "CUDA IPC weight export entered while torch_memory_saver is active. "
             "The caller must enter torch_memory_saver.disable() before flattening weights."
         )
 
-    export_pool = torch.cuda.MemPool()
-    with torch.cuda.use_mem_pool(export_pool):
-        yield export_pool
+    # update_weights() already runs inside torch_memory_saver.disable(), which
+    # owns one temporary MemPool for the complete sync. Nesting a per-bucket
+    # MemPool makes its destructor call emptyCache while the outer pool capture
+    # is active, aborting with CUDACachingAllocator captures_underway.empty().
+    flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+    flattened_tensor_data = {
+        "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+        "metadata": flattened_tensor_bucket.get_metadata(),
+    }
+    flattened_tensor = flattened_tensor_data["flattened_tensor"]
+    if flattened_tensor.is_cuda:
+        torch.cuda.synchronize(flattened_tensor.device)
+    serialized_tensor = _serialize_flattened_bucket(flattened_tensor_data, named_tensors)
+
+    # Keep the allocation alive until the SGLang actor consumes and closes the
+    # CUDA IPC handle. The caller-owned disable pool outlives every bucket.
+    return serialized_tensor, flattened_tensor_data
 
 
 def _serialize_flattened_bucket(flattened_tensor_data: dict[str, Any], named_tensors) -> str:

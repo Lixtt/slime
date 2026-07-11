@@ -335,6 +335,7 @@ def wrap_model_provider_with_freeze(original_provider, args, role="actor"):
         freeze_model_params(model, args)
         if role == "actor" and getattr(args, "use_megatron_lora", False):
             apply_megatron_lora(model, args)
+        enable_partial_train_activation_grad(model)
 
         return model
 
@@ -360,3 +361,50 @@ def freeze_model_params(model: GPTModel, args: argparse.Namespace):
                 if re.search(pattern, name):
                     param.requires_grad = False
                     break
+
+
+def enable_partial_train_activation_grad(model: GPTModel) -> bool:
+    """Keep recomputed PP0 decoder layers connected when embeddings are frozen.
+
+    Reentrant activation checkpointing only creates a backward node when at
+    least one tensor input requires gradients.  On the first pipeline stage,
+    a frozen embedding otherwise produces a non-grad activation, while later
+    stages receive pipeline tensors with ``requires_grad=True``.  Partial
+    fine-tuning would therefore silently skip every trainable decoder
+    parameter on PP0.
+    """
+
+    if not getattr(model, "pre_process", False):
+        return False
+    config = getattr(model, "config", None)
+    if getattr(config, "recompute_granularity", None) is None:
+        return False
+
+    embedding = getattr(model, "embedding", None)
+    if embedding is None or any(param.requires_grad for param in embedding.parameters()):
+        return False
+    if not any(
+        param.requires_grad
+        for name, param in model.named_parameters()
+        if not name.startswith("embedding.")
+    ):
+        return False
+
+    handle_attr = "_slime_partial_train_activation_grad_hook"
+    if getattr(embedding, handle_attr, None) is not None:
+        return False
+
+    def require_activation_grad(_module, _inputs, output):
+        if (
+            torch.is_grad_enabled()
+            and _module.training
+            and torch.is_tensor(output)
+            and output.is_floating_point()
+            and not output.requires_grad
+        ):
+            output.requires_grad_(True)
+        return output
+
+    embedding.register_forward_hook(require_activation_grad)
+    setattr(embedding, handle_attr, True)
+    return True

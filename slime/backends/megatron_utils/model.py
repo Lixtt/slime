@@ -88,6 +88,70 @@ def _with_rollout_top_p_token_keys(args: Namespace, keys: Sequence[str]) -> list
     return [*keys, *ROLLOUT_TOP_P_TOKEN_KEYS]
 
 
+def _collect_local_trainable_gradient_stats(model: Sequence[DDP]) -> dict[str, int | bool]:
+    seen_params: set[int] = set()
+    trainable_param_count = 0
+    trainable_numel = 0
+    grad_param_count = 0
+    grad_numel = 0
+    has_nonzero_grad = False
+
+    for model_chunk in model:
+        for param in model_chunk.parameters():
+            param_id = id(param)
+            if param_id in seen_params or not param.requires_grad:
+                continue
+            seen_params.add(param_id)
+            trainable_param_count += 1
+            trainable_numel += param.numel()
+            grad = getattr(param, "main_grad", None)
+            if grad is None:
+                grad = param.grad
+            if grad is None:
+                continue
+            grad_param_count += 1
+            grad_numel += grad.numel()
+            if not has_nonzero_grad and bool(torch.any(grad.detach() != 0).item()):
+                has_nonzero_grad = True
+
+    return {
+        "trainable_param_count": trainable_param_count,
+        "trainable_numel": trainable_numel,
+        "grad_param_count": grad_param_count,
+        "grad_numel": grad_numel,
+        "has_nonzero_grad": has_nonzero_grad,
+    }
+
+
+def _require_nonzero_local_trainable_gradients(model: Sequence[DDP]) -> None:
+    if os.getenv("SLIME_REQUIRE_NONZERO_TRAINABLE_GRADS", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+
+    stats = _collect_local_trainable_gradient_stats(model)
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    pipeline_rank = mpu.get_pipeline_model_parallel_rank()
+    logger.info(
+        "Trainable gradient gate rank=%s pipeline_rank=%s stats=%s",
+        rank,
+        pipeline_rank,
+        stats,
+    )
+    if stats["trainable_numel"] and (
+        stats["grad_numel"] == 0 or not stats["has_nonzero_grad"]
+    ):
+        raise RuntimeError(
+            "Trainable gradient gate found no non-zero gradient on "
+            f"rank={rank} pipeline_rank={pipeline_rank}: {stats}. "
+            "For partial fine-tuning with activation recomputation, verify that "
+            "the first pipeline activation requires gradients."
+        )
+
+
 def _iter_critic_output_layers(model: Sequence[DDP]):
     for chunk_id, module in enumerate(unwrap_model(model)):
         output_layer = getattr(module, "output_layer", None)
@@ -583,6 +647,8 @@ def train_one_step(
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False,
     )
+
+    _require_nonzero_local_trainable_gradients(model)
 
     valid_step = True
     grad_norm = float("nan")

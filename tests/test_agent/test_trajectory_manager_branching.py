@@ -219,12 +219,20 @@ def drift_replace(ids: list[int], at: int, sentinel: int = _DRIFT_BAND + 2) -> l
     return out
 
 
-def turn(prompt_ids, response_ids, *, finish_reason="stop", logprobs=None) -> TurnRecord:
+def turn(
+    prompt_ids,
+    response_ids,
+    *,
+    finish_reason="stop",
+    logprobs=None,
+    weight_version=None,
+) -> TurnRecord:
     return TurnRecord(
         prompt_ids=list(prompt_ids),
         output_ids=list(response_ids),
         finish_reason=finish_reason,
         output_log_probs=list(logprobs) if logprobs is not None else [],
+        weight_version=weight_version,
     )
 
 
@@ -254,6 +262,7 @@ def append(
     response_ids=None,
     finish_reason="stop",
     logprobs=None,
+    weight_version=None,
     response_message=None,
 ):
     p = list(prompt_ids) if prompt_ids is not None else render_prompt(prompt_msgs)
@@ -280,7 +289,13 @@ def append(
     )
     mgr.record_turn(
         sid,
-        turn=turn(p, r, finish_reason=finish_reason, logprobs=lp),
+        turn=turn(
+            p,
+            r,
+            finish_reason=finish_reason,
+            logprobs=lp,
+            weight_version=weight_version,
+        ),
         prompt_messages=messages(prompt_msgs),
         response_message=rmsg,
     )
@@ -1261,11 +1276,25 @@ def test_4_7_context_compression_preserves_one_trajectory_and_both_actions():
     sid = "4.7"
     system = sys_msg("stable-system")
     original_task = usr_msg("original-task")
-    append(mgr, sid, [system, original_task], "before-compression", logprobs=[-0.1, -0.2])
+    append(
+        mgr,
+        sid,
+        [system, original_task],
+        "before-compression",
+        logprobs=[-0.1, -0.2],
+        weight_version="7",
+    )
 
     summary = sys_msg("summary-of-prior-context")
     resumed_task = usr_msg("continue-after-summary")
-    append(mgr, sid, [system, summary, resumed_task], "after-compression", logprobs=[-0.3, -0.4])
+    append(
+        mgr,
+        sid,
+        [system, summary, resumed_task],
+        "after-compression",
+        logprobs=[-0.3, -0.4],
+        weight_version="7",
+    )
 
     reward = {"score": 0.75}
     samples = get_traj(
@@ -1280,6 +1309,7 @@ def test_4_7_context_compression_preserves_one_trajectory_and_both_actions():
     assert all(sample.group_id == 730 for sample in samples)
     assert all(sample.group_index == 5 for sample in samples)
     assert all(sample.reward == reward for sample in samples)
+    assert [sample.weight_versions for sample in samples] == [["7"], ["7"]]
     assert [sum(sample.loss_mask) for sample in samples] == [2, 2]
     assert goldens(samples) == [
         "<sys> system:stable-system </sys> <usr> user:original-task </usr> "

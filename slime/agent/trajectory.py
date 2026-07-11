@@ -36,6 +36,7 @@ class TurnRecord:
     finish_reason: str
     output_log_probs: list[float] = dataclasses.field(default_factory=list)
     ill_formed: bool = False
+    weight_version: str | None = None
 
 
 # ===========================================================================
@@ -163,6 +164,7 @@ class _SampleBuilder:
         self.tokens: list[int] = []
         self.loss_mask: list[int] = []
         self.logprobs: list[float] = []
+        self.weight_versions: list[str] = []
         self.last_response_start_idx: int | None = None
         self.leading_prompt_len: int = 0
 
@@ -209,6 +211,8 @@ class _SampleBuilder:
         self._append_tokens(
             turn.output_ids, loss_mask=int(trained), logprobs=turn.output_log_probs if trained else None
         )
+        if trained and turn.output_ids and turn.weight_version is not None:
+            self.weight_versions.append(str(turn.weight_version))
 
         if is_first_turn:
             self.leading_prompt_len = len(turn.prompt_ids)
@@ -235,6 +239,7 @@ class _SampleBuilder:
             response_length=len(self.loss_mask) - start,
             loss_mask=self.loss_mask[start:],
             rollout_log_probs=self.logprobs[start:],
+            weight_versions=list(self.weight_versions),
             reward=0.0,
             status=Sample.Status.COMPLETED,
             metadata=dict(extra_metadata or {}),

@@ -11,7 +11,7 @@ def test_initial_weight_update_does_not_resume_kv_before_sync():
 
 def test_initial_quality_gate_runs_before_rollout_offload_and_actor_creation():
     source = Path("slime/train.py").read_text()
-    quality_gate = 'run_rollout_generation_quality_gate(rollout_manager, "pre_initial_update")'
+    quality_gate = '"pre_initial_update",\n        debug_train_only=args.debug_train_only,'
     rollout_offload = "rollout_manager.offload.remote()"
     actor_creation = "create_training_models(args, pgs, rollout_manager)"
 
@@ -41,7 +41,7 @@ def test_training_loop_runs_pre_update_quality_gate_before_rollout_offload():
     source = Path("slime/train.py").read_text()
     train_loop = source.split("for rollout_id in range", 1)[1]
     generate = "rollout_manager.generate.remote(rollout_id)"
-    quality_gate = 'run_rollout_generation_quality_gate(rollout_manager, f"pre_update_{rollout_id}")'
+    quality_gate = 'f"pre_update_{rollout_id}",\n            debug_train_only=args.debug_train_only,'
     rollout_offload = "rollout_manager.offload.remote()"
 
     assert train_loop.index(generate) < train_loop.index(quality_gate) < train_loop.index(rollout_offload)

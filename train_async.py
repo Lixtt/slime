@@ -19,7 +19,11 @@ def train(args):
     # need to initialize rollout manager first to calculate num_rollout
     rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
 
-    run_rollout_generation_quality_gate(rollout_manager, "pre_initial_update")
+    run_rollout_generation_quality_gate(
+        rollout_manager,
+        "pre_initial_update",
+        debug_train_only=args.debug_train_only,
+    )
 
     if args.offload_rollout:
         ray.get(rollout_manager.offload.remote())
@@ -33,7 +37,11 @@ def train(args):
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
 
-    run_rollout_generation_quality_gate(rollout_manager, "post_initial_update")
+    run_rollout_generation_quality_gate(
+        rollout_manager,
+        "post_initial_update",
+        debug_train_only=args.debug_train_only,
+    )
 
     # async train loop.
     rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
@@ -74,9 +82,17 @@ def train(args):
             # sync generate before update weights to prevent update weight in the middle of generation
             rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
             rollout_data_next_future = None
-            run_rollout_generation_quality_gate(rollout_manager, f"pre_update_{rollout_id}")
+            run_rollout_generation_quality_gate(
+                rollout_manager,
+                f"pre_update_{rollout_id}",
+                debug_train_only=args.debug_train_only,
+            )
             actor_model.update_weights()
-            run_rollout_generation_quality_gate(rollout_manager, f"post_update_{rollout_id}")
+            run_rollout_generation_quality_gate(
+                rollout_manager,
+                f"post_update_{rollout_id}",
+                debug_train_only=args.debug_train_only,
+            )
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))

@@ -69,15 +69,21 @@ def _write_artifact(label: str, payload: dict) -> None:
     )
 
 
-def run_rollout_generation_quality_gate(rollout_manager, label: str) -> list[dict]:
+def run_rollout_generation_quality_gate(
+    rollout_manager,
+    label: str,
+    *,
+    debug_train_only: bool = False,
+) -> list[dict]:
     """Run a tiny generation probe against rollout engines.
 
     The probe is diagnostic by default. Large/offloaded rollout engines can be
     slow immediately after resume, so a probe timeout should not kill an
     otherwise valid training step unless strict mode is explicitly requested.
+    Debug train-only runs have no rollout engines and always skip the probe.
     """
 
-    if not _truthy(os.environ.get("ROLLOUT_GENERATION_QUALITY_GATE_ENABLED")):
+    if debug_train_only or not _truthy(os.environ.get("ROLLOUT_GENERATION_QUALITY_GATE_ENABLED")):
         return []
 
     strict = _strict()

@@ -19,7 +19,11 @@ def train(args):
 
     # Probe while rollout still has weights, KV cache, and CUDA graphs loaded.
     # A weights-only onload intentionally keeps generation paused for sync.
-    run_rollout_generation_quality_gate(rollout_manager, "pre_initial_update")
+    run_rollout_generation_quality_gate(
+        rollout_manager,
+        "pre_initial_update",
+        debug_train_only=args.debug_train_only,
+    )
 
     if args.offload_rollout:
         ray.get(rollout_manager.offload.remote())
@@ -39,7 +43,11 @@ def train(args):
     if args.offload_rollout:
         ray.get(rollout_manager.onload_kv.remote())
 
-    run_rollout_generation_quality_gate(rollout_manager, "post_initial_update")
+    run_rollout_generation_quality_gate(
+        rollout_manager,
+        "post_initial_update",
+        debug_train_only=args.debug_train_only,
+    )
 
     # special case for eval-only
     if args.num_rollout == 0 and args.eval_interval is not None:
@@ -77,7 +85,11 @@ def train(args):
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
 
         # Validate the current rollout version before its memory is released.
-        run_rollout_generation_quality_gate(rollout_manager, f"pre_update_{rollout_id}")
+        run_rollout_generation_quality_gate(
+            rollout_manager,
+            f"pre_update_{rollout_id}",
+            debug_train_only=args.debug_train_only,
+        )
 
         if args.offload_rollout:
             ray.get(rollout_manager.offload.remote())
@@ -104,7 +116,11 @@ def train(args):
         if args.offload_rollout:
             ray.get(rollout_manager.onload_kv.remote())
 
-        run_rollout_generation_quality_gate(rollout_manager, f"post_update_{rollout_id}")
+        run_rollout_generation_quality_gate(
+            rollout_manager,
+            f"post_update_{rollout_id}",
+            debug_train_only=args.debug_train_only,
+        )
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))

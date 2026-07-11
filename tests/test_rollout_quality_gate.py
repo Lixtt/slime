@@ -14,6 +14,24 @@ class _RolloutManager:
     generation_quality_check = _RemoteMethod()
 
 
+def test_quality_gate_skips_debug_train_only_without_ray_rpc(monkeypatch):
+    monkeypatch.setenv("ROLLOUT_GENERATION_QUALITY_GATE_ENABLED", "1")
+
+    def unexpected_ray_get(_ref, timeout=None):
+        raise AssertionError("debug train-only mode must not probe absent rollout engines")
+
+    monkeypatch.setattr(rollout_quality_gate.ray, "get", unexpected_ray_get)
+
+    assert (
+        rollout_quality_gate.run_rollout_generation_quality_gate(
+            _RolloutManager(),
+            "pre_initial_update",
+            debug_train_only=True,
+        )
+        == []
+    )
+
+
 def test_quality_gate_error_is_nonfatal_by_default(monkeypatch, tmp_path):
     monkeypatch.setenv("ROLLOUT_GENERATION_QUALITY_GATE_ENABLED", "1")
     monkeypatch.setenv("RUN_ROOT", str(tmp_path))

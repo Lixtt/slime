@@ -1,12 +1,55 @@
+import os
 import random
 from argparse import Namespace
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 
 
-TRAINING_STATE_FORMAT = "slime_megatron_trainable_training_state_v1"
+TRAINING_STATE_FORMAT = "slime_megatron_trainable_training_state_v2"
+
+
+def save_optimizer_parameter_state_atomically(
+    optimizer: Any,
+    destination: str | Path,
+    *,
+    writer_rank: bool,
+) -> None:
+    """Save Megatron distributed-optimizer tensors without publishing a partial file.
+
+    Every rank in the optimizer's data-parallel group must call this function.
+    Megatron writes only on data-parallel rank zero, represented by
+    ``writer_rank`` here.
+    """
+
+    destination = Path(destination)
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    if writer_rank:
+        temporary.unlink(missing_ok=True)
+    try:
+        optimizer.save_parameter_state(str(temporary))
+        if not writer_rank:
+            return
+        if not temporary.is_file() or temporary.stat().st_size == 0:
+            raise RuntimeError(
+                f"Megatron did not write distributed optimizer parameter state to {temporary}"
+            )
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        try:
+            parent_fd = os.open(destination.parent, os.O_RDONLY)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        except OSError:
+            pass
+    finally:
+        if writer_rank:
+            temporary.unlink(missing_ok=True)
 
 
 def capture_rank_local_rng_state(tensor_parallel: Any) -> dict:
@@ -69,6 +112,9 @@ def build_training_state_payload(
     optimizer: Any,
     opt_param_scheduler: Any,
     tensor_parallel: Any,
+    optimizer_parameter_state_required: bool = False,
+    optimizer_parameter_state_file: str | None = None,
+    optimizer_parameter_state_saved: bool = False,
 ) -> tuple[dict, dict[str, bool]]:
     save_optimizer = not getattr(args, "no_save_optim", False)
     optimizer_state = None
@@ -87,6 +133,11 @@ def build_training_state_payload(
     if not getattr(args, "no_save_rng", False):
         rng_state = capture_rank_local_rng_state(tensor_parallel)
 
+    optimizer_common_state_saved = optimizer_state is not None
+    optimizer_state_saved = optimizer_common_state_saved and (
+        not optimizer_parameter_state_required or optimizer_parameter_state_saved
+    )
+
     payload = {
         "format": TRAINING_STATE_FORMAT,
         "iteration": iteration,
@@ -94,12 +145,20 @@ def build_training_state_payload(
         "world_size": world_size,
         **topology,
         "optimizer": optimizer_state,
+        "optimizer_parameter_state": {
+            "required": optimizer_parameter_state_required,
+            "file": optimizer_parameter_state_file,
+            "saved": optimizer_parameter_state_saved,
+        },
         "opt_param_scheduler": scheduler_state,
         "rng_state": rng_state,
         "progress": training_progress_state(args),
     }
     metadata = {
-        "optimizer_state_saved": optimizer_state is not None,
+        "optimizer_state_saved": optimizer_state_saved,
+        "optimizer_common_state_saved": optimizer_common_state_saved,
+        "optimizer_parameter_state_required": optimizer_parameter_state_required,
+        "optimizer_parameter_state_saved": optimizer_parameter_state_saved,
         "scheduler_state_saved": scheduler_state is not None,
         "rng_state_saved": rng_state is not None,
     }
@@ -118,6 +177,7 @@ def restore_training_state_payload(
     tensor_parallel: Any,
     strict: bool,
     source: str,
+    optimizer_parameter_state_path: str | Path | None = None,
 ) -> tuple[bool, list[str]]:
     if payload.get("format") != TRAINING_STATE_FORMAT:
         raise ValueError(
@@ -139,16 +199,51 @@ def restore_training_state_payload(
     warnings: list[str] = []
     optimizer_state_loaded = False
     optimizer_state = payload.get("optimizer")
+    parameter_state = payload.get("optimizer_parameter_state")
+    if not isinstance(parameter_state, dict):
+        raise ValueError(
+            f"Training state {source} has no distributed optimizer parameter-state metadata"
+        )
+    parameter_state_required = bool(parameter_state.get("required"))
+    parameter_state_saved = bool(parameter_state.get("saved"))
+    parameter_state_path = (
+        Path(optimizer_parameter_state_path)
+        if optimizer_parameter_state_path is not None
+        else None
+    )
+
+    optimizer_error: Exception | None = None
     if optimizer_state is None:
-        if strict:
-            raise KeyError(f"Training state {source} has no optimizer state")
-        warnings.append(f"Training state {source} has no optimizer state")
+        optimizer_error = KeyError(f"Training state {source} has no optimizer common state")
     elif optimizer is None or getattr(optimizer, "is_stub_optimizer", False):
         raise RuntimeError(
             f"Training state {source} contains optimizer state, but the runtime optimizer is unavailable"
         )
+    elif parameter_state_required and not parameter_state_saved:
+        optimizer_error = KeyError(
+            f"Training state {source} has no distributed optimizer parameter state"
+        )
+    elif parameter_state_required and (
+        parameter_state_path is None or not parameter_state_path.is_file()
+    ):
+        optimizer_error = FileNotFoundError(
+            "Missing distributed optimizer parameter state for "
+            f"{source}: {parameter_state_path}"
+        )
+    elif parameter_state_required and not hasattr(optimizer, "load_parameter_state"):
+        optimizer_error = RuntimeError(
+            "Training state requires distributed optimizer parameter state, but "
+            "the runtime optimizer has no load_parameter_state()"
+        )
+
+    if optimizer_error is not None:
+        if strict:
+            raise optimizer_error
+        warnings.append(str(optimizer_error))
     else:
         optimizer.load_state_dict(optimizer_state)
+        if parameter_state_required:
+            optimizer.load_parameter_state(str(parameter_state_path))
         optimizer_state_loaded = True
 
     scheduler_state = payload.get("opt_param_scheduler")

@@ -22,6 +22,9 @@ SPEC.loader.exec_module(checkpoint_state)
 TRAINING_STATE_FORMAT = checkpoint_state.TRAINING_STATE_FORMAT
 build_training_state_payload = checkpoint_state.build_training_state_payload
 restore_training_state_payload = checkpoint_state.restore_training_state_payload
+save_optimizer_parameter_state_atomically = (
+    checkpoint_state.save_optimizer_parameter_state_atomically
+)
 
 
 class _Tracker:
@@ -58,12 +61,16 @@ class _StateOwner:
     def __init__(self, state):
         self.state = state
         self.loaded = None
+        self.loaded_parameter_state = None
 
     def state_dict(self):
         return self.state
 
     def load_state_dict(self, state):
         self.loaded = state
+
+    def load_parameter_state(self, path):
+        self.loaded_parameter_state = Path(path).read_bytes()
 
 
 def _args(**overrides):
@@ -102,6 +109,9 @@ def test_training_state_payload_round_trip_restores_all_state():
     assert payload["format"] == TRAINING_STATE_FORMAT
     assert metadata == {
         "optimizer_state_saved": True,
+        "optimizer_common_state_saved": True,
+        "optimizer_parameter_state_required": False,
+        "optimizer_parameter_state_saved": False,
         "scheduler_state_saved": True,
         "rng_state_saved": True,
     }
@@ -158,7 +168,7 @@ def test_training_state_strict_resume_rejects_missing_optimizer():
         tensor_parallel=tensor_parallel,
     )
 
-    with pytest.raises(KeyError, match="no optimizer state"):
+    with pytest.raises(KeyError, match="no optimizer common state"):
         restore_training_state_payload(
             payload,
             expected_iteration=0,
@@ -171,6 +181,100 @@ def test_training_state_strict_resume_rejects_missing_optimizer():
             strict=True,
             source="test.pt",
         )
+
+
+def test_training_state_loads_distributed_optimizer_parameter_state(tmp_path: Path):
+    tensor_parallel = _TensorParallel()
+    optimizer = _StateOwner({"param_groups": [{"step": 7}]})
+    payload, metadata = build_training_state_payload(
+        iteration=6,
+        rank=0,
+        world_size=1,
+        topology={},
+        args=_args(),
+        optimizer=optimizer,
+        opt_param_scheduler=_StateOwner({"num_steps": 48}),
+        tensor_parallel=tensor_parallel,
+        optimizer_parameter_state_required=True,
+        optimizer_parameter_state_file="optimizer_parameter_state.pt",
+        optimizer_parameter_state_saved=True,
+    )
+    assert metadata["optimizer_state_saved"] is True
+    assert metadata["optimizer_parameter_state_required"] is True
+    assert metadata["optimizer_parameter_state_saved"] is True
+
+    parameter_state_path = tmp_path / "optimizer_parameter_state.pt"
+    parameter_state_path.write_bytes(b"adam-moments")
+    target_optimizer = _StateOwner({})
+    loaded, warnings = restore_training_state_payload(
+        payload,
+        expected_iteration=6,
+        expected_rank=0,
+        expected_world_size=1,
+        args=_args(),
+        optimizer=target_optimizer,
+        opt_param_scheduler=_StateOwner({}),
+        tensor_parallel=tensor_parallel,
+        strict=True,
+        source="test.pt",
+        optimizer_parameter_state_path=parameter_state_path,
+    )
+
+    assert loaded is True
+    assert warnings == []
+    assert target_optimizer.loaded == {"param_groups": [{"step": 7}]}
+    assert target_optimizer.loaded_parameter_state == b"adam-moments"
+
+
+def test_training_state_rejects_missing_distributed_optimizer_parameter_state(
+    tmp_path: Path,
+):
+    tensor_parallel = _TensorParallel()
+    payload, _ = build_training_state_payload(
+        iteration=1,
+        rank=0,
+        world_size=1,
+        topology={},
+        args=_args(),
+        optimizer=_StateOwner({"param_groups": [{"step": 1}]}),
+        opt_param_scheduler=_StateOwner({"num_steps": 24}),
+        tensor_parallel=tensor_parallel,
+        optimizer_parameter_state_required=True,
+        optimizer_parameter_state_file="missing.pt",
+        optimizer_parameter_state_saved=True,
+    )
+    target_optimizer = _StateOwner({})
+
+    with pytest.raises(FileNotFoundError, match="Missing distributed optimizer"):
+        restore_training_state_payload(
+            payload,
+            expected_iteration=1,
+            expected_rank=0,
+            expected_world_size=1,
+            args=_args(),
+            optimizer=target_optimizer,
+            opt_param_scheduler=_StateOwner({}),
+            tensor_parallel=tensor_parallel,
+            strict=True,
+            source="test.pt",
+            optimizer_parameter_state_path=tmp_path / "missing.pt",
+        )
+    assert target_optimizer.loaded is None
+
+
+def test_optimizer_parameter_state_save_is_atomic(tmp_path: Path):
+    class _FileOptimizer:
+        @staticmethod
+        def save_parameter_state(path):
+            Path(path).write_bytes(b"complete-state")
+
+    destination = tmp_path / "optimizer_parameter_state.pt"
+    save_optimizer_parameter_state_atomically(
+        _FileOptimizer(), destination, writer_rank=True
+    )
+
+    assert destination.read_bytes() == b"complete-state"
+    assert list(tmp_path.glob(".*.tmp")) == []
 
 
 def test_training_state_rejects_topology_identity_mismatch():

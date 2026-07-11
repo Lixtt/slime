@@ -42,6 +42,7 @@ from .trainable_checkpoint_state import (
     TRAINING_STATE_FORMAT,
     build_training_state_payload,
     restore_training_state_payload,
+    save_optimizer_parameter_state_atomically,
 )
 
 logger = logging.getLogger(__name__)
@@ -904,6 +905,17 @@ def _atomic_write_text(path: Path, text: str) -> None:
     os.replace(tmp_path, path)
 
 
+def _data_parallel_group_leader_rank(rank: int) -> int:
+    group = _safe_mpu_value("get_data_parallel_group", with_context_parallel=True)
+    if (
+        group is None
+        or not torch.distributed.is_available()
+        or not torch.distributed.is_initialized()
+    ):
+        return rank
+    return int(torch.distributed.get_process_group_ranks(group)[0])
+
+
 def _save_trainable_only_checkpoint(
     iteration: int,
     model: Sequence[DDP],
@@ -971,6 +983,10 @@ def _save_trainable_only_checkpoint(
 
     save_training_state = _env_flag("SLIME_MEGATRON_TRAINABLE_ONLY_SAVE_TRAINING_STATE")
     optimizer_state_saved = False
+    optimizer_common_state_saved = False
+    optimizer_parameter_state_required = False
+    optimizer_parameter_state_saved = False
+    optimizer_parameter_state_file = None
     scheduler_state_saved = False
     rng_state_saved = False
     if save_training_state:
@@ -980,6 +996,37 @@ def _save_trainable_only_checkpoint(
             "expert_model_parallel_rank": expert_model_parallel_rank,
             "data_parallel_rank": data_parallel_rank,
         }
+        save_optimizer = not getattr(args, "no_save_optim", False)
+        optimizer_parameter_state_required = bool(
+            save_optimizer and getattr(args, "use_distributed_optimizer", False)
+        )
+        if optimizer_parameter_state_required:
+            if optimizer is None or getattr(optimizer, "is_stub_optimizer", False):
+                raise RuntimeError(
+                    "Exact trainable-only checkpointing requires a non-stub distributed optimizer"
+                )
+            if not hasattr(optimizer, "save_parameter_state"):
+                raise RuntimeError(
+                    "Exact trainable-only checkpointing requires optimizer.save_parameter_state()"
+                )
+            if data_parallel_rank is None:
+                raise RuntimeError("Cannot determine data-parallel rank for optimizer checkpointing")
+            group_leader_rank = _data_parallel_group_leader_rank(rank)
+            optimizer_parameter_state_file = (
+                f"optimizer_parameter_state_dp_group_{group_leader_rank:05d}.pt"
+            )
+            optimizer_parameter_state_path = iteration_dir / optimizer_parameter_state_file
+            save_optimizer_parameter_state_atomically(
+                optimizer,
+                optimizer_parameter_state_path,
+                writer_rank=int(data_parallel_rank) == 0,
+            )
+            _safe_barrier()
+            optimizer_parameter_state_saved = (
+                optimizer_parameter_state_path.is_file()
+                and optimizer_parameter_state_path.stat().st_size > 0
+            )
+
         training_state_payload, training_state_metadata = build_training_state_payload(
             iteration=iteration,
             rank=rank,
@@ -989,8 +1036,20 @@ def _save_trainable_only_checkpoint(
             optimizer=optimizer,
             opt_param_scheduler=opt_param_scheduler,
             tensor_parallel=tensor_parallel,
+            optimizer_parameter_state_required=optimizer_parameter_state_required,
+            optimizer_parameter_state_file=optimizer_parameter_state_file,
+            optimizer_parameter_state_saved=optimizer_parameter_state_saved,
         )
         optimizer_state_saved = training_state_metadata["optimizer_state_saved"]
+        optimizer_common_state_saved = training_state_metadata[
+            "optimizer_common_state_saved"
+        ]
+        optimizer_parameter_state_required = training_state_metadata[
+            "optimizer_parameter_state_required"
+        ]
+        optimizer_parameter_state_saved = training_state_metadata[
+            "optimizer_parameter_state_saved"
+        ]
         scheduler_state_saved = training_state_metadata["scheduler_state_saved"]
         rng_state_saved = training_state_metadata["rng_state_saved"]
         if not optimizer_state_saved and rank == 0:
@@ -1009,6 +1068,10 @@ def _save_trainable_only_checkpoint(
                     "rank": rank,
                     "world_size": world_size,
                     "optimizer_state_saved": optimizer_state_saved,
+                    "optimizer_common_state_saved": optimizer_common_state_saved,
+                    "optimizer_parameter_state_required": optimizer_parameter_state_required,
+                    "optimizer_parameter_state_saved": optimizer_parameter_state_saved,
+                    "optimizer_parameter_state_file": optimizer_parameter_state_file,
                     "scheduler_state_saved": scheduler_state_saved,
                     "rng_state_saved": rng_state_saved,
                     "progress": training_state_payload["progress"],
@@ -1035,6 +1098,30 @@ def _save_trainable_only_checkpoint(
             ]
             optimizer_state_saved = all(
                 item.get("optimizer_state_saved") is True for item in training_rank_metadata
+            )
+            optimizer_common_state_saved = all(
+                item.get("optimizer_common_state_saved") is True
+                for item in training_rank_metadata
+            )
+            optimizer_parameter_state_required = any(
+                item.get("optimizer_parameter_state_required") is True
+                for item in training_rank_metadata
+            )
+            required_parameter_state_metadata = [
+                item
+                for item in training_rank_metadata
+                if item.get("optimizer_parameter_state_required") is True
+            ]
+            optimizer_parameter_state_saved = all(
+                item.get("optimizer_parameter_state_saved") is True
+                for item in required_parameter_state_metadata
+            )
+            optimizer_parameter_state_files = sorted(
+                {
+                    str(item["optimizer_parameter_state_file"])
+                    for item in required_parameter_state_metadata
+                    if item.get("optimizer_parameter_state_file")
+                }
             )
             scheduler_state_saved = all(
                 item.get("scheduler_state_saved") is True for item in training_rank_metadata
@@ -1063,6 +1150,12 @@ def _save_trainable_only_checkpoint(
             ),
             "training_state_requested": save_training_state,
             "optimizer_state_saved": optimizer_state_saved,
+            "optimizer_common_state_saved": optimizer_common_state_saved,
+            "optimizer_parameter_state_required": optimizer_parameter_state_required,
+            "optimizer_parameter_state_saved": optimizer_parameter_state_saved,
+            "optimizer_parameter_state_files": (
+                optimizer_parameter_state_files if save_training_state else []
+            ),
             "scheduler_state_saved": scheduler_state_saved,
             "rng_state_saved": rng_state_saved,
             "created_by": "slime.megatron.trainable_only_save",
@@ -1215,6 +1308,10 @@ def _load_trainable_only_checkpoint_if_requested(
             logger.warning("%s; continuing as a model-only warm start", message)
         else:
             training_state = torch.load(training_state_file, map_location="cpu", weights_only=False)
+            parameter_state_metadata = training_state.get("optimizer_parameter_state")
+            parameter_state_path = None
+            if isinstance(parameter_state_metadata, dict) and parameter_state_metadata.get("file"):
+                parameter_state_path = checkpoint_dir / str(parameter_state_metadata["file"])
             optimizer_state_loaded, warnings = restore_training_state_payload(
                 training_state,
                 expected_iteration=checkpoint_iteration,
@@ -1226,6 +1323,7 @@ def _load_trainable_only_checkpoint_if_requested(
                 tensor_parallel=tensor_parallel,
                 strict=strict,
                 source=str(training_state_file),
+                optimizer_parameter_state_path=parameter_state_path,
             )
             for warning in warnings:
                 logger.warning("%s", warning)

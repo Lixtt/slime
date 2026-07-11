@@ -5,6 +5,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -161,3 +163,34 @@ def test_get_weight_version_falls_back_for_legacy_sglang(monkeypatch) -> None:
         "http://127.0.0.1:30000/model_info",
         "http://127.0.0.1:30000/get_weight_version",
     ]
+
+
+def test_runtime_token_capacity_gate_uses_profiled_values(monkeypatch) -> None:
+    module = _load_sglang_engine(monkeypatch)
+    engine = object.__new__(module.SGLangEngine)
+    engine.node_rank = 0
+    engine.args = types.SimpleNamespace(
+        rollout_min_kv_tokens=191873,
+        rollout_min_input_tokens=159040,
+    )
+
+    engine._validate_runtime_token_capacity(
+        {
+            "max_total_num_tokens": 199488,
+            "max_req_input_len": 199482,
+            "context_length": 200000,
+            "max_total_tokens": 200000,
+            "mem_fraction_static": 0.83,
+        }
+    )
+
+    with pytest.raises(RuntimeError, match=r"KV token pool 118848 < required 191873"):
+        engine._validate_runtime_token_capacity(
+            {
+                "max_total_num_tokens": 118848,
+                "max_req_input_len": 118842,
+                "context_length": 200000,
+                "max_total_tokens": 200000,
+                "mem_fraction_static": 0.80,
+            }
+        )

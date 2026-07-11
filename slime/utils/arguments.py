@@ -395,6 +395,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rollout-min-kv-tokens",
+                type=int,
+                default=0,
+                help=(
+                    "Fail SGLang startup when the profiled runtime KV token pool is smaller than this value. "
+                    "This checks the effective capacity reported by /server_info, not the requested "
+                    "--sglang-max-total-tokens value."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-min-input-tokens",
+                type=int,
+                default=0,
+                help=(
+                    "Fail SGLang startup when its profiled maximum request input length is smaller than this value."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-max-prompt-len",
                 type=int,
                 default=None,

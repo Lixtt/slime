@@ -256,6 +256,7 @@ class SGLangEngine(RayActor):
 
         actual_server_args = get_server_info(f"http://{self.server_host}:{self.server_port}")
         _sanity_check_server_args(actual_server_args, expect_server_args)
+        self._validate_runtime_token_capacity(actual_server_args)
         self._register_to_router(expect_server_args)
 
     def _init_normal(self, server_args_dict):
@@ -275,7 +276,47 @@ class SGLangEngine(RayActor):
             except ImportError:
                 logger.warning("enable_memory_saver is set, but torch_memory_saver is not importable.")
         self.process = launch_server_process(ServerArgs(**server_args_dict))
+        if self.node_rank == 0:
+            actual_server_args = get_server_info(f"http://{self.server_host}:{self.server_port}")
+            self._validate_runtime_token_capacity(actual_server_args)
         self._register_to_router(server_args_dict)
+
+    def _validate_runtime_token_capacity(self, server_info: dict) -> None:
+        """Fail before router registration when SGLang profiled too little KV."""
+        if self.node_rank != 0:
+            return
+
+        min_kv_tokens = int(getattr(self.args, "rollout_min_kv_tokens", 0) or 0)
+        min_input_tokens = int(getattr(self.args, "rollout_min_input_tokens", 0) or 0)
+        if min_kv_tokens <= 0 and min_input_tokens <= 0:
+            return
+
+        actual_kv_tokens = int(server_info.get("max_total_num_tokens") or 0)
+        actual_input_tokens = int(server_info.get("max_req_input_len") or 0)
+        failures = []
+        if actual_kv_tokens < min_kv_tokens:
+            failures.append(f"KV token pool {actual_kv_tokens} < required {min_kv_tokens}")
+        if actual_input_tokens < min_input_tokens:
+            failures.append(f"max request input {actual_input_tokens} < required {min_input_tokens}")
+        if failures:
+            raise RuntimeError(
+                "SGLang runtime context-capacity gate failed before router registration: "
+                + "; ".join(failures)
+                + ". "
+                + f"context_length={server_info.get('context_length')} "
+                + f"requested_max_total_tokens={server_info.get('max_total_tokens')} "
+                + f"mem_fraction_static={server_info.get('mem_fraction_static')}. "
+                + "Increase verified KV capacity or lower the agent context/output budget."
+            )
+
+        logger.info(
+            "SGLang runtime context-capacity gate passed: max_total_num_tokens=%s "
+            "max_req_input_len=%s required_kv_tokens=%s required_input_tokens=%s",
+            actual_kv_tokens,
+            actual_input_tokens,
+            min_kv_tokens,
+            min_input_tokens,
+        )
 
     def _register_to_router(self, server_args_dict):
         if self.worker_type == "encoder":

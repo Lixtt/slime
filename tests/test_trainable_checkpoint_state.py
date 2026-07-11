@@ -73,6 +73,18 @@ class _StateOwner:
         self.loaded_parameter_state = Path(path).read_bytes()
 
 
+class _StrictScheduler:
+    def __init__(self, *, override=False):
+        self.override_opt_param_scheduler = override
+        self.use_checkpoint_opt_param_scheduler = False
+        self.loaded = None
+
+    def load_state_dict(self, state):
+        if not self.use_checkpoint_opt_param_scheduler:
+            raise AssertionError("runtime and checkpoint scheduler horizons differ")
+        self.loaded = state
+
+
 def _args(**overrides):
     values = {
         "no_save_optim": False,
@@ -153,6 +165,74 @@ def test_training_state_payload_round_trip_restores_all_state():
     assert np.random.random() == expected_numpy
     assert torch.equal(torch.rand(1), expected_torch)
     assert tensor_parallel.tracker.states["model-parallel-rng"].tolist() == [7]
+
+
+def test_strict_resume_uses_checkpoint_scheduler_configuration():
+    tensor_parallel = _TensorParallel()
+    payload, _ = build_training_state_payload(
+        iteration=1,
+        rank=0,
+        world_size=1,
+        topology={},
+        args=_args(),
+        optimizer=_StateOwner({"step": 1}),
+        opt_param_scheduler=_StateOwner(
+            {"num_steps": 40, "lr_decay_steps": 40, "wd_incr_steps": 40}
+        ),
+        tensor_parallel=tensor_parallel,
+    )
+    target_args = _args(
+        use_checkpoint_opt_param_scheduler=False,
+        override_opt_param_scheduler=False,
+    )
+    target_scheduler = _StrictScheduler()
+
+    loaded, warnings = restore_training_state_payload(
+        payload,
+        expected_iteration=1,
+        expected_rank=0,
+        expected_world_size=1,
+        args=target_args,
+        optimizer=_StateOwner({}),
+        opt_param_scheduler=target_scheduler,
+        tensor_parallel=tensor_parallel,
+        strict=True,
+        source="horizon-mismatch.pt",
+    )
+
+    assert loaded is True
+    assert warnings == []
+    assert target_args.use_checkpoint_opt_param_scheduler is True
+    assert target_scheduler.use_checkpoint_opt_param_scheduler is True
+    assert target_scheduler.loaded["lr_decay_steps"] == 40
+
+
+def test_strict_resume_rejects_scheduler_override():
+    tensor_parallel = _TensorParallel()
+    payload, _ = build_training_state_payload(
+        iteration=1,
+        rank=0,
+        world_size=1,
+        topology={},
+        args=_args(),
+        optimizer=_StateOwner({"step": 1}),
+        opt_param_scheduler=_StateOwner({"num_steps": 40}),
+        tensor_parallel=tensor_parallel,
+    )
+
+    with pytest.raises(ValueError, match="cannot override the checkpoint scheduler"):
+        restore_training_state_payload(
+            payload,
+            expected_iteration=1,
+            expected_rank=0,
+            expected_world_size=1,
+            args=_args(override_opt_param_scheduler=True),
+            optimizer=_StateOwner({}),
+            opt_param_scheduler=_StrictScheduler(override=True),
+            tensor_parallel=tensor_parallel,
+            strict=True,
+            source="override.pt",
+        )
 
 
 def test_training_state_strict_resume_rejects_missing_optimizer():

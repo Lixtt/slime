@@ -102,6 +102,29 @@ def restore_training_progress_state(args: Namespace, progress: dict) -> None:
         setattr(args, key, value)
 
 
+def prepare_scheduler_for_exact_restore(
+    args: Namespace,
+    opt_param_scheduler: Any,
+    *,
+    source: str,
+) -> None:
+    """Make the persisted scheduler authoritative for an exact resume."""
+    override_requested = bool(
+        getattr(args, "override_opt_param_scheduler", False)
+        or getattr(opt_param_scheduler, "override_opt_param_scheduler", False)
+    )
+    if override_requested:
+        raise ValueError(
+            f"Strict training-state restore from {source} cannot override the checkpoint scheduler; "
+            "disable strict restore for an intentional new-schedule branch"
+        )
+
+    if hasattr(args, "use_checkpoint_opt_param_scheduler"):
+        args.use_checkpoint_opt_param_scheduler = True
+    if hasattr(opt_param_scheduler, "use_checkpoint_opt_param_scheduler"):
+        opt_param_scheduler.use_checkpoint_opt_param_scheduler = True
+
+
 def build_training_state_payload(
     *,
     iteration: int,
@@ -256,6 +279,12 @@ def restore_training_state_payload(
             f"Training state {source} contains scheduler state, but the runtime scheduler is unavailable"
         )
     else:
+        if strict:
+            prepare_scheduler_for_exact_restore(
+                args,
+                opt_param_scheduler,
+                source=source,
+            )
         opt_param_scheduler.load_state_dict(scheduler_state)
 
     rng_state = payload.get("rng_state")

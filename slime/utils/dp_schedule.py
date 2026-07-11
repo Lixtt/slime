@@ -7,12 +7,12 @@ under CPU-only CI.
 
 The scheduling philosophy is **pack first, distribute second**:
 
-  1. Group samples by training group id (``group_indices[i]`` =
+  1. Group samples by trajectory id (``group_indices[i]`` =
      ``samples[i].group_id`` or ``samples[i].index``) and split groups into
      steps of ``global_batch_size`` groups each. In the common case one group
      has one training sample so this is the same as a contiguous chunk; under
-     compact / subagent one rollout may emit multiple training samples, in
-     which case all sibling samples stay in the same step.
+     context compaction / subagents one trajectory may emit multiple training
+     rows, in which case all sibling rows stay in the same step.
   2. For each step, pack its samples into ``K`` micro-batches with a
      single first-fit pass (dynamic batch) or fixed-size chunking
      (static batch).
@@ -100,12 +100,12 @@ def build_dp_schedule(
             may omit context/pipeline fields; they default to non-parallel
             values.
         total_lengths: token count per sample, indexed globally.
-        global_batch_size: number of groups (NOT training samples) per
+        global_batch_size: number of trajectories (NOT training rows) per
             training step. Number of training steps =
             ``num_groups // global_batch_size``; trailing groups whose
             samples don't fit are dropped.
-        group_indices: group id for each sample. Samples sharing the same id
-            are kept together in one step.
+        group_indices: trajectory id for each training row. Rows sharing the
+            same id are kept together in one step.
         rollout_indices: legacy alias for ``group_indices``.
 
     Returns:
@@ -134,8 +134,8 @@ def build_dp_schedule(
     elif rollout_indices is not None and list(group_indices) != list(rollout_indices):
         raise ValueError("group_indices and rollout_indices were both provided but differ.")
 
-    # Group samples by group id (preserve first-occurrence order). All
-    # samples from one group stay in a single step so the per-group loss
+    # Group rows by trajectory id (preserve first-occurrence order). All rows
+    # from one trajectory stay in a single step so the trajectory loss
     # reducer is well-defined.
     group_id_to_samples: dict[int, list[int]] = {}
     for sample_pos, group_id in enumerate(group_indices):

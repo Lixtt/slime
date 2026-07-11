@@ -97,12 +97,11 @@ class Sample:
 
     group_index: int | None = None
     index: int | None = None
-    # Id of the training aggregation group this sample belongs to. Defaults
-    # to ``None`` and the downstream pipeline falls back to ``index`` (or the
-    # sample position if index is absent). Compact / subagent paths that split
-    # one rollout execution into multiple training samples should set the same
-    # ``group_id`` on every sibling, so loss aggregation averages within the
-    # group instead of over-counting it.
+    # Id of one sampled trajectory. The downstream pipeline falls back to the
+    # unique ``index`` for ordinary one-row trajectories. Compact / subagent
+    # paths that split one trajectory into multiple training rows set the same
+    # ``group_id`` on every sibling. ``group_index`` remains the prompt/task
+    # identity used to normalize advantages across independent trajectories.
     group_id: int | None = None
     # prompt
     prompt: str | list[dict[str, str]] = ""

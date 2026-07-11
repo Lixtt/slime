@@ -3,6 +3,7 @@ import sys
 import types
 
 import numpy as np
+import pytest
 
 
 def _install_rollout_import_stubs():
@@ -248,7 +249,7 @@ def test_reward_normalization_groups_by_canonical_sample_group_id_even_for_full_
     assert normalized_rewards == [-1.0, -2.0, 1.0, 2.0]
 
 
-def test_reward_normalization_prefers_group_id_over_group_index():
+def test_reward_normalization_uses_prompt_group_and_not_trajectory_id():
     _install_rollout_import_stubs()
     rollout = importlib.import_module("slime.ray.rollout")
     from slime.utils.types import Sample
@@ -266,14 +267,65 @@ def test_reward_normalization_prefers_group_id_over_group_index():
     samples = [
         Sample(group_id=10, group_index=0, index=0, reward=1.0),
         Sample(group_id=20, group_index=0, index=1, reward=10.0),
-        Sample(group_id=10, group_index=1, index=2, reward=3.0),
-        Sample(group_id=20, group_index=1, index=3, reward=14.0),
+        Sample(group_id=30, group_index=1, index=2, reward=3.0),
+        Sample(group_id=40, group_index=1, index=3, reward=14.0),
     ]
 
     raw_rewards, normalized_rewards = manager._post_process_rewards(samples)
 
     assert raw_rewards == [1.0, 10.0, 3.0, 14.0]
-    assert normalized_rewards == [-1.0, -2.0, 1.0, 2.0]
+    assert normalized_rewards == [-4.5, 4.5, -5.5, 5.5]
+
+
+def test_reward_normalization_counts_compacted_trajectory_once_and_broadcasts_advantage():
+    _install_rollout_import_stubs()
+    rollout = importlib.import_module("slime.ray.rollout")
+    from slime.utils.types import Sample
+
+    manager = object.__new__(rollout.RolloutManager)
+    manager.custom_reward_post_process_func = None
+    manager.args = types.SimpleNamespace(
+        advantage_estimator="grpo",
+        rewards_normalization=True,
+        grpo_std_normalization=False,
+        n_samples_per_prompt=2,
+        rollout_batch_size=1,
+        reward_key=None,
+    )
+    samples = [
+        Sample(group_id=10, group_index=0, index=0, reward=1.0),
+        Sample(group_id=10, group_index=0, index=0, reward=1.0),
+        Sample(group_id=11, group_index=0, index=1, reward=3.0),
+    ]
+
+    raw_rewards, normalized_rewards = manager._post_process_rewards(samples)
+
+    assert raw_rewards == [1.0, 1.0, 3.0]
+    assert normalized_rewards == [-1.0, -1.0, 1.0]
+
+
+def test_reward_normalization_rejects_trajectory_crossing_prompt_groups():
+    _install_rollout_import_stubs()
+    rollout = importlib.import_module("slime.ray.rollout")
+    from slime.utils.types import Sample
+
+    manager = object.__new__(rollout.RolloutManager)
+    manager.custom_reward_post_process_func = None
+    manager.args = types.SimpleNamespace(
+        advantage_estimator="grpo",
+        rewards_normalization=True,
+        grpo_std_normalization=False,
+        n_samples_per_prompt=2,
+        rollout_batch_size=1,
+        reward_key=None,
+    )
+    samples = [
+        Sample(group_id=10, group_index=0, index=0, reward=1.0),
+        Sample(group_id=10, group_index=1, index=0, reward=1.0),
+    ]
+
+    with pytest.raises(ValueError, match="crosses prompt groups"):
+        manager._post_process_rewards(samples)
 
 
 def test_reward_normalization_ignores_removed_padding_samples():
@@ -352,11 +404,121 @@ def test_convert_samples_keeps_train_metadata_from_sample_metadata():
 
     train_data = manager._convert_samples_to_train_data(samples)
 
-    assert train_data["group_ids"] == [0, 0]
+    assert train_data["group_ids"] == [0, 1]
     assert train_data["metadata"] == [
         {"sample_group_index": 0, "eligible_for_rl": True},
         {"sample_group_index": 0, "eligible_for_rl": False},
     ]
+
+
+def test_five_prompts_times_eight_trajectories_do_not_inject_dummy_rows():
+    _install_rollout_import_stubs()
+    rollout = importlib.import_module("slime.ray.rollout")
+    from slime.utils.types import Sample
+
+    manager = object.__new__(rollout.RolloutManager)
+    manager.custom_convert_samples_to_train_data_func = None
+    manager.custom_reward_post_process_func = None
+    manager.train_parallel_config = {
+        "dp_size": 1,
+        "cp_size": 1,
+        "vpp_size": 1,
+        "microbatch_group_size_per_vp_stage": 1,
+    }
+    manager.args = types.SimpleNamespace(
+        use_dynamic_global_batch_size=True,
+        disable_rollout_trim_samples=False,
+        num_steps_per_rollout=1,
+        global_batch_size=40,
+        reward_key=None,
+        advantage_estimator="grpo",
+        rewards_normalization=False,
+        n_samples_per_prompt=8,
+        rollout_batch_size=5,
+        grpo_std_normalization=False,
+    )
+    samples = [
+        Sample(
+            group_index=prompt_index,
+            index=trajectory_index,
+            tokens=[1, 2],
+            response_length=1,
+            loss_mask=[1],
+            reward=1.0,
+        )
+        for prompt_index in range(5)
+        for trajectory_index in range(prompt_index * 8, (prompt_index + 1) * 8)
+    ]
+
+    train_data = manager._convert_samples_to_train_data(samples)
+
+    assert len(train_data["tokens"]) == 40
+    assert train_data["group_ids"] == list(range(40))
+    assert manager._dynamic_global_batch_size == 40
+    assert not any(sample.metadata.get("dummy_removed_sample") for sample in samples)
+
+
+def test_compacted_rows_share_trajectory_loss_denominator():
+    _install_rollout_import_stubs()
+    rollout = importlib.import_module("slime.ray.rollout")
+    from slime.utils.types import Sample
+
+    manager = object.__new__(rollout.RolloutManager)
+    manager.custom_convert_samples_to_train_data_func = None
+    manager.custom_reward_post_process_func = None
+    manager.train_parallel_config = {
+        "dp_size": 1,
+        "cp_size": 1,
+        "vpp_size": 1,
+        "microbatch_group_size_per_vp_stage": 1,
+    }
+    manager.args = types.SimpleNamespace(
+        use_dynamic_global_batch_size=False,
+        disable_rollout_trim_samples=False,
+        global_batch_size=2,
+        reward_key=None,
+        advantage_estimator="grpo",
+        rewards_normalization=False,
+        n_samples_per_prompt=2,
+        rollout_batch_size=1,
+        grpo_std_normalization=False,
+    )
+    samples = [
+        Sample(group_id=10, group_index=0, index=0, tokens=[1, 2], response_length=1, loss_mask=[1], reward=1.0),
+        Sample(
+            group_id=10,
+            group_index=0,
+            index=0,
+            tokens=[3, 4, 5],
+            response_length=2,
+            loss_mask=[1, 0],
+            reward=1.0,
+        ),
+        Sample(group_id=11, group_index=0, index=1, tokens=[6, 7], response_length=1, loss_mask=[1], reward=0.0),
+    ]
+
+    train_data = manager._convert_samples_to_train_data(samples)
+
+    assert train_data["group_ids"] == [10, 10, 11]
+    assert train_data["rollout_mask_sums"] == [2, 2, 1]
+
+
+def test_trajectory_prefix_trimming_keeps_all_compacted_rows():
+    _install_rollout_import_stubs()
+    rollout = importlib.import_module("slime.ray.rollout")
+    from slime.utils.types import Sample
+
+    samples = [
+        Sample(group_id=10, group_index=0, index=0),
+        Sample(group_id=10, group_index=0, index=0),
+        Sample(group_id=11, group_index=0, index=1),
+        Sample(group_id=12, group_index=1, index=2),
+    ]
+
+    trimmed = rollout._trim_to_trajectory_prefix(samples, 2)
+
+    assert trimmed == samples[:3]
+    assert rollout._count_distinct_trajectories(trimmed) == 2
 
 
 def test_dynamic_global_batch_infers_missing_train_parallel_config():

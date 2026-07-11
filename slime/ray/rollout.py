@@ -101,12 +101,63 @@ _SGLANG_DECODE_PERF_FIELDS = (
 )
 
 
-def _sample_group_id(sample: Sample) -> int | None:
+def _sample_trajectory_id(sample: Sample) -> int | None:
+    """Return the identity of one sampled agent trajectory.
+
+    ``group_index`` is deliberately not a fallback here: it identifies the
+    prompt/task whose independent trajectories form an advantage group. A
+    compacted trajectory may emit several ``Sample`` rows, all sharing
+    ``group_id``; an ordinary one-row trajectory falls back to its unique
+    ``index``.
+    """
     if sample.group_id is not None:
         return sample.group_id
-    if sample.group_index is not None:
-        return sample.group_index
     return sample.index
+
+
+def _resolve_trajectory_ids(samples: list[Sample]) -> list[int]:
+    """Resolve a stable integer trajectory id for every training row."""
+    trajectory_ids = [_sample_trajectory_id(sample) for sample in samples]
+    used = {trajectory_id for trajectory_id in trajectory_ids if trajectory_id is not None}
+    next_id = 0
+    for position, trajectory_id in enumerate(trajectory_ids):
+        if trajectory_id is not None:
+            continue
+        while next_id in used:
+            next_id += 1
+        trajectory_ids[position] = next_id
+        used.add(next_id)
+    return trajectory_ids
+
+
+def _count_distinct_trajectories(samples: list[Sample]) -> int:
+    return len(set(_resolve_trajectory_ids(samples)))
+
+
+def _validate_trajectory_prompt_ownership(samples: list[Sample], trajectory_ids: list[int]) -> None:
+    owners: dict[int, int] = {}
+    for sample, trajectory_id in zip(samples, trajectory_ids, strict=True):
+        if sample.group_index is None:
+            continue
+        prior = owners.setdefault(trajectory_id, sample.group_index)
+        if prior != sample.group_index:
+            raise ValueError(
+                f"trajectory_id={trajectory_id} crosses prompt groups: "
+                f"group_index={prior} and group_index={sample.group_index}"
+            )
+
+
+def _trim_to_trajectory_prefix(samples: list[Sample], trajectory_count: int) -> list[Sample]:
+    """Keep whole trajectories from the first ``trajectory_count`` identities."""
+    if trajectory_count <= 0:
+        return []
+    trajectory_ids = _resolve_trajectory_ids(samples)
+    selected: set[int] = set()
+    for trajectory_id in trajectory_ids:
+        if trajectory_id not in selected and len(selected) >= trajectory_count:
+            continue
+        selected.add(trajectory_id)
+    return [sample for sample, trajectory_id in zip(samples, trajectory_ids, strict=True) if trajectory_id in selected]
 
 
 def _cpu_tensor(value, dtype: torch.dtype | None = None) -> torch.Tensor:
@@ -730,9 +781,9 @@ class RolloutManager:
             metrics = data.metrics
             data = data.samples
             # Enforce the group_id contract before flattening: compact /
-            # subagent paths that split one rollout into N training samples must
+            # subagent paths that split one trajectory into N training rows must
             # set the same group_id on every sibling so the loss reducer counts
-            # that group once instead of N times.
+            # that trajectory once instead of N times.
             _validate_group_id_annotated(data)
             # flatten the data if it is a list of lists
             while data and isinstance(data[0], list):
@@ -740,6 +791,7 @@ class RolloutManager:
 
             if not getattr(self.args, "disable_rollout_trim_samples", False):
                 global_batch_size = self.args.global_batch_size
+                trajectory_count = _count_distinct_trajectories(data)
                 target_steps_per_rollout = getattr(self.args, "num_steps_per_rollout", None)
                 auto_dynamic_for_history = (
                     getattr(self.args, "dynamic_history", False) and target_steps_per_rollout is not None
@@ -747,31 +799,46 @@ class RolloutManager:
                 use_dynamic_gbs = getattr(self.args, "use_dynamic_global_batch_size", False) or auto_dynamic_for_history
                 dynamic_target_steps = target_steps_per_rollout if auto_dynamic_for_history else None
                 if use_dynamic_gbs:
-                    logger.info(f"Collected {len(data)} samples from rollout to train with dynamic global batch size")
+                    logger.info(
+                        "Collected %d trajectories in %d training rows from rollout "
+                        "with dynamic global batch size",
+                        trajectory_count,
+                        len(data),
+                    )
                     self._dynamic_global_batch_size = self._compute_dynamic_global_batch_size(
-                        len(data), target_steps=dynamic_target_steps
+                        trajectory_count, target_steps=dynamic_target_steps
                     )
                     global_batch_size = self._dynamic_global_batch_size
 
-                if len(data) % global_batch_size != 0:
-                    trim_len = (len(data) // global_batch_size) * global_batch_size
-                    if trim_len == 0:
-                        if use_dynamic_gbs and len(data) > 0:
+                if trajectory_count % global_batch_size != 0:
+                    trim_trajectory_count = (trajectory_count // global_batch_size) * global_batch_size
+                    if trim_trajectory_count == 0:
+                        if use_dynamic_gbs and trajectory_count > 0:
                             logger.warning(
-                                "Keeping %d short dynamic rollout sample(s) for later dummy padding "
+                                "Keeping %d short dynamic rollout trajectory/trajectories for later dummy padding "
                                 "instead of failing global_batch_size=%d.",
-                                len(data),
+                                trajectory_count,
                                 global_batch_size,
                             )
                         else:
                             raise ValueError(
-                                f"Not enough samples {len(data)} for global_batch_size {global_batch_size}"
+                                f"Not enough trajectories {trajectory_count} for global_batch_size {global_batch_size}"
                             )
                     else:
-                        origin_data_length = len(data)
-                        data = data[:trim_len]
-                        logger.info(f"trim number of samples from {origin_data_length} to {trim_len}")
-                logger.info(f"Final collected {len(data)} samples from rollout to train")
+                        original_rows = len(data)
+                        data = _trim_to_trajectory_prefix(data, trim_trajectory_count)
+                        logger.info(
+                            "Trimmed rollout trajectories from %d to %d and training rows from %d to %d",
+                            trajectory_count,
+                            trim_trajectory_count,
+                            original_rows,
+                            len(data),
+                        )
+                logger.info(
+                    "Final collected %d trajectories in %d training rows",
+                    _count_distinct_trajectories(data),
+                    len(data),
+                )
 
         return data, metrics
 
@@ -883,59 +950,69 @@ class RolloutManager:
             self.args.advantage_estimator in ["grpo", "gspo", "cispo", "reinforce_plus_plus_baseline"]
             and self.args.rewards_normalization
         ):
-            group_keys = []
-            has_explicit_group_key = False
-            for position, sample in enumerate(samples):
-                group_id = _sample_group_id(sample)
-                if sample.group_id is not None or sample.group_index is not None:
-                    group_keys.append(("group_id", group_id))
-                    has_explicit_group_key = True
-                else:
-                    group_keys.append(("position", position))
+            trajectory_ids = _resolve_trajectory_ids(samples)
+            _validate_trajectory_prompt_ownership(samples, trajectory_ids)
+            has_explicit_prompt_groups = any(sample.group_index is not None for sample in samples)
 
-            if has_explicit_group_key:
-                normalized_rewards = [0.0] * len(samples)
-                grouped: dict[tuple[str, int], list[tuple[int, float]]] = defaultdict(list)
-                for position, (group_key, reward) in enumerate(zip(group_keys, raw_rewards, strict=True)):
-                    grouped[group_key].append((position, reward))
+            # Context compression may split one trajectory into several rows.
+            # Collapse those rows before computing a task-group advantage, then
+            # broadcast the trajectory-level result back to every trainable row.
+            trajectory_rows: dict[int, list[int]] = defaultdict(list)
+            for position, (sample, trajectory_id) in enumerate(zip(samples, trajectory_ids, strict=True)):
+                if not sample.remove_sample:
+                    trajectory_rows[trajectory_id].append(position)
 
-                for grouped_rewards in grouped.values():
-                    active_grouped_rewards = [
-                        (position, reward)
-                        for position, reward in grouped_rewards
-                        if not getattr(samples[position], "remove_sample", False)
-                    ]
-                    if not active_grouped_rewards:
-                        continue
-                    rewards = torch.tensor([reward for _, reward in active_grouped_rewards], dtype=torch.float)
-                    rewards = rewards - rewards.mean()
-                    if (
-                        self.args.advantage_estimator in ["grpo", "gspo", "cispo"]
-                        and self.args.grpo_std_normalization
-                        and len(active_grouped_rewards) > 1
-                    ):
-                        rewards = rewards / (rewards.std() + 1e-6)
+            trajectory_rewards: dict[int, float] = {}
+            ordered_trajectory_ids: list[int] = []
+            for trajectory_id, positions in trajectory_rows.items():
+                rewards_for_trajectory = [float(raw_rewards[position]) for position in positions]
+                first_reward = rewards_for_trajectory[0]
+                if any(abs(reward - first_reward) > 1e-6 for reward in rewards_for_trajectory[1:]):
+                    raise ValueError(
+                        f"trajectory_id={trajectory_id} has inconsistent rewards across compacted rows: "
+                        f"{rewards_for_trajectory}"
+                    )
+                trajectory_rewards[trajectory_id] = first_reward
+                ordered_trajectory_ids.append(trajectory_id)
 
-                    for (position, _), reward in zip(active_grouped_rewards, rewards.tolist(), strict=True):
+            trajectory_prompt_groups: dict[int, tuple[str, int]] = {}
+            if has_explicit_prompt_groups:
+                for trajectory_id, positions in trajectory_rows.items():
+                    group_index = samples[positions[0]].group_index
+                    if group_index is None:
+                        # Never normalize a row with unknown task identity
+                        # against a potentially unrelated prompt.
+                        trajectory_prompt_groups[trajectory_id] = ("trajectory", trajectory_id)
+                    else:
+                        trajectory_prompt_groups[trajectory_id] = ("prompt", group_index)
+            else:
+                group_size = max(1, int(self.args.n_samples_per_prompt))
+                for ordinal, trajectory_id in enumerate(ordered_trajectory_ids):
+                    trajectory_prompt_groups[trajectory_id] = ("legacy", ordinal // group_size)
+
+            grouped_trajectories: dict[tuple[str, int], list[int]] = defaultdict(list)
+            for trajectory_id in ordered_trajectory_ids:
+                grouped_trajectories[trajectory_prompt_groups[trajectory_id]].append(trajectory_id)
+
+            normalized_rewards = [0.0] * len(samples)
+            for trajectory_group in grouped_trajectories.values():
+                rewards = torch.tensor(
+                    [trajectory_rewards[trajectory_id] for trajectory_id in trajectory_group],
+                    dtype=torch.float,
+                )
+                rewards = rewards - rewards.mean()
+                if (
+                    self.args.advantage_estimator in ["grpo", "gspo", "cispo"]
+                    and self.args.grpo_std_normalization
+                    and len(trajectory_group) > 1
+                ):
+                    rewards = rewards / (rewards.std() + 1e-6)
+
+                for trajectory_id, reward in zip(trajectory_group, rewards.tolist(), strict=True):
+                    for position in trajectory_rows[trajectory_id]:
                         normalized_rewards[position] = reward
 
-                return raw_rewards, normalized_rewards
-
-            # group norm
-            rewards = torch.tensor(raw_rewards, dtype=torch.float)
-            if rewards.shape[-1] == self.args.n_samples_per_prompt * self.args.rollout_batch_size:
-                rewards = rewards.reshape(-1, self.args.n_samples_per_prompt)
-            else:
-                # when samples count are not equal in each group
-                rewards = rewards.view(-1, rewards.shape[-1])
-            mean = rewards.mean(dim=-1, keepdim=True)
-            rewards = rewards - mean
-
-            if self.args.advantage_estimator in ["grpo", "gspo", "cispo"] and self.args.grpo_std_normalization:
-                std = rewards.std(dim=-1, keepdim=True)
-                rewards = rewards / (std + 1e-6)
-
-            return raw_rewards, rewards.flatten().tolist()
+            return raw_rewards, normalized_rewards
 
         return raw_rewards, raw_rewards
 
@@ -946,12 +1023,9 @@ class RolloutManager:
         if self.custom_convert_samples_to_train_data_func is not None:
             return self.custom_convert_samples_to_train_data_func(self.args, samples)
 
-        def _count_distinct_groups(items: list[Sample]) -> int:
-            return len({_sample_group_id(sample) for sample in items})
-
         def _make_dummy_samples(count: int) -> list[Sample]:
             reward = {self.args.reward_key: 0.0} if self.args.reward_key else 0.0
-            used_group_ids = {_sample_group_id(sample) for sample in samples}
+            used_group_ids = set(_resolve_trajectory_ids(samples))
             dummy_samples: list[Sample] = []
             next_offset = 1
             while len(dummy_samples) < count:
@@ -978,11 +1052,12 @@ class RolloutManager:
             return dummy_samples
 
         dp_size = self._get_train_parallel_config()["dp_size"]
+        trajectory_count = _count_distinct_trajectories(samples)
         target_group_count = None
         if getattr(self.args, "use_dynamic_global_batch_size", False):
             target_steps = getattr(self.args, "num_steps_per_rollout", None)
             self._dynamic_global_batch_size = self._compute_dynamic_global_batch_size(
-                len(samples), target_steps=target_steps
+                trajectory_count, target_steps=target_steps
             )
             target_group_count = self._dynamic_global_batch_size
         elif getattr(self.args, "disable_rollout_trim_samples", False):
@@ -990,7 +1065,7 @@ class RolloutManager:
 
         dummy_count = max(0, dp_size - len(samples))
         if target_group_count is not None:
-            dummy_count = max(dummy_count, target_group_count - _count_distinct_groups(samples))
+            dummy_count = max(dummy_count, target_group_count - trajectory_count)
         if dummy_count:
             logger.warning("Injecting %d dummy samples.", dummy_count)
             samples.extend(_make_dummy_samples(dummy_count))
@@ -1000,15 +1075,8 @@ class RolloutManager:
         assert len(raw_rewards) == len(samples)
         assert len(rewards) == len(samples)
 
-        group_ids = [_sample_group_id(sample) for sample in samples]
-        existed_group_id_values = set(group_id for group_id in group_ids if group_id is not None)
-        tmp_id = 0
-        for i in range(len(group_ids)):
-            if group_ids[i] is None:
-                while tmp_id in existed_group_id_values:
-                    tmp_id += 1
-                group_ids[i] = tmp_id
-                existed_group_id_values.add(tmp_id)
+        group_ids = _resolve_trajectory_ids(samples)
+        _validate_trajectory_prompt_ownership(samples, group_ids)
 
         train_data = {
             "tokens": [sample.tokens for sample in samples],
@@ -1038,15 +1106,14 @@ class RolloutManager:
             loss_masks.append(sample.loss_mask)
         train_data["loss_masks"] = loss_masks
 
-        # Per-group aggregate, precomputed at the step level (where we can
-        # see every sample of every group) and broadcast per-sample so the
-        # per-mb loss reducer uses the correct whole-group denominator even
-        # when a group's samples land in different micro-batches (first-fit
-        # packing can split a group across mbs). The downstream backend field
+        # Per-trajectory aggregate, precomputed at the step level (where we can
+        # see every compacted segment) and broadcast per-row so the per-mb loss
+        # reducer uses the correct whole-trajectory denominator even when its
+        # segments land in different micro-batches. The downstream backend field
         # is still named rollout_mask_sums for compatibility:
         #
-        #   ``rollout_mask_sums[i]`` — sum of loss-mask totals over every
-        #   sample in sample i's group. Used as the reducer's denominator
+        #   ``rollout_mask_sums[i]`` — sum of loss-mask totals over every row
+        #   in row i's trajectory. Used as the reducer's denominator
         #   so summing partial contributions across mbs yields one
         #   token-weighted mean per group.
         group_id_list = train_data["group_ids"]
@@ -1118,10 +1185,10 @@ class RolloutManager:
         into a Ray Box. The schedule itself is computed by
         :func:`build_dp_schedule` so it stays unit-testable without Ray/sglang.
 
-        Step split is by canonical rollout group id (``samples[i].group_id``,
-        then ``samples[i].group_index``, then ``samples[i].index``); each step holds exactly
-        ``global_batch_size`` groups so the training-step count per rollout is
-        stable even when a rollout produced multiple training samples.
+        Step split is by trajectory id (``samples[i].group_id`` then
+        ``samples[i].index``); each step holds exactly ``global_batch_size``
+        trajectories so compacted segments stay together without changing the
+        training-step count.
         """
         train_parallel_config = self._get_train_parallel_config()
         dp_size = train_parallel_config["dp_size"]
@@ -1193,7 +1260,7 @@ def _validate_group_id_annotated(node, depth=0):
     ``list[list[list[Sample]]]`` (prompt × rollout × samples-from-one-rollout),
     so the leaf ``list[Sample]`` lands at depth ≥ 2. At that point we require
     every sibling to carry a non-None ``group_id`` and to share the same
-    value, so the loss reducer counts the group once instead of N times.
+    value, so the loss reducer counts the trajectory once instead of N times.
     """
     if isinstance(node, Sample):
         return
@@ -1205,7 +1272,7 @@ def _validate_group_id_annotated(node, depth=0):
             assert not missing, (
                 f"Compact rollout returned {len(node)} samples but group_id is unset on "
                 f"positions {missing}. Set Sample.group_id on every sibling so the loss "
-                "reducer can aggregate them as one group instead of N."
+                "reducer can aggregate them as one trajectory instead of N."
             )
             assert len(set(gids)) == 1, f"Sibling samples from one compact rollout must share group_id; got {gids}."
         return

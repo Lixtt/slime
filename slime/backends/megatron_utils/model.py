@@ -10,7 +10,7 @@ from functools import partial
 from pathlib import Path
 
 import torch
-from megatron.core import mpu
+from megatron.core import mpu, tensor_parallel
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
@@ -29,6 +29,7 @@ try:
 except ImportError:
     from megatron.core.utils import unwrap_model
 from slime.utils import logging_utils
+from slime.utils.atomic_io import atomic_torch_save
 from slime.utils.memory_utils import clear_memory
 
 from .checkpoint import load_checkpoint, save_checkpoint
@@ -37,6 +38,11 @@ from .data import DataIterator, get_batch
 from .lora import load_megatron_lora_checkpoint, save_megatron_lora_checkpoint
 from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_rollout_top_p_logprob_kwargs, loss_function
 from .model_provider import get_model_provider_func
+from .trainable_checkpoint_state import (
+    TRAINING_STATE_FORMAT,
+    build_training_state_payload,
+    restore_training_state_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -898,13 +904,12 @@ def _atomic_write_text(path: Path, text: str) -> None:
     os.replace(tmp_path, path)
 
 
-def _atomic_torch_save(obj, path: Path) -> None:
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    torch.save(obj, tmp_path)
-    os.replace(tmp_path, path)
-
-
-def _save_trainable_only_checkpoint(iteration: int, model: Sequence[DDP]) -> None:
+def _save_trainable_only_checkpoint(
+    iteration: int,
+    model: Sequence[DDP],
+    optimizer: MegatronOptimizer | None,
+    opt_param_scheduler: OptimizerParamScheduler | None,
+) -> None:
     """Save only rank-local trainable parameter shards.
 
     This bypasses Megatron's full distributed checkpoint metadata path, which is
@@ -954,7 +959,7 @@ def _save_trainable_only_checkpoint(iteration: int, model: Sequence[DDP]) -> Non
         "params": params,
     }
     rank_file = iteration_dir / f"trainable_rank_{rank:05d}.pt"
-    _atomic_torch_save(rank_payload, rank_file)
+    atomic_torch_save(rank_payload, rank_file)
 
     rank_meta = {k: v for k, v in rank_payload.items() if k != "params"}
     _atomic_write_text(
@@ -963,9 +968,80 @@ def _save_trainable_only_checkpoint(iteration: int, model: Sequence[DDP]) -> Non
     )
     del params, rank_payload
     clear_memory(clear_host_memory=True)
+
+    save_training_state = _env_flag("SLIME_MEGATRON_TRAINABLE_ONLY_SAVE_TRAINING_STATE")
+    optimizer_state_saved = False
+    scheduler_state_saved = False
+    rng_state_saved = False
+    if save_training_state:
+        topology = {
+            "tensor_model_parallel_rank": tensor_model_parallel_rank,
+            "pipeline_model_parallel_rank": pipeline_model_parallel_rank,
+            "expert_model_parallel_rank": expert_model_parallel_rank,
+            "data_parallel_rank": data_parallel_rank,
+        }
+        training_state_payload, training_state_metadata = build_training_state_payload(
+            iteration=iteration,
+            rank=rank,
+            world_size=world_size,
+            topology=topology,
+            args=args,
+            optimizer=optimizer,
+            opt_param_scheduler=opt_param_scheduler,
+            tensor_parallel=tensor_parallel,
+        )
+        optimizer_state_saved = training_state_metadata["optimizer_state_saved"]
+        scheduler_state_saved = training_state_metadata["scheduler_state_saved"]
+        rng_state_saved = training_state_metadata["rng_state_saved"]
+        if not optimizer_state_saved and rank == 0:
+            logger.warning(
+                "Trainable-only training-state save was requested without optimizer state; "
+                "set SAVE_OPTIMIZER=1 for an exact resume"
+            )
+        training_state_file = f"training_state_rank_{rank:05d}.pt"
+        atomic_torch_save(training_state_payload, iteration_dir / training_state_file)
+        _atomic_write_text(
+            iteration_dir / f"training_state_rank_{rank:05d}.json",
+            json.dumps(
+                {
+                    "format": training_state_payload["format"],
+                    "iteration": iteration,
+                    "rank": rank,
+                    "world_size": world_size,
+                    "optimizer_state_saved": optimizer_state_saved,
+                    "scheduler_state_saved": scheduler_state_saved,
+                    "rng_state_saved": rng_state_saved,
+                    "progress": training_state_payload["progress"],
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+        )
+        del training_state_payload
+        clear_memory(clear_host_memory=True)
     _safe_barrier()
 
     if rank == 0:
+        if save_training_state:
+            training_rank_metadata = [
+                json.loads(
+                    (iteration_dir / f"training_state_rank_{idx:05d}.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                for idx in range(world_size)
+            ]
+            optimizer_state_saved = all(
+                item.get("optimizer_state_saved") is True for item in training_rank_metadata
+            )
+            scheduler_state_saved = all(
+                item.get("scheduler_state_saved") is True for item in training_rank_metadata
+            )
+            rng_state_saved = all(
+                item.get("rng_state_saved") is True for item in training_rank_metadata
+            )
         common = {
             "format": "slime_megatron_trainable_only_v1",
             "iteration": iteration,
@@ -979,6 +1055,16 @@ def _save_trainable_only_checkpoint(iteration: int, model: Sequence[DDP]) -> Non
             "expert_model_parallel_size": _safe_mpu_value("get_expert_model_parallel_world_size"),
             "data_parallel_size": _safe_mpu_value("get_data_parallel_world_size", with_context_parallel=True),
             "rank_files": [f"trainable_rank_{idx:05d}.pt" for idx in range(world_size)],
+            "training_state_format": TRAINING_STATE_FORMAT if save_training_state else None,
+            "training_state_files": (
+                [f"training_state_rank_{idx:05d}.pt" for idx in range(world_size)]
+                if save_training_state
+                else []
+            ),
+            "training_state_requested": save_training_state,
+            "optimizer_state_saved": optimizer_state_saved,
+            "scheduler_state_saved": scheduler_state_saved,
+            "rng_state_saved": rng_state_saved,
             "created_by": "slime.megatron.trainable_only_save",
         }
         _atomic_write_text(
@@ -1020,10 +1106,12 @@ def _resolve_trainable_only_checkpoint_dir(path: str) -> Path:
 @torch.no_grad()
 def _load_trainable_only_checkpoint_if_requested(
     model: Sequence[DDP],
-) -> int | None:
+    optimizer: MegatronOptimizer | None,
+    opt_param_scheduler: OptimizerParamScheduler | None,
+) -> tuple[int | None, bool]:
     load_path = os.environ.get("SLIME_MEGATRON_TRAINABLE_ONLY_LOAD")
     if not load_path:
-        return None
+        return None, False
 
     checkpoint_dir = _resolve_trainable_only_checkpoint_dir(load_path)
     common_path = checkpoint_dir / "trainable_common.json"
@@ -1106,17 +1194,58 @@ def _load_trainable_only_checkpoint_if_requested(
     del checkpoint_params, payload, runtime_params
     clear_memory(clear_host_memory=True)
     _safe_barrier()
+
+    optimizer_state_loaded = False
+    if _env_flag("SLIME_MEGATRON_TRAINABLE_ONLY_LOAD_TRAINING_STATE"):
+        strict = os.getenv(
+            "SLIME_MEGATRON_TRAINABLE_ONLY_LOAD_TRAINING_STATE_STRICT",
+            "1",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        training_state_files = common.get("training_state_files") or []
+        training_state_name = (
+            training_state_files[rank]
+            if rank < len(training_state_files)
+            else f"training_state_rank_{rank:05d}.pt"
+        )
+        training_state_file = checkpoint_dir / training_state_name
+        if not training_state_file.is_file():
+            message = f"Missing rank-local trainable-only training state: {training_state_file}"
+            if strict:
+                raise FileNotFoundError(message)
+            logger.warning("%s; continuing as a model-only warm start", message)
+        else:
+            training_state = torch.load(training_state_file, map_location="cpu", weights_only=False)
+            optimizer_state_loaded, warnings = restore_training_state_payload(
+                training_state,
+                expected_iteration=checkpoint_iteration,
+                expected_rank=rank,
+                expected_world_size=world_size,
+                args=get_args(),
+                optimizer=optimizer,
+                opt_param_scheduler=opt_param_scheduler,
+                tensor_parallel=tensor_parallel,
+                strict=strict,
+                source=str(training_state_file),
+            )
+            for warning in warnings:
+                logger.warning("%s", warning)
+            del training_state
+            clear_memory(clear_host_memory=True)
+
     if rank == 0:
         logger.info(
             "Loaded trainable-only Megatron checkpoint iteration=%s world_size=%s from %s; "
-            "rank-local tensors are restored on every rank, rank0_tensor_count=%s rank0_numel=%s",
+            "rank-local tensors are restored on every rank, rank0_tensor_count=%s rank0_numel=%s "
+            "training_state_requested=%s optimizer_state_loaded=%s",
             common.get("iteration"),
             world_size,
             checkpoint_dir,
             loaded_param_count,
             loaded_numel,
+            _env_flag("SLIME_MEGATRON_TRAINABLE_ONLY_LOAD_TRAINING_STATE"),
+            optimizer_state_loaded,
         )
-    return checkpoint_iteration
+    return checkpoint_iteration, optimizer_state_loaded
 
 
 def save(
@@ -1143,7 +1272,7 @@ def save(
             save_megatron_lora_checkpoint(model, args, iteration)
             return
         if _env_flag("SLIME_MEGATRON_TRAINABLE_ONLY_SAVE"):
-            _save_trainable_only_checkpoint(iteration, model)
+            _save_trainable_only_checkpoint(iteration, model, optimizer, opt_param_scheduler)
             return
         save_checkpoint(
             iteration,
@@ -1239,12 +1368,15 @@ def initialize_model_and_optimizer(
         loaded_lora_iteration = load_megatron_lora_checkpoint(model, getattr(args, "megatron_lora_adapter_load", None))
         if loaded_lora_iteration is not None:
             iteration = loaded_lora_iteration
-    loaded_trainable_only_iteration = _load_trainable_only_checkpoint_if_requested(model)
+    loaded_trainable_only_iteration, trainable_optimizer_state_loaded = (
+        _load_trainable_only_checkpoint_if_requested(model, optimizer, opt_param_scheduler)
+    )
     if loaded_trainable_only_iteration is not None:
         iteration = loaded_trainable_only_iteration
     if (
         (loaded_lora_iteration is not None or loaded_trainable_only_iteration is not None)
         and optimizer is not None
+        and not trainable_optimizer_state_loaded
         and hasattr(optimizer, "reload_model_params")
     ):
         optimizer.reload_model_params()

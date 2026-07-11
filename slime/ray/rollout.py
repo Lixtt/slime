@@ -21,6 +21,7 @@ from slime.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupCo
 from slime.backends.sglang_utils.sglang_engine import SGLangEngine
 from slime.rollout.base_types import call_rollout_fn
 from slime.utils import logging_utils
+from slime.utils.atomic_io import atomic_torch_save
 from slime.utils.dp_schedule import build_dp_schedule
 from slime.utils.health_monitor import RolloutHealthMonitor
 from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
@@ -871,7 +872,7 @@ class RolloutManager:
                     samples=[sample.to_dict() for sample in data],
                 )
 
-            torch.save(dict(rollout_id=rollout_id, **dump_data), path)
+            atomic_torch_save(dict(rollout_id=rollout_id, **dump_data), path, durable=True)
 
     def _post_process_rewards(self, samples: list[Sample] | list[list[Sample]]):
         if self.custom_reward_post_process_func is not None:

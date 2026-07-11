@@ -7,9 +7,9 @@ ways a trajectory can branch, organized as a two-axis matrix:
   * LAYER 1 — routing tree (record_turn). DFS merges on (role, message-equality)
     only, so MESSAGE IDENTITY determines tree shape; token ids are irrelevant here.
   * LAYER 2 — linearization (get_trajectory). TOKEN-ID prefix determines how each leaf
-    chain becomes Samples (clean continuation / drift case A·B1·B2 / cross-leaf
-    dedup / reward split).
-  * COMBINED — both layers interacting (rewrite-merge, tree-fork + token-drift
+    chain becomes Samples (clean continuation / loss-preserving drift boundaries /
+    cross-leaf dedup / full trajectory reward).
+  * COMBINED — both layers interacting (rewrite-fork, tree-fork + token-drift
     stacked, deep multi-leaf dedup, long mixed session).
 
 Readability:
@@ -47,8 +47,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tests.test_agent._dump_helpers import dump_tree_txt  # noqa: E402
 
-from slime.agent.adapters.common import TurnRecord  # noqa: E402
-from slime.agent.trajectory import TrajectoryManager, _common_prefix_len  # noqa: E402
+from slime.agent.trajectory import TrajectoryManager, TurnRecord, _common_prefix_len  # noqa: E402
 from slime.utils.types import Sample  # noqa: E402
 
 # ===========================================================================
@@ -317,22 +316,16 @@ def get_traj(mgr, sid, *args, **kwargs):
     Linearization (get_trajectory) pops the sid, so a later dump would only see
     ``<drained>``. Capturing the tree text here keeps the routing tree visible
     next to the Samples it produced. The input ``reward`` is captured too so the
-    dump can show how it splits across the emitted samples.
+    dump can show the trajectory reward carried by every emitted row.
     """
     if mgr.has_session(sid):
         _TREE_SNAP[sid] = dump_tree_txt(mgr, sid)
     _REWARD_IN[sid] = kwargs.get("reward", 0.0)
     samples = mgr.get_trajectory(sid, *args, **kwargs)
-    # Reward conservation: get_trajectory splits the input reward evenly across
-    # every emitted sample, so the per-sample shares must sum back to the input
-    # (modulo float error). This is the "averaged over sample count" invariant.
+    # Every compacted row carries the full trajectory reward. Downstream code
+    # deduplicates rows by trajectory id before advantage normalization.
     if samples:
-        total = sum(s.reward for s in samples)
-        assert abs(total - _REWARD_IN[sid]) < 1e-9, (
-            "reward not conserved across split",
-            total,
-            _REWARD_IN[sid],
-        )
+        assert all(s.reward == _REWARD_IN[sid] for s in samples)
     return samples
 
 
@@ -660,14 +653,14 @@ def test_2_3_drift_case_A_forks():
         "<sys> system:S </sys> <usr> user:u </usr> <DRIFT> <gen> r:call </ast> "
         "<tul> tool:t </tul> <gen> [r:done] [</ast>]",
     ]
-    assert all(abs(s.reward - 1.0 / len(samples)) < 1e-9 for s in samples)
+    assert all(s.reward == 1.0 for s in samples)
     _check_invariants(samples)
     _record("2.3 drift case A (prompt region) -> fork", mgr, sid, samples)
     print("PASS 2.3")
 
 
-def test_2_4_drift_case_B1_short_replaces():
-    """Small drift inside the most-recent response span -> replace."""
+def test_2_4_drift_case_B1_short_preserves_both_actions():
+    """Small drift still creates a boundary so the prior action is retained."""
     mgr = TrajectoryManager()  # default threshold 1024
     sid = "2.4"
     s, u, a1, t = sys_msg("S"), usr_msg("u"), asst_msg("call"), tool_msg("t")
@@ -678,21 +671,20 @@ def test_2_4_drift_case_B1_short_replaces():
     p2 = drift_replace(p2_honest, drift_idx)
     p2, r2 = append(mgr, sid, [s, u, a1, t], "done", prompt_ids=p2, logprobs=[-0.4] * 2)
     samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
-    assert len(samples) == 1
-    s0 = samples[0]
+    assert len(samples) == 2
     L = _common_prefix_len(p1 + r1, p2)
     assert L == drift_idx
-    # replace: the drifted r:call response is no longer a faithful echo of what the
-    # model generated (its tail diverged), so the WHOLE surviving span is masked and
-    # re-supplied as loss=0 prompt context (the <DRIFT> token marks the divergence);
-    # only the new r:done trains.
+    # Both sampled actions remain trainable. The rewritten echo is context-only
+    # in the second row and cannot erase the first row's action.
     assert goldens(samples) == [
+        "<sys> system:S </sys> <usr> user:u </usr> <gen> [r:call] [</ast>]",
         "<sys> system:S </sys> <usr> user:u </usr> <gen> r:call <DRIFT> "
         "<tul> tool:t </tul> <gen> [r:done] [</ast>]",
     ]
-    assert s0.rollout_log_probs == [0.0] * (len(p2) - len(p1)) + [-0.4] * len(r2)
+    assert samples[0].rollout_log_probs == [-0.5] * len(r1)
+    assert samples[1].rollout_log_probs == [-0.4] * len(r2)
     _check_invariants(samples)
-    _record("2.4 drift case B1 (small) -> replace", mgr, sid, samples)
+    _record("2.4 drift case B1 (small) -> loss-preserving boundary", mgr, sid, samples)
     print("PASS 2.4")
 
 
@@ -713,7 +705,7 @@ def test_2_5_drift_case_B1_long_forks():
         "<sys> system:S </sys> <usr> user:u </usr> <gen> r:call <DRIFT> "
         "<tul> tool:t </tul> <gen> [r:done] [</ast>]",
     ]
-    assert all(abs(s.reward - 1.0 / len(samples)) < 1e-9 for s in samples)
+    assert all(s.reward == 1.0 for s in samples)
     _check_invariants(samples)
     _record("2.5 drift case B1 (long) -> fork", mgr, sid, samples)
     print("PASS 2.5")
@@ -761,13 +753,13 @@ def test_2_7_drift_case_B2_earlier_turn_forks():
         "<sys> system:S </sys> <usr> user:u </usr> <gen> r:a1 <DRIFT> "
         "<tul> tool:t1 </tul> <gen> r:a2 </ast> <tul> tool:t2 </tul> <gen> [r:a3] [</ast>]",
     ]
-    assert all(abs(s.reward - 1.0 / len(samples)) < 1e-9 for s in samples)
+    assert all(s.reward == 1.0 for s in samples)
     _check_invariants(samples)
     _record("2.7 drift case B2 (earlier turn) -> fork", mgr, sid, samples)
     print("PASS 2.7")
 
 
-def test_2_8_fork_reward_split():
+def test_2_8_fork_carries_full_trajectory_reward():
     mgr = TrajectoryManager()
     sid = "2.8"
     s, u, a1, t = sys_msg("S"), usr_msg("u"), asst_msg("call"), tool_msg("t")
@@ -783,14 +775,13 @@ def test_2_8_fork_reward_split():
         "<sys> system:S </sys> <usr> user:u </usr> <DRIFT> <gen> r:call </ast> "
         "<tul> tool:t </tul> <gen> [r:done] [</ast>]",
     ]
-    # reward 1.0 split evenly across the 2 forked samples -> 0.5 each.
-    assert all(abs(s.reward - 0.5) < 1e-9 for s in samples)
+    assert all(s.reward == 1.0 for s in samples)
     _check_invariants(samples)
-    _record("2.8 fork reward split (1.0 / 2 = 0.5 each)", mgr, sid, samples)
+    _record("2.8 fork carries full trajectory reward", mgr, sid, samples)
     print("PASS 2.8")
 
 
-def test_2_9_two_leaves_reward_split():
+def test_2_9_two_leaves_carry_full_trajectory_reward():
     mgr = TrajectoryManager()
     sid = "2.9"
     s = sys_msg("S")
@@ -802,10 +793,9 @@ def test_2_9_two_leaves_reward_split():
         "<sys> system:S </sys> <usr> user:A </usr> <gen> [r:a] [</ast>]",
         "<sys> system:S </sys> <usr> user:B </usr> <gen> [r:b] [</ast>]",
     ]
-    # reward 1.0 split evenly across the 2 leaves -> 0.5 each.
-    assert all(abs(s.reward - 0.5) < 1e-9 for s in samples)
+    assert all(s.reward == 1.0 for s in samples)
     _check_invariants(samples)
-    _record("2.9 two leaves reward split (1.0 / 2 = 0.5 each)", mgr, sid, samples)
+    _record("2.9 two leaves carry full trajectory reward", mgr, sid, samples)
     print("PASS 2.9")
 
 
@@ -886,7 +876,7 @@ def test_2_12_drop_clears_sid():
 # ===========================================================================
 
 
-def test_3_1_rewrite_merge_absorbs_short():
+def test_3_1_short_rewrite_preserves_original_action():
     mgr = TrajectoryManager()
     sid = "3.1"
     s, u = sys_msg("S"), usr_msg("u")
@@ -895,17 +885,11 @@ def test_3_1_rewrite_merge_absorbs_short():
     append(mgr, sid, [s, u], "ok", finish_reason="tool_calls", logprobs=[-0.5] * 2)
     append(mgr, sid, [s, u, a1_rw, t1], "done", logprobs=[-0.4] * 2)
     leaves = _leaves(mgr, sid)
-    assert len(leaves) == 1, "short rewrite absorbed, not forked"
-    chain = leaves[0].path_from_root()
-    merged = chain[2]
-    assert merged.turn is None and merged.turn_index is None
-    assert merged.message == a1_rw.message
-    assert merged.metadata["merged_rewrite"]["abandoned_turn_index"] == 1
+    assert len(leaves) == 2, "rewritten history must not erase the original action"
     samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
-    assert len(samples) == 1
-    # The abandoned turn-1 response (r:ok␣) is demoted to routing-only -> appears
-    # bare; only the surviving turn-2 r:done trains.
+    assert len(samples) == 2
     assert goldens(samples) == [
+        "<sys> system:S </sys> <usr> user:u </usr> <gen> [r:ok] [</ast>]",
         "<sys> system:S </sys> <usr> user:u </usr> <gen> r:ok␣ </ast> " "<tul> tool:t </tul> <gen> [r:done] [</ast>]",
     ]
     _check_invariants(samples)
@@ -977,9 +961,7 @@ def test_3_4_rewrite_merge_ambiguous_forks():
     print("PASS 3.4")
 
 
-def test_3_5_rewrite_merge_match_key_updated():
-    """After merge, a later turn replaying the rewritten message must descend
-    through the merged node (match_key updated), not fork again."""
+def test_3_5_rewritten_branch_continues_without_losing_original_action():
     mgr = TrajectoryManager()
     sid = "3.5"
     s, u = sys_msg("S"), usr_msg("u")
@@ -989,12 +971,11 @@ def test_3_5_rewrite_merge_match_key_updated():
     append(mgr, sid, [s, u, a1_rw, t1], "second", finish_reason="tool_calls", logprobs=[-0.4] * 2)
     append(mgr, sid, [s, u, a1_rw, t1, a2, t2], "third", logprobs=[-0.3] * 2)
     leaves = _leaves(mgr, sid)
-    assert len(leaves) == 1, "match_key updated -> no spurious fork"
+    assert len(leaves) == 2
     samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
-    assert len(samples) == 1
-    # Turn 1 (r:ok) was absorbed as routing-only (rewrite merge), so it appears
-    # bare; turns 2 and 3 (r:second / r:third) train in one clean chain.
+    assert len(samples) == 2
     assert goldens(samples) == [
+        "<sys> system:S </sys> <usr> user:u </usr> <gen> [r:ok] [</ast>]",
         "<sys> system:S </sys> <usr> user:u </usr> <gen> r:ok5␣ </ast> "
         "<tul> tool:t1 </tul> <gen> [r:second] [</ast>] <tul> tool:t2 </tul> <gen> [r:third] [</ast>]",
     ]
@@ -1034,7 +1015,7 @@ def test_3_6_tree_fork_plus_token_drift():
         # Sample 2: leaf Y, shares r:call (claimed by sample 0 -> bare), trains r:ay2.
         "<sys> system:S </sys> <usr> user:u </usr> <gen> r:call </ast> " "<tul> tool:y </tul> <gen> [r:ay2] [</ast>]",
     ]
-    assert all(abs(s.reward - 1.0 / 3) < 1e-9 for s in samples)
+    assert all(s.reward == 1.0 for s in samples)
     _check_invariants(samples)
     _record("3.6 tree fork + token drift -> 3 samples", mgr, sid, samples)
     print("PASS 3.6")
@@ -1121,7 +1102,7 @@ def test_3_8_long_mixed_session():
         "<tul> tool:t2 </tul> <gen> r:a3 </ast> <tul> tool:t3 </tul> <gen> r:a4 </ast> "
         "<tul> tool:t4 </tul> <gen> [r:a5] [</ast>]",
     ]
-    assert abs(sum(s.reward for s in samples) - 1.0) < 1e-9
+    assert all(s.reward == 1.0 for s in samples)
     _check_invariants(samples)
     _record(f"3.8 long mixed session -> {len(samples)} samples", mgr, sid, samples)
     print("PASS 3.8")
@@ -1216,12 +1197,8 @@ def test_4_5_mixed_logprobs_across_turns():
     print("PASS 4.5")
 
 
-def test_4_6_drift_B1_threshold_boundary():
-    """case-B1 threshold compares the incoming turn's full ``output_ids`` length
-    to ``fork_threshold`` (mirroring ``_try_merge_assistant_rewrite``): the gate
-    is exclusive, so ``len(r2) == threshold`` forks and ``len(r2) < threshold``
-    replaces. Drift-tail length is not part of the gate -- only its position
-    (inside the most-recent response span) keeps REALIGN physically applicable."""
+def test_4_6_drift_threshold_never_discards_a_sampled_action():
+    """Both sides of the old REALIGN threshold preserve both actions."""
 
     def run(threshold, new_resp_len):
         mgr = TrajectoryManager(fork_threshold_tokens=threshold)
@@ -1253,23 +1230,66 @@ def test_4_6_drift_B1_threshold_boundary():
         samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
         return samples, p1, r1, p2, r2
 
-    # len(r2) == threshold -> fork: two single-turn segments, each trains its own resp.
+    # At the threshold, both turns become single-turn segments.
     forked, p1, r1, p2, r2 = run(threshold=2, new_resp_len=2)
     assert len(forked) == 2, f"len(r2)==threshold must fork, got {len(forked)}"
     assert forked[0].tokens == p1 + r1
     assert forked[0].loss_mask == [1] * len(r1)
     assert forked[1].tokens == p2 + r2
     assert forked[1].loss_mask == [1] * len(r2)
-    # len(r2) < threshold -> replace: one coherent segment realigned to p2.
-    replaced, p1b, r1b, p2b, r2b = run(threshold=3, new_resp_len=2)
-    assert len(replaced) == 1, f"len(r2)<threshold must replace, got {len(replaced)}"
-    assert replaced[0].tokens == p2b + r2b
-    # the drifted r1 echo is not a faithful response anymore -> the WHOLE r1 span is
-    # masked (loss=0 prompt context), r2 trains.
-    assert replaced[0].loss_mask == [0] * (len(p2b) - len(p1b)) + [1] * len(r2b)
+    # Below the old threshold, the result is intentionally the same: do not
+    # overwrite r1 merely because the client re-rendered it differently.
+    preserved, p1b, r1b, p2b, r2b = run(threshold=3, new_resp_len=2)
+    assert len(preserved) == 2
+    assert preserved[0].tokens == p1b + r1b
+    assert preserved[0].loss_mask == [1] * len(r1b)
+    assert preserved[1].tokens == p2b + r2b
+    assert preserved[1].loss_mask == [1] * len(r2b)
     _check_invariants(forked)
-    _check_invariants(replaced)
+    _check_invariants(preserved)
     print("PASS 4.6")
+
+
+def test_4_7_context_compression_preserves_one_trajectory_and_both_actions():
+    """A compressed prompt starts a new segment, not a new RL trajectory.
+
+    The summary is routing-only context. Both model outputs are trained exactly
+    once, carry the same terminal reward and retain the task/trajectory ids from
+    the base sample.
+    """
+    mgr = TrajectoryManager()
+    sid = "4.7"
+    system = sys_msg("stable-system")
+    original_task = usr_msg("original-task")
+    append(mgr, sid, [system, original_task], "before-compression", logprobs=[-0.1, -0.2])
+
+    summary = sys_msg("summary-of-prior-context")
+    resumed_task = usr_msg("continue-after-summary")
+    append(mgr, sid, [system, summary, resumed_task], "after-compression", logprobs=[-0.3, -0.4])
+
+    reward = {"score": 0.75}
+    samples = get_traj(
+        mgr,
+        sid,
+        base_sample=Sample(index=17, group_index=5, group_id=730, prompt="task"),
+        reward=reward,
+    )
+
+    assert len(samples) == 2
+    assert all(sample.index == 17 for sample in samples)
+    assert all(sample.group_id == 730 for sample in samples)
+    assert all(sample.group_index == 5 for sample in samples)
+    assert all(sample.reward == reward for sample in samples)
+    assert [sum(sample.loss_mask) for sample in samples] == [2, 2]
+    assert goldens(samples) == [
+        "<sys> system:stable-system </sys> <usr> user:original-task </usr> "
+        "<gen> [r:before-compression] [</ast>]",
+        "<sys> system:stable-system </sys> <sys> system:summary-of-prior-context </sys> "
+        "<usr> user:continue-after-summary </usr> <gen> [r:after-compression] [</ast>]",
+    ]
+    _check_invariants(samples)
+    _record("4.7 context compression -> one trajectory, two trainable segments", mgr, sid, samples)
+    print("PASS 4.7")
 
 
 # ===========================================================================
@@ -1325,8 +1345,7 @@ def _print_case(title: str, mgr, sid: str, samples: list) -> None:
     n = len(samples)
     if n:
         r_in = _REWARD_IN.get(sid, 0.0)
-        per = r_in / n
-        print(f"[samples] {n}  (reward split: {r_in:.3f} / {n} = {per:.3f} per sample)")
+        print(f"[samples] {n}  (full trajectory reward: {r_in:.3f} per row)")
     else:
         print(f"[samples] {n}")
     for i, s in enumerate(samples):
@@ -1352,20 +1371,20 @@ _CASES = [
     test_2_1_single_turn_linearize,
     test_2_2_clean_multiturn_linearize,
     test_2_3_drift_case_A_forks,
-    test_2_4_drift_case_B1_short_replaces,
+    test_2_4_drift_case_B1_short_preserves_both_actions,
     test_2_5_drift_case_B1_long_forks,
     test_2_6_drift_case_B1_threshold_zero_forks,
     test_2_7_drift_case_B2_earlier_turn_forks,
-    test_2_8_fork_reward_split,
-    test_2_9_two_leaves_reward_split,
+    test_2_8_fork_carries_full_trajectory_reward,
+    test_2_9_two_leaves_carry_full_trajectory_reward,
     test_2_10_cross_leaf_dedup,
     test_2_11_routing_only_assistant_filtered,
     test_2_12_drop_clears_sid,
-    test_3_1_rewrite_merge_absorbs_short,
+    test_3_1_short_rewrite_preserves_original_action,
     test_3_2_rewrite_merge_long_forks,
     test_3_3_rewrite_merge_threshold_zero_forks,
     test_3_4_rewrite_merge_ambiguous_forks,
-    test_3_5_rewrite_merge_match_key_updated,
+    test_3_5_rewritten_branch_continues_without_losing_original_action,
     test_3_6_tree_fork_plus_token_drift,
     test_3_7_deep_multi_leaf_dedup,
     test_3_8_long_mixed_session,
@@ -1373,7 +1392,8 @@ _CASES = [
     test_4_3_empty_prompt_messages_skipped,
     test_4_4_default_base_sample,
     test_4_5_mixed_logprobs_across_turns,
-    test_4_6_drift_B1_threshold_boundary,
+    test_4_6_drift_threshold_never_discards_a_sampled_action,
+    test_4_7_context_compression_preserves_one_trajectory_and_both_actions,
 ]
 
 

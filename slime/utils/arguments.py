@@ -13,6 +13,7 @@ from slime.backends.sglang_utils.arguments import validate_args as sglang_valida
 from slime.backends.sglang_utils.external import apply_external_engine_info_to_args
 from slime.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
 from slime.utils.logging_utils import configure_logger
+from slime.utils.misc import validate_rollout_window
 
 logger = logging.getLogger(__name__)
 
@@ -2099,6 +2100,12 @@ def slime_validate_args(args):
         assert args.num_rollout is not None, (
             "num_epoch is not set, but num_rollout is not set, " "please set --num-rollout or --num-epoch"
         )
+
+    validate_rollout_window(
+        args.start_rollout_id,
+        args.num_rollout,
+        allow_empty=args.num_rollout == 0 and args.eval_interval is not None,
+    )
 
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"

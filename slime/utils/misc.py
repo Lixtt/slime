@@ -133,6 +133,25 @@ def should_run_periodic_action(
     return (step % interval == 0) or (num_rollout_per_epoch is not None and step % num_rollout_per_epoch == 0)
 
 
+def validate_rollout_window(
+    start_rollout_id: int | None,
+    num_rollout: int | None,
+    *,
+    allow_empty: bool = False,
+) -> None:
+    """Reject an empty rollout interval before it can exit as a successful no-op."""
+    if start_rollout_id is None or num_rollout is None:
+        return
+    if num_rollout > start_rollout_id:
+        return
+    if allow_empty and num_rollout == start_rollout_id:
+        return
+    raise ValueError(
+        f"num_rollout={num_rollout} must be greater than start_rollout_id={start_rollout_id}; "
+        "num_rollout is the exclusive terminal rollout id, not the number of additional rollouts"
+    )
+
+
 class Box:
     def __init__(self, inner):
         self._inner = inner

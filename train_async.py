@@ -3,7 +3,7 @@ import ray
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking
-from slime.utils.misc import should_run_periodic_action
+from slime.utils.misc import should_run_periodic_action, validate_rollout_window
 from slime.utils.rollout_quality_gate import run_rollout_generation_quality_gate
 
 
@@ -30,6 +30,7 @@ def train(args):
 
     # create the actor and critic models
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
+    validate_rollout_window(args.start_rollout_id, args.num_rollout)
 
     # Always push actor weights to rollout once weights are loaded.
     actor_model.update_weights()

@@ -1004,6 +1004,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "select exactly one entry with role=critic. Legacy 'critic' configs are still accepted."
                 ),
             )
+            parser.add_argument(
+                "--megatron-trainable-only-load",
+                type=str,
+                default=None,
+                help=(
+                    "Role-specific trainable-only Megatron overlay. Megatron role configs use this to load "
+                    "different actor and critic checkpoints; when unset, the legacy "
+                    "SLIME_MEGATRON_TRAINABLE_ONLY_LOAD environment variable is used."
+                ),
+            )
 
             parser.add_argument("--eps-clip", type=float, default=0.2, help="PPO clip range")
             parser.add_argument("--eps-clip-high", type=float, default=None, help="PPO clip upper range")
@@ -1931,7 +1941,10 @@ def slime_validate_args(args):
         if args.opd_teacher_load is not None:
             raise ValueError("--opd-teacher-load is set but --use-opd is not enabled. Please add --use-opd flag.")
 
-    trainable_only_load_requested = bool(os.environ.get("SLIME_MEGATRON_TRAINABLE_ONLY_LOAD"))
+    trainable_only_load_requested = bool(
+        args.megatron_trainable_only_load
+        or os.environ.get("SLIME_MEGATRON_TRAINABLE_ONLY_LOAD")
+    )
 
     if args.megatron_to_hf_mode == "bridge":
         if (

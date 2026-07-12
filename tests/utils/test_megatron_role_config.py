@@ -30,6 +30,7 @@ def _base_args(**overrides):
         critic_num_gpus_per_node=1,
         use_critic=False,
         megatron_config_path=None,
+        megatron_trainable_only_load=None,
         start_rollout_id=None,
         rollout_global_dataset=False,
     )
@@ -47,9 +48,21 @@ class TestMegatronRoleConfig:
                     {
                         "name": "default",
                         "role": "critic",
-                        "overrides": {"lr": "1e-5", "tensor_model_parallel_size": 2},
+                        "overrides": {
+                            "lr": "1e-5",
+                            "tensor_model_parallel_size": 2,
+                            "megatron_trainable_only_load": "/checkpoints/critic",
+                        },
                     },
-                    {"name": "default", "role": "actor", "overrides": {"lr": "1e-6", "tensor_model_parallel_size": 4}},
+                    {
+                        "name": "default",
+                        "role": "actor",
+                        "overrides": {
+                            "lr": "1e-6",
+                            "tensor_model_parallel_size": 4,
+                            "megatron_trainable_only_load": "/checkpoints/actor",
+                        },
+                    },
                 ]
             }
         )
@@ -60,11 +73,13 @@ class TestMegatronRoleConfig:
 
         assert actor_args.lr == 1e-6
         assert actor_args.tensor_model_parallel_size == 4
+        assert actor_args.megatron_trainable_only_load == "/checkpoints/actor"
         assert actor_args.kl_coef == args.kl_coef
         assert actor_args.use_opd is args.use_opd
 
         assert critic_args.lr == 1e-5
         assert critic_args.tensor_model_parallel_size == 2
+        assert critic_args.megatron_trainable_only_load == "/checkpoints/critic"
         assert critic_args.kl_coef == 0
         assert critic_args.use_opd is False
         assert critic_args.custom_advantage_function_path is None

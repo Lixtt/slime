@@ -1264,11 +1264,17 @@ def _resolve_trainable_only_checkpoint_dir(path: str) -> Path:
 
 @torch.no_grad()
 def _load_trainable_only_checkpoint_if_requested(
+    args: Namespace,
     model: Sequence[DDP],
     optimizer: MegatronOptimizer | None,
     opt_param_scheduler: OptimizerParamScheduler | None,
 ) -> tuple[int | None, bool]:
-    load_path = os.environ.get("SLIME_MEGATRON_TRAINABLE_ONLY_LOAD")
+    role_load_path = getattr(args, "megatron_trainable_only_load", None)
+    load_path = (
+        os.environ.get("SLIME_MEGATRON_TRAINABLE_ONLY_LOAD")
+        if role_load_path is None
+        else role_load_path
+    )
     if not load_path:
         return None, False
 
@@ -1533,7 +1539,7 @@ def initialize_model_and_optimizer(
         if loaded_lora_iteration is not None:
             iteration = loaded_lora_iteration
     loaded_trainable_only_iteration, trainable_optimizer_state_loaded = (
-        _load_trainable_only_checkpoint_if_requested(model, optimizer, opt_param_scheduler)
+        _load_trainable_only_checkpoint_if_requested(args, model, optimizer, opt_param_scheduler)
     )
     if loaded_trainable_only_iteration is not None:
         iteration = loaded_trainable_only_iteration

@@ -207,9 +207,12 @@ def _critic_output_layer_needs_reinit(args: Namespace, model: Sequence[DDP], rol
 
 
 @torch.no_grad()
-def _reinitialize_critic_output_layer(model: Sequence[DDP]) -> None:
+def _reinitialize_critic_output_layer(args: Namespace, model: Sequence[DDP]) -> None:
+    init_method_std = getattr(args, "init_method_std", None)
+    if init_method_std is None:
+        init_method_std = 0.02
     for _chunk_id, output_layer in _iter_critic_output_layers(model):
-        output_layer.weight.data.normal_(mean=0.0, std=0.02)
+        output_layer.weight.data.normal_(mean=0.0, std=init_method_std)
         if output_layer.bias is not None:
             output_layer.bias.data.zero_()
 
@@ -1530,7 +1533,7 @@ def initialize_model_and_optimizer(
         skip_load_to_model_and_opt=False,
     )
     if reinit_critic_output_layer:
-        _reinitialize_critic_output_layer(model)
+        _reinitialize_critic_output_layer(args, model)
         if (args.fp16 or args.bf16) and optimizer is not None:
             optimizer.reload_model_params()
     loaded_lora_iteration = None

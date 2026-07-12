@@ -15,6 +15,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import make_sharded_tensor_for_checkpoint
 from megatron.training.arguments import core_transformer_config_from_args
 
 from slime.utils.misc import load_function
@@ -39,9 +40,29 @@ class LinearForLastLayer(torch.nn.Linear):
             if bias:
                 self.bias.sequence_parallel = True
 
-        self.weight.data.normal_(mean=0.0, std=0.02)
+        init_method_std = getattr(config, "init_method_std", None)
+        if init_method_std is None:
+            init_method_std = 0.02
+        self.weight.data.normal_(mean=0.0, std=init_method_std)
         if bias:
             self.bias.data.zero_()
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        state_dict = {}
+        self._save_to_state_dict(state_dict, "", keep_vars=True)
+        group_kwargs = {}
+        if metadata is not None and metadata.get("dp_cp_group") is not None:
+            group_kwargs["dp_cp_group"] = metadata["dp_cp_group"]
+        return {
+            f"{prefix}{name}": make_sharded_tensor_for_checkpoint(
+                tensor,
+                f"{prefix}{name}",
+                prepend_offsets=sharded_offsets,
+                allow_shape_mismatch=True,
+                **group_kwargs,
+            )
+            for name, tensor in state_dict.items()
+        }
 
     def forward(
         self,
@@ -54,6 +75,12 @@ class LinearForLastLayer(torch.nn.Linear):
         if self.sequence_parallel:
             logits = tensor_parallel.gather_from_sequence_parallel_region(logits, tensor_parallel_output_grad=False)
         return logits, None
+
+
+def _build_critic_output_layer(config: TransformerConfig) -> LinearForLastLayer:
+    # The base LM checkpoint has a vocabulary projection and no bias. The value
+    # head is reinitialized after the overlapping checkpoint load.
+    return LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config, bias=False)
 
 
 def _get_model_provider_func(
@@ -75,9 +102,7 @@ def _get_model_provider_func(
                 model = custom_model_provider(pre_process=pre_process, post_process=post_process)
             # Apply critic output layer if needed
             if post_process and role == "critic":
-                model.output_layer = LinearForLastLayer(
-                    input_size=model.config.hidden_size, output_size=1, config=model.config
-                )
+                model.output_layer = _build_critic_output_layer(model.config)
             return model
 
         return wrapped_model_provider
@@ -186,9 +211,7 @@ def _get_model_provider_func(
             def _critic_provide(pre_process=True, post_process=True, vp_stage=None):
                 model = _original_provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
                 if post_process:
-                    model.output_layer = LinearForLastLayer(
-                        input_size=model.config.hidden_size, output_size=1, config=model.config
-                    )
+                    model.output_layer = _build_critic_output_layer(model.config)
                 return model
 
             return _critic_provide
@@ -309,7 +332,7 @@ def _get_model_provider_func(
             model = GPTModel(**kwargs)
 
         if post_process and role == "critic":
-            model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
+            model.output_layer = _build_critic_output_layer(config)
 
         return model
 

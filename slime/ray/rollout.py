@@ -2,6 +2,7 @@ import dataclasses
 import importlib.util
 import itertools
 import logging
+import math
 import multiprocessing
 import os
 import random
@@ -144,6 +145,101 @@ def _validate_trajectory_prompt_ownership(samples: list[Sample], trajectory_ids:
             raise ValueError(
                 f"trajectory_id={trajectory_id} crosses prompt groups: "
                 f"group_index={prior} and group_index={sample.group_index}"
+            )
+
+
+def _validate_segmented_ppo_semantics(
+    args,
+    samples: list[Sample],
+    rewards: list[float],
+    trajectory_ids: list[int],
+) -> None:
+    """Reject segmented PPO inputs unless row-local GAE is exact.
+
+    The backend currently computes GAE independently for every training row.
+    For a trajectory split by context compaction, that is equivalent to
+    whole-trajectory terminal-reward GAE only with no discounting, no trace
+    decay, and no per-token reward KL.
+    """
+    if args.advantage_estimator != "ppo":
+        return
+
+    trajectory_rows: dict[int, list[int]] = defaultdict(list)
+    for position, trajectory_id in enumerate(trajectory_ids):
+        trajectory_rows[trajectory_id].append(position)
+    segmented_rows = {
+        trajectory_id: positions
+        for trajectory_id, positions in trajectory_rows.items()
+        if len(positions) > 1
+    }
+    if not segmented_rows:
+        return
+
+    gamma = float(args.gamma)
+    lambd = float(args.lambd)
+    kl_coef = float(args.kl_coef)
+    if not math.isclose(gamma, 1.0, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError(
+            "segmented PPO requires gamma=1 because Slime computes GAE "
+            f"independently per compacted row; got gamma={gamma}"
+        )
+    if not math.isclose(lambd, 1.0, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError(
+            "segmented PPO requires lambda=1 because Slime computes GAE "
+            f"independently per compacted row; got lambda={lambd}"
+        )
+    if not math.isclose(kl_coef, 0.0, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError(
+            "segmented PPO requires kl_coef=0 until token rewards are chained "
+            f"across compacted rows; got kl_coef={kl_coef}"
+        )
+
+    for trajectory_id, positions in segmented_rows.items():
+        trajectory_rewards = [float(rewards[position]) for position in positions]
+        first_reward = trajectory_rewards[0]
+        if any(
+            not math.isclose(reward, first_reward, rel_tol=0.0, abs_tol=1e-6)
+            for reward in trajectory_rewards[1:]
+        ):
+            raise ValueError(
+                f"segmented PPO trajectory_id={trajectory_id} has inconsistent "
+                f"terminal rewards: {trajectory_rewards}"
+            )
+
+        segment_indices: list[int] = []
+        segment_counts: list[int] = []
+        for position in positions:
+            trajectory_metadata = (samples[position].metadata or {}).get("trajectory")
+            if not isinstance(trajectory_metadata, dict):
+                raise ValueError(
+                    f"segmented PPO trajectory_id={trajectory_id} is missing "
+                    "metadata.trajectory"
+                )
+            metadata_id = trajectory_metadata.get("id")
+            if metadata_id != trajectory_id:
+                raise ValueError(
+                    f"segmented PPO trajectory_id={trajectory_id} has metadata "
+                    f"trajectory id {metadata_id!r}"
+                )
+            try:
+                segment_indices.append(int(trajectory_metadata["segment_index"]))
+                segment_counts.append(int(trajectory_metadata["segment_count"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"segmented PPO trajectory_id={trajectory_id} has invalid "
+                    "segment_index/segment_count metadata"
+                ) from exc
+
+        expected_count = len(positions)
+        if any(segment_count != expected_count for segment_count in segment_counts):
+            raise ValueError(
+                f"segmented PPO trajectory_id={trajectory_id} is incomplete: "
+                f"row_count={expected_count}, segment_counts={segment_counts}"
+            )
+        if sorted(segment_indices) != list(range(expected_count)):
+            raise ValueError(
+                f"segmented PPO trajectory_id={trajectory_id} has invalid segment "
+                f"indices: {segment_indices}"
             )
 
 
@@ -1077,6 +1173,7 @@ class RolloutManager:
 
         group_ids = _resolve_trajectory_ids(samples)
         _validate_trajectory_prompt_ownership(samples, group_ids)
+        _validate_segmented_ppo_semantics(self.args, samples, rewards, group_ids)
 
         train_data = {
             "tokens": [sample.tokens for sample in samples],

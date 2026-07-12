@@ -340,6 +340,8 @@ def log_rollout_data(
                 "loss_masks",
                 "sample_indices",
                 "group_ids",
+                "trajectory_segment_indices",
+                "trajectory_segment_counts",
                 "rollout_mask_sums",
                 "rollout_top_p_token_ids",
                 "rollout_top_p_token_offsets",

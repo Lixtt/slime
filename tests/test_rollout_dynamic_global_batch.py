@@ -522,26 +522,16 @@ def _segmented_ppo_samples(Sample, *, rewards=(1.0, 1.0), segment_indices=(0, 1)
     ]
 
 
-def test_segmented_ppo_accepts_exact_row_local_gae_semantics():
-    _install_rollout_import_stubs()
-    rollout = importlib.import_module("slime.ray.rollout")
-    from slime.utils.types import Sample
-
-    samples = _segmented_ppo_samples(Sample)
-    args = types.SimpleNamespace(advantage_estimator="ppo", gamma=1.0, lambd=1.0, kl_coef=0.0)
-
-    rollout._validate_segmented_ppo_semantics(args, samples, [1.0, 1.0], [10, 10])
-
-
 @pytest.mark.parametrize(
-    ("overrides", "message"),
+    "overrides",
     [
-        ({"gamma": 0.99}, "requires gamma=1"),
-        ({"lambd": 0.95}, "requires lambda=1"),
-        ({"kl_coef": 0.01}, "requires kl_coef=0"),
+        {},
+        {"gamma": 0.99},
+        {"lambd": 0.95},
+        {"kl_coef": 0.01},
     ],
 )
-def test_segmented_ppo_rejects_inexact_row_local_gae_semantics(overrides, message):
+def test_segmented_ppo_accepts_trajectory_chained_gae_semantics(overrides):
     _install_rollout_import_stubs()
     rollout = importlib.import_module("slime.ray.rollout")
     from slime.utils.types import Sample
@@ -550,10 +540,12 @@ def test_segmented_ppo_rejects_inexact_row_local_gae_semantics(overrides, messag
     values = {"advantage_estimator": "ppo", "gamma": 1.0, "lambd": 1.0, "kl_coef": 0.0}
     values.update(overrides)
 
-    with pytest.raises(ValueError, match=message):
-        rollout._validate_segmented_ppo_semantics(
-            types.SimpleNamespace(**values), samples, [1.0, 1.0], [10, 10]
-        )
+    segment_indices, segment_counts = rollout._validate_segmented_ppo_semantics(
+        types.SimpleNamespace(**values), samples, [1.0, 1.0], [10, 10]
+    )
+
+    assert segment_indices == [0, 1]
+    assert segment_counts == [2, 2]
 
 
 def test_segmented_ppo_rejects_inconsistent_terminal_rewards():
@@ -596,6 +588,37 @@ def test_single_row_ppo_does_not_require_segmented_trajectory_constraints():
     args = types.SimpleNamespace(advantage_estimator="ppo", gamma=0.99, lambd=0.95, kl_coef=0.1)
 
     rollout._validate_segmented_ppo_semantics(args, [sample], [1.0], [10])
+
+
+def test_ppo_padding_ignores_stale_source_segment_metadata():
+    _install_rollout_import_stubs()
+    rollout = importlib.import_module("slime.ray.rollout")
+    from slime.utils.types import Sample
+
+    sample = Sample(
+        group_id=None,
+        index=-1,
+        reward=-1.0,
+        remove_sample=True,
+        metadata={
+            "trajectory": {
+                "id": 10,
+                "segment_index": 4,
+                "segment_count": 5,
+            }
+        },
+    )
+    args = types.SimpleNamespace(advantage_estimator="ppo", gamma=0.99, lambd=0.95, kl_coef=0.1)
+
+    segment_indices, segment_counts = rollout._validate_segmented_ppo_semantics(
+        args,
+        [sample],
+        [-1.0],
+        [0],
+    )
+
+    assert segment_indices == [0]
+    assert segment_counts == [1]
 
 
 def test_trajectory_prefix_trimming_keeps_all_compacted_rows():

@@ -720,17 +720,33 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         advantages = [r for r in returns]
 
     elif args.advantage_estimator == "ppo":
-        old_rewards = rewards
+        terminal_rewards = rewards
         rewards = []
         kl_coef = -args.kl_coef
-        cp_rank = mpu.get_context_parallel_rank()
-        for reward, k in zip(old_rewards, kl, strict=False):
+        for k in kl:
             k *= kl_coef
-            if cp_rank == 0:
-                k[-1] += reward
             rewards.append(k)
+        trajectory_ids = rollout_data.get("group_ids")
+        if trajectory_ids is None:
+            trajectory_ids = list(range(len(response_lengths)))
+        segment_indices = rollout_data.get("trajectory_segment_indices")
+        if segment_indices is None:
+            segment_indices = [0] * len(response_lengths)
+        segment_counts = rollout_data.get("trajectory_segment_counts")
+        if segment_counts is None:
+            segment_counts = [1] * len(response_lengths)
         advantages, returns = get_advantages_and_returns_batch(
-            total_lengths, response_lengths, values, rewards, args.gamma, args.lambd
+            total_lengths,
+            response_lengths,
+            values,
+            rewards,
+            args.gamma,
+            args.lambd,
+            loss_masks=loss_masks,
+            trajectory_ids=trajectory_ids,
+            segment_indices=segment_indices,
+            segment_counts=segment_counts,
+            terminal_rewards=terminal_rewards,
         )
 
     elif args.advantage_estimator == "reinforce_plus_plus":

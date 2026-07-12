@@ -422,6 +422,12 @@ def get_advantages_and_returns_batch(
     gamma,
     lambd,
     chunked: bool = True,
+    *,
+    loss_masks=None,
+    trajectory_ids=None,
+    segment_indices=None,
+    segment_counts=None,
+    terminal_rewards=None,
 ):
     """
     Batched GAE with CP support.
@@ -465,31 +471,48 @@ def get_advantages_and_returns_batch(
             full_values_list = values_list
             full_rewards_list = rewards_list
 
-        # pad to max_len for batched GAE
-        max_len = max(response_lengths)
-
-        full_values = torch.zeros(B, max_len, device=device, dtype=dtype)
-        full_rewards = torch.zeros(B, max_len, device=device, dtype=dtype)
-
-        for i in range(B):
-            L = response_lengths[i]
-            full_values[i, :L] = full_values_list[i][:L]
-            full_rewards[i, :L] = full_rewards_list[i][:L]
-
-        if not chunked:
-            full_advantages, full_returns = vanilla_gae(
-                rewards=full_rewards,
-                values=full_values,
+        if trajectory_ids is not None:
+            full_advantages_list, full_returns_list = get_trajectory_advantages_and_returns(
+                response_lengths=response_lengths,
+                values_list=full_values_list,
+                token_rewards_list=full_rewards_list,
+                loss_masks=loss_masks,
+                trajectory_ids=trajectory_ids,
+                segment_indices=segment_indices,
+                segment_counts=segment_counts,
+                terminal_rewards=terminal_rewards,
                 gamma=gamma,
                 lambd=lambd,
+                chunked=chunked,
             )
         else:
-            full_advantages, full_returns = chunked_gae(
-                rewards=full_rewards,
-                values=full_values,
-                gamma=gamma,
-                lambd=lambd,
-            )
+            # pad to max_len for batched GAE
+            max_len = max(response_lengths)
+
+            full_values = torch.zeros(B, max_len, device=device, dtype=dtype)
+            full_rewards = torch.zeros(B, max_len, device=device, dtype=dtype)
+
+            for i in range(B):
+                L = response_lengths[i]
+                full_values[i, :L] = full_values_list[i][:L]
+                full_rewards[i, :L] = full_rewards_list[i][:L]
+
+            if not chunked:
+                full_advantages, full_returns = vanilla_gae(
+                    rewards=full_rewards,
+                    values=full_values,
+                    gamma=gamma,
+                    lambd=lambd,
+                )
+            else:
+                full_advantages, full_returns = chunked_gae(
+                    rewards=full_rewards,
+                    values=full_values,
+                    gamma=gamma,
+                    lambd=lambd,
+                )
+            full_advantages_list = [full_advantages[i, :L] for i, L in enumerate(response_lengths)]
+            full_returns_list = [full_returns[i, :L] for i, L in enumerate(response_lengths)]
 
         advantages_list = []
         returns_list = []
@@ -497,16 +520,13 @@ def get_advantages_and_returns_batch(
         if cp_size > 1:
             from slime.backends.megatron_utils.cp_utils import slice_log_prob_with_cp
 
-            for total_len, resp_len, adv_row, ret_row in zip(
+            for total_len, resp_len, adv_full, ret_full in zip(
                 total_lengths,
                 response_lengths,
-                full_advantages,
-                full_returns,
+                full_advantages_list,
+                full_returns_list,
                 strict=False,
             ):
-                adv_full = adv_row  # shape = [resp_len_i padded to max_len]
-                ret_full = ret_row
-
                 adv_sliced = slice_log_prob_with_cp(adv_full[:resp_len], total_len, resp_len)
                 ret_sliced = slice_log_prob_with_cp(ret_full[:resp_len], total_len, resp_len)
 
@@ -514,12 +534,163 @@ def get_advantages_and_returns_batch(
                 returns_list.append(ret_sliced)
 
         else:
-            for i in range(B):
-                L = response_lengths[i]
-                advantages_list.append(full_advantages[i, :L])
-                returns_list.append(full_returns[i, :L])
+            advantages_list = full_advantages_list
+            returns_list = full_returns_list
 
     return advantages_list, returns_list
+
+
+def get_trajectory_advantages_and_returns(
+    *,
+    response_lengths,
+    values_list,
+    token_rewards_list,
+    loss_masks,
+    trajectory_ids,
+    segment_indices,
+    segment_counts,
+    terminal_rewards,
+    gamma,
+    lambd,
+    chunked: bool = True,
+):
+    """Compute action-token GAE across every ordered segment of a trajectory.
+
+    Context rewrites and compaction can represent one agent episode as several
+    training rows.  Tool observations and other masked context are not policy
+    actions, so they neither consume a GAE step nor receive value loss.  The
+    task reward is applied once, to the final trainable action token.
+    """
+    B = len(response_lengths)
+    fields = {
+        "values": values_list,
+        "token_rewards": token_rewards_list,
+        "loss_masks": loss_masks,
+        "trajectory_ids": trajectory_ids,
+        "segment_indices": segment_indices,
+        "segment_counts": segment_counts,
+        "terminal_rewards": terminal_rewards,
+    }
+    for name, values in fields.items():
+        if values is None or len(values) != B:
+            raise ValueError(f"trajectory GAE requires {name} for all {B} rows")
+    if B == 0:
+        return [], []
+
+    row_advantages = [torch.zeros_like(value) for value in values_list]
+    row_returns = [torch.zeros_like(value) for value in values_list]
+    trajectory_rows: dict[int, list[int]] = {}
+    for position, trajectory_id in enumerate(trajectory_ids):
+        trajectory_rows.setdefault(int(trajectory_id), []).append(position)
+
+    plans = []
+    trajectory_values = []
+    trajectory_token_rewards = []
+    for trajectory_id, positions in trajectory_rows.items():
+        expected_count = len(positions)
+        counts = [int(segment_counts[position]) for position in positions]
+        indices = [int(segment_indices[position]) for position in positions]
+        if any(count != expected_count for count in counts):
+            raise ValueError(
+                f"trajectory_id={trajectory_id} is incomplete for GAE: "
+                f"row_count={expected_count}, segment_counts={counts}"
+            )
+        if sorted(indices) != list(range(expected_count)):
+            raise ValueError(
+                f"trajectory_id={trajectory_id} has invalid GAE segment indices: {indices}"
+            )
+
+        ordered_positions = [
+            position
+            for _, position in sorted(
+                zip(indices, positions, strict=True),
+                key=lambda item: item[0],
+            )
+        ]
+        rewards = [float(terminal_rewards[position]) for position in positions]
+        terminal_reward = rewards[0]
+        if any(abs(reward - terminal_reward) > 1e-6 for reward in rewards[1:]):
+            raise ValueError(
+                f"trajectory_id={trajectory_id} has inconsistent terminal rewards for GAE: {rewards}"
+            )
+
+        action_spans = []
+        value_parts = []
+        reward_parts = []
+        for position in ordered_positions:
+            response_length = int(response_lengths[position])
+            values = values_list[position]
+            token_rewards = token_rewards_list[position]
+            loss_mask = torch.as_tensor(loss_masks[position], device=values.device).reshape(-1)
+            if values.numel() != response_length or token_rewards.numel() != response_length:
+                raise ValueError(
+                    f"trajectory_id={trajectory_id} row={position} response tensor mismatch: "
+                    f"response_length={response_length}, values={values.numel()}, "
+                    f"token_rewards={token_rewards.numel()}"
+                )
+            if loss_mask.numel() != response_length:
+                raise ValueError(
+                    f"trajectory_id={trajectory_id} row={position} loss-mask mismatch: "
+                    f"response_length={response_length}, loss_mask={loss_mask.numel()}"
+                )
+            action_indices = torch.nonzero(loss_mask > 0, as_tuple=False).flatten()
+            action_spans.append((position, action_indices))
+            if action_indices.numel() > 0:
+                value_parts.append(values[action_indices])
+                reward_parts.append(token_rewards[action_indices])
+
+        if not value_parts:
+            continue
+
+        values = torch.cat(value_parts)
+        token_rewards = torch.cat(reward_parts)
+        token_rewards[-1] += terminal_reward
+        trajectory_values.append(values)
+        trajectory_token_rewards.append(token_rewards)
+        plans.append(action_spans)
+
+    if not trajectory_values:
+        return row_advantages, row_returns
+
+    lengths = [values.numel() for values in trajectory_values]
+    max_len = max(lengths)
+    device = trajectory_values[0].device
+    dtype = trajectory_values[0].dtype
+    padded_values = torch.zeros(len(lengths), max_len, device=device, dtype=dtype)
+    padded_rewards = torch.zeros_like(padded_values)
+    for index, length in enumerate(lengths):
+        padded_values[index, :length] = trajectory_values[index]
+        padded_rewards[index, :length] = trajectory_token_rewards[index]
+
+    gae_fn = chunked_gae if chunked else vanilla_gae
+    trajectory_advantages, trajectory_returns = gae_fn(
+        rewards=padded_rewards,
+        values=padded_values,
+        gamma=gamma,
+        lambd=lambd,
+    )
+    for trajectory_position, action_spans in enumerate(plans):
+        offset = 0
+        for row_position, action_indices in action_spans:
+            action_count = action_indices.numel()
+            if action_count == 0:
+                continue
+            next_offset = offset + action_count
+            row_advantages[row_position][action_indices] = trajectory_advantages[
+                trajectory_position,
+                offset:next_offset,
+            ]
+            row_returns[row_position][action_indices] = trajectory_returns[
+                trajectory_position,
+                offset:next_offset,
+            ]
+            offset = next_offset
+        if offset != lengths[trajectory_position]:
+            raise RuntimeError(
+                f"trajectory GAE scatter mismatch: scattered={offset}, expected={lengths[trajectory_position]}"
+            )
+
+    return row_advantages, row_returns
 
 
 def vanilla_gae(

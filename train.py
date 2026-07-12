@@ -68,12 +68,13 @@ def train(args):
                 critic_model.clear_memory()
 
     def save(rollout_id):
-        actor_trains_this_step = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
-        if actor_trains_this_step:
-            actor_model.save_model(
-                rollout_id,
-                force_sync=rollout_id == args.num_rollout - 1,
-            )
+        # A critic-only warmup still advances the shared rollout/data cursor.
+        # Save the unchanged actor too so actor and critic remain an exact,
+        # iteration-aligned resume pair after every checkpointed PPO step.
+        actor_model.save_model(
+            rollout_id,
+            force_sync=rollout_id == args.num_rollout - 1,
+        )
         if args.use_critic:
             critic_model.save_model(
                 rollout_id,

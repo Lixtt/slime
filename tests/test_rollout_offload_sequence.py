@@ -47,6 +47,16 @@ def test_training_loop_runs_pre_update_quality_gate_before_rollout_offload():
     assert train_loop.index(generate) < train_loop.index(quality_gate) < train_loop.index(rollout_offload)
 
 
+def test_critic_only_checkpoint_keeps_actor_and_critic_iterations_aligned():
+    source = Path("slime/train.py").read_text()
+    save_body = source.split("    def save(rollout_id):", 1)[1].split("\n    # train loop.", 1)[0]
+
+    assert save_body.count("actor_model.save_model(") == 1
+    assert save_body.count("critic_model.save_model(") == 1
+    actor_save_prefix = save_body.split("actor_model.save_model(", 1)[0]
+    assert "if actor_trains_this_step" not in actor_save_prefix
+
+
 def test_rollout_manager_creation_does_not_hide_initial_offload():
     source = Path("slime/slime/ray/placement_group.py").read_text()
     create_body = source.split("def create_rollout_manager(args, pg):", 1)[1]

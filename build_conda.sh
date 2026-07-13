@@ -12,6 +12,7 @@ SLIME_BUILD_CACHE_DIR="${SLIME_BUILD_CACHE_DIR:-}"
 PIP_INSTALL_RETRIES="${PIP_INSTALL_RETRIES:-4}"
 PIP_RETRY_SLEEP_SEC="${PIP_RETRY_SLEEP_SEC:-10}"
 NVIDIA_PYPI_INDEX_URL="${NVIDIA_PYPI_INDEX_URL:-https://pypi.nvidia.com}"
+GENERAL_PYPI_INDEX_URL="${GENERAL_PYPI_INDEX_URL:-${PIP_INDEX_URL:-}}"
 
 if [[ -n "${SLIME_BUILD_TMPDIR}" ]]; then
   mkdir -p "${SLIME_BUILD_TMPDIR}"
@@ -168,9 +169,13 @@ mapfile -t cuda13_packages < <(
 if (( ${#cuda13_packages[@]} )); then
   pip uninstall -y "${cuda13_packages[@]}"
 fi
+torch_index_args=(--index-url https://download.pytorch.org/whl/cu129)
+if [[ -n "${GENERAL_PYPI_INDEX_URL}" ]]; then
+  torch_index_args+=(--extra-index-url "${GENERAL_PYPI_INDEX_URL}")
+fi
 pip install --force-reinstall \
-  torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
-  --index-url https://download.pytorch.org/whl/cu129
+  torch==2.11.0+cu129 torchvision==0.26.0+cu129 torchaudio==2.11.0+cu129 \
+  "${torch_index_args[@]}"
 pip install --force-reinstall --no-deps \
   sglang-kernel==0.4.4 sgl-deep-gemm==0.1.3 \
   --index-url https://docs.sglang.ai/whl/cu129/

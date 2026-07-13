@@ -77,3 +77,15 @@ def test_build_conda_native_build_parallelism_is_overridable():
     assert 'MAX_JOBS="${FA3_MAX_JOBS}"' in text
     assert "MAX_JOBS=64" not in text
     assert "MAX_JOBS=96" not in text
+
+
+def test_build_conda_replaces_cuda13_python_bindings_after_sglang_resolution():
+    text = (SLIME_ROOT / "build_conda.sh").read_text()
+
+    assert 'SLIME_BUILD_TMPDIR="${SLIME_BUILD_TMPDIR:-}"' in text
+    assert 'export TMPDIR="${SLIME_BUILD_TMPDIR}"' in text
+    for package in ("cuda-bindings", "cuda-core", "cuda-python", "cuda-toolkit"):
+        assert f"  {package} \\\n" in text
+    reinstall = "pip install --force-reinstall cuda-python==12.9"
+    assert reinstall in text
+    assert text.index("pip uninstall -y") < text.index(reinstall)

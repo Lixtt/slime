@@ -7,6 +7,13 @@ SLIME_ENV_NAME="${SLIME_ENV_NAME:-slime}"
 BUILD_MAX_JOBS="${BUILD_MAX_JOBS:-$(nproc)}"
 FA2_MAX_JOBS="${FA2_MAX_JOBS:-${BUILD_MAX_JOBS}}"
 FA3_MAX_JOBS="${FA3_MAX_JOBS:-${BUILD_MAX_JOBS}}"
+SLIME_BUILD_TMPDIR="${SLIME_BUILD_TMPDIR:-}"
+
+if [[ -n "${SLIME_BUILD_TMPDIR}" ]]; then
+  mkdir -p "${SLIME_BUILD_TMPDIR}"
+  export TMPDIR="${SLIME_BUILD_TMPDIR}"
+fi
+export PIP_NO_CACHE_DIR="${PIP_NO_CACHE_DIR:-1}"
 
 env_install() {
   "${ENV_MANAGER_BIN}" install "${ENV_SELECTOR[@]}" "$@"
@@ -86,8 +93,6 @@ env_install -c conda-forge cudnn -y
 # setuptools-rust), so the conda env needs a working rustc + cargo.
 env_install -c conda-forge rust -y
 
-pip install cuda-python==12.9
-
 # install sglang. The Dockerfile starts FROM lmsysorg/sglang:v0.5.14-cu129
 # which already has sglang installed with cu129-built native kernels; we have
 # to install it ourselves here. Two follow-up steps clean up the cu13 spill:
@@ -115,6 +120,10 @@ pip install --force-reinstall --no-deps \
   sglang-kernel==0.4.4 sgl-deep-gemm==0.1.3 \
   --index-url https://docs.sglang.ai/whl/cu129/
 pip uninstall -y \
+  cuda-bindings \
+  cuda-core \
+  cuda-python \
+  cuda-toolkit \
   nvidia-cublas \
   nvidia-cuda-cupti \
   nvidia-cuda-nvrtc \
@@ -150,6 +159,7 @@ pip install --force-reinstall --no-deps \
   nvidia-nvtx-cu12 \
   --index-url https://download.pytorch.org/whl/cu129 \
   --extra-index-url https://pypi.org/simple
+pip install --force-reinstall cuda-python==12.9
 
 
 pip install cmake ninja

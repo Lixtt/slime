@@ -142,20 +142,29 @@ if [ -n "$(git -C "$SLIME_DIR" status --porcelain --untracked-files=no)" ]; then
 fi
 SGLANG_PATCH="$SLIME_DIR/docker/patch/${PATCH_VERSION}/sglang.patch"
 
-# install cuda 12.9 as it's the default cuda version for torch
-env_install \
-  cuda=12.9.1 \
-  cuda-nvtx=12.9.79 \
-  cuda-nvtx-dev=12.9.79 \
-  nccl \
-  -c nvidia/label/cuda-12.9.1 \
-  -c nvidia \
-  -c conda-forge \
-  -y
-env_install -c conda-forge cudnn -y
-# sglang's editable install builds a Rust extension (sglang-grpc via
-# setuptools-rust), so the conda env needs a working rustc + cargo.
-env_install -c conda-forge rust -y
+if [[ "${SLIME_BUILD_RESUME_AFTER_CU129_BASE:-0}" == "1" ]]; then
+  # A verified resume must not revisit public conda channels just to resolve
+  # already-installed CUDA packages. The exact Python/native package audit
+  # below remains the authoritative cu129 base gate.
+  "${CONDA_PREFIX}/bin/nvcc" --version | grep -q 'release 12\.9'
+  command -v rustc >/dev/null
+  command -v cargo >/dev/null
+else
+  # install cuda 12.9 as it's the default cuda version for torch
+  env_install \
+    cuda=12.9.1 \
+    cuda-nvtx=12.9.79 \
+    cuda-nvtx-dev=12.9.79 \
+    nccl \
+    -c nvidia/label/cuda-12.9.1 \
+    -c nvidia \
+    -c conda-forge \
+    -y
+  env_install -c conda-forge cudnn -y
+  # sglang's editable install builds a Rust extension (sglang-grpc via
+  # setuptools-rust), so the conda env needs a working rustc + cargo.
+  env_install -c conda-forge rust -y
+fi
 
 # install sglang. The Dockerfile starts FROM lmsysorg/sglang:v0.5.14-cu129
 # which already has sglang installed with cu129-built native kernels; we have

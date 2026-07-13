@@ -256,7 +256,8 @@ fi
 pip install cmake ninja
 
 # flash attn 2 (matches Dockerfile)
-FLASH_ATTN_CUDA_ARCHS="${FA2_CUDA_ARCHS}" \
+FLASH_ATTENTION_FORCE_BUILD=TRUE \
+  FLASH_ATTN_CUDA_ARCHS="${FA2_CUDA_ARCHS}" \
   MAX_JOBS="${FA2_MAX_JOBS}" \
   pip -v install flash-attn==2.8.3 --no-build-isolation
 

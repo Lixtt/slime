@@ -1,5 +1,5 @@
-ARG SGLANG_IMAGE_TAG=v0.5.13-cu129
-FROM slimerl/sglang:${SGLANG_IMAGE_TAG} AS sglang
+ARG SGLANG_IMAGE_TAG=v0.5.14-cu129
+FROM lmsysorg/sglang:${SGLANG_IMAGE_TAG} AS sglang
 
 # ======================================== Arguments =============================================
 
@@ -102,28 +102,24 @@ RUN cd Megatron-LM && \
 
 # TODO temporarily skip patching for GB200/GB300 (and require users to bring their own sglang version). should add back later.
 ARG ENABLE_SGLANG_PATCH=1
-COPY docker/patch/${PATCH_VERSION}/sglang.patch \
-     docker/patch/${PATCH_VERSION}/sglang-top_p.patch \
-     docker/patch/${PATCH_VERSION}/sglang-release_hicache.patch \
-     docker/patch/${PATCH_VERSION}/sglang-pull_weights.patch \
-     /sgl-workspace/sglang/
+COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
 RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
   cd /sgl-workspace/sglang && \
   git update-index --refresh && \
-  for patch in sglang.patch sglang-top_p.patch sglang-release_hicache.patch sglang-pull_weights.patch; do \
-    git apply --3way "$patch" || exit 1; \
-    if git grep -n '^<<<<<<< ' -- .; then \
-      echo "Patch failed to apply cleanly. Please resolve conflicts." && \
-      exit 1; \
-    fi; \
-  done && \
-  rm sglang.patch sglang-top_p.patch sglang-release_hicache.patch sglang-pull_weights.patch; \
+  git apply --check sglang.patch && \
+  git apply --3way sglang.patch && \
+  if git grep -n '^<<<<<<< ' -- .; then \
+    echo "Patch failed to apply cleanly. Please resolve conflicts." && \
+    exit 1; \
+  fi && \
+  rm sglang.patch; \
 fi
 
 # ====================================== Install main package ============================================
 
-ARG SLIME_COMMIT=main
-RUN git clone https://github.com/THUDM/slime.git /root/slime && \
+ARG SLIME_REPO=https://github.com/Lixtt/slime.git
+ARG SLIME_COMMIT=openclaw-rl/upstream-main-20260713
+RUN git clone ${SLIME_REPO} /root/slime && \
     cd /root/slime && \
     git checkout ${SLIME_COMMIT} && \
     pip install -e . --no-deps

@@ -70,6 +70,7 @@ else
   set -u
 fi
 export CUDA_HOME="$CONDA_PREFIX"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
 # Retry complete pip install transactions. Streaming resets from cluster-local
 # mirrors otherwise force operators to rerun this multi-hour build by hand.
@@ -134,12 +135,10 @@ env_install -c conda-forge rust -y
 
 # install sglang. The Dockerfile starts FROM lmsysorg/sglang:v0.5.14-cu129
 # which already has sglang installed with cu129-built native kernels; we have
-# to install it ourselves here. Two follow-up steps clean up the cu13 spill:
-#   1. force-reinstall torch / sglang-kernel / sgl-deep-gemm to their +cu129
-#      wheels (pypi defaults are cu13);
-#   2. uninstall the cu13 nvidia-* runtime libs sglang dragged in, then
-#      reinstall the cu12 equivalents to repair the `site-packages/nvidia/*`
-#      shared dirs (pip uninstall stomps libs co-owned across cu12/cu13).
+# to install it ourselves here. Match the official cu129 image order: remove
+# dependency variants whose distribution names end in -cu13 first, then
+# reinstall the complete cu129 Torch stack so shared `site-packages/nvidia/*`
+# files cannot be removed after their cu12 owners are installed.
 if [ ! -d "$SGLANG_DIR/.git" ]; then
   cd $BASE_DIR
   git clone https://github.com/sgl-project/sglang.git "$SGLANG_DIR"
@@ -155,52 +154,19 @@ fi
 # diffusion, tracing, and HTTP/2 stacks that are part of the general Docker
 # image but not the Slime runtime and greatly expand resolver/network failure.
 pip install -e "python" --extra-index-url https://download.pytorch.org/whl/cu129
-pip install --force-reinstall --no-deps \
-  torch==2.11.0 torchvision torchaudio==2.11.0 \
+mapfile -t cuda13_packages < <(
+  pip list --format=freeze \
+    | awk -F'==' '/-cu13(==|$)/ {print $1}'
+)
+if (( ${#cuda13_packages[@]} )); then
+  pip uninstall -y "${cuda13_packages[@]}"
+fi
+pip install --force-reinstall \
+  torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
   --index-url https://download.pytorch.org/whl/cu129
 pip install --force-reinstall --no-deps \
   sglang-kernel==0.4.4 sgl-deep-gemm==0.1.3 \
   --index-url https://docs.sglang.ai/whl/cu129/
-pip uninstall -y \
-  cuda-bindings \
-  cuda-core \
-  cuda-python \
-  cuda-toolkit \
-  nvidia-cublas \
-  nvidia-cuda-cupti \
-  nvidia-cuda-nvrtc \
-  nvidia-cuda-runtime \
-  nvidia-cudnn-cu13 \
-  nvidia-cufft \
-  nvidia-cufile \
-  nvidia-curand \
-  nvidia-cusolver \
-  nvidia-cusparse \
-  nvidia-cusparselt-cu13 \
-  nvidia-nccl-cu13 \
-  nvidia-nvjitlink \
-  nvidia-nvshmem-cu13 \
-  nvidia-nvtx \
-  nvidia-cutlass-dsl-libs-cu13 \
-  || true
-pip install --force-reinstall --no-deps \
-  nvidia-cublas-cu12 \
-  nvidia-cuda-cupti-cu12 \
-  nvidia-cuda-nvrtc-cu12 \
-  nvidia-cuda-runtime-cu12 \
-  nvidia-cudnn-cu12==9.16.0.29 \
-  nvidia-cufft-cu12 \
-  nvidia-cufile-cu12 \
-  nvidia-curand-cu12 \
-  nvidia-cusolver-cu12 \
-  nvidia-cusparse-cu12 \
-  nvidia-cusparselt-cu12 \
-  nvidia-nccl-cu12 \
-  nvidia-nvjitlink-cu12 \
-  nvidia-nvshmem-cu12 \
-  nvidia-nvtx-cu12 \
-  --index-url https://download.pytorch.org/whl/cu129 \
-  --extra-index-url https://pypi.org/simple
 pip install --force-reinstall cuda-python==12.9
 
 
@@ -316,13 +282,22 @@ else
 fi
 
 python - <<'PY'
+import importlib
 from importlib import metadata
+from pathlib import Path
+
+import torch
+from packaging.utils import canonicalize_name
 from packaging.version import Version
 
 expected_exact = {
+    "flash-attn": "2.8.3",
+    "sgl-deep-gemm": "0.1.3",
     "sglang": "0.5.14",
     "sglang-kernel": "0.4.4",
     "torch": "2.11.0",
+    "torchaudio": "2.11.0",
+    "torchvision": "0.26.0",
     "transformers": "5.8.1",
     "transformer-engine": "2.16.1",
 }
@@ -332,8 +307,51 @@ for package, expected in expected_exact.items():
         raise SystemExit(f"{package}: expected {expected}, got {actual}")
     print(f"{package}={actual}")
 
+if torch.version.cuda != "12.9":
+    raise SystemExit(f"torch: expected CUDA 12.9, got {torch.version.cuda}")
+
+cuda_python_version = Version(metadata.version("cuda-python"))
+if cuda_python_version.release[:2] != (12, 9):
+    raise SystemExit(
+        f"cuda-python: expected a 12.9.x release, got {cuda_python_version}"
+    )
+print(f"cuda-python={cuda_python_version}")
+
+cuda13_packages = sorted(
+    name
+    for distribution in metadata.distributions()
+    if (name := distribution.metadata.get("Name"))
+    and canonicalize_name(name).endswith("-cu13")
+)
+if cuda13_packages:
+    raise SystemExit(f"unexpected -cu13 distributions: {cuda13_packages}")
+
 ray_version = metadata.version("ray")
 if Version(ray_version) < Version("2.55.1"):
     raise SystemExit(f"ray: expected >=2.55.1, got {ray_version}")
 print(f"ray={ray_version}")
+
+required_modules = (
+    "apex",
+    "cuda.bindings.driver",
+    "deep_gemm",
+    "flash_attn",
+    "flash_attn_3._C",
+    "hopper.flash_attn_interface",
+    "megatron.core",
+    "sgl_kernel",
+    "sglang",
+    "slime",
+    "torch_memory_saver",
+    "transformer_engine.pytorch",
+)
+for module_name in required_modules:
+    module = importlib.import_module(module_name)
+    print(f"imported {module_name} from {getattr(module, '__file__', '<builtin>')}")
+
+site_packages = Path(metadata.distribution("torch-memory-saver").locate_file(""))
+tms_preload = site_packages / "torch_memory_saver_hook_mode_preload_cu12.abi3.so"
+if not tms_preload.is_file() or tms_preload.stat().st_size == 0:
+    raise SystemExit(f"missing native torch-memory-saver preload hook: {tms_preload}")
+print(f"torch-memory-saver-preload={tms_preload}")
 PY

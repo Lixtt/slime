@@ -81,16 +81,41 @@ def test_build_conda_native_build_parallelism_is_overridable():
     assert "MAX_JOBS=96" not in text
 
 
-def test_build_conda_replaces_cuda13_python_bindings_after_sglang_resolution():
+def test_build_conda_replaces_cuda13_variants_before_cu129_torch():
     text = (SLIME_ROOT / "build_conda.sh").read_text()
 
     assert 'SLIME_BUILD_TMPDIR="${SLIME_BUILD_TMPDIR:-}"' in text
     assert 'export TMPDIR="${SLIME_BUILD_TMPDIR}"' in text
-    for package in ("cuda-bindings", "cuda-core", "cuda-python", "cuda-toolkit"):
-        assert f"  {package} \\\n" in text
+    assert "awk -F'==' '/-cu13(==|$)/ {print $1}'" in text
+    assert 'pip uninstall -y "${cuda13_packages[@]}"' in text
+    cu129_torch = (
+        "torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0"
+    )
+    assert cu129_torch in text
     reinstall = "pip install --force-reinstall cuda-python==12.9"
     assert reinstall in text
-    assert text.index("pip uninstall -y") < text.index(reinstall)
+    assert text.index("pip uninstall -y") < text.index(cu129_torch)
+    assert text.index(cu129_torch) < text.index(reinstall)
+
+
+def test_build_conda_validates_native_runtime_and_conda_abi_first():
+    text = (SLIME_ROOT / "build_conda.sh").read_text()
+
+    assert (
+        'export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib'
+        '${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"'
+    ) in text
+    for module in (
+        '"flash_attn_3._C"',
+        '"hopper.flash_attn_interface"',
+        '"sgl_kernel"',
+        '"sglang"',
+        '"torch_memory_saver"',
+        '"transformer_engine.pytorch"',
+    ):
+        assert module in text
+    assert "torch_memory_saver_hook_mode_preload_cu12.abi3.so" in text
+    assert 'canonicalize_name(name).endswith("-cu13")' in text
 
 
 def test_build_conda_uses_cached_retries_for_autoregressive_sglang_runtime():

@@ -12,7 +12,7 @@ from slime.utils.types import ParamInfo
 
 from ..megatron_to_hf import convert_to_hf
 from ..sglang import monkey_patch_torch_reductions
-from .common import all_gather_params_async, named_params_and_buffers
+from .common import all_gather_params_async, group_fused_qkv_a_sync_items, named_params_and_buffers
 from .hf_weight_iterator_base import HfWeightIteratorBase
 
 
@@ -113,24 +113,24 @@ def _get_megatron_local_param_info_buckets(args: Namespace, model: Sequence[torc
     param_info_buckets = [[]]  # Start with one empty bucket
     buffer_size = 0  # Track current bucket size in bytes
 
-    for info in param_infos:
-        # Expert params use expert-TP size, others use regular-TP size
-        if ".experts." in info.name:
-            tp_size = mpu.get_expert_tensor_parallel_world_size()
-        else:
-            tp_size = mpu.get_tensor_model_parallel_world_size()
+    for info_group in group_fused_qkv_a_sync_items(param_infos, lambda info: info.name):
+        group_size = 0
+        for info in info_group:
+            # Expert params use expert-TP size, others use regular-TP size.
+            if ".experts." in info.name:
+                tp_size = mpu.get_expert_tensor_parallel_world_size()
+            else:
+                tp_size = mpu.get_tensor_model_parallel_world_size()
+            group_size += info.size * tp_size
 
-        # Full param size = shard size × TP replicas (all-gather will reconstruct full param)
-        param_size = info.size * tp_size
-
-        # If adding this param exceeds limit AND current bucket has params: start new bucket
-        if buffer_size + param_size > args.update_weight_buffer_size and len(param_info_buckets[-1]) > 0:
+        # Fused q-a/kv-a pairs may exceed the nominal bucket limit, but must
+        # remain in one SGLang load_weights call so its local fusion cache sees both.
+        if buffer_size + group_size > args.update_weight_buffer_size and len(param_info_buckets[-1]) > 0:
             param_info_buckets.append([])
             buffer_size = 0
 
-        # Add param to current bucket and update size
-        param_info_buckets[-1].append(info)
-        buffer_size += param_size
+        param_info_buckets[-1].extend(info_group)
+        buffer_size += group_size
 
     return param_info_buckets
 

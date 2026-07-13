@@ -12,6 +12,11 @@ from slime.backends.megatron_utils.misc_utils import strip_param_name_prefix
 from slime.utils.types import ParamInfo
 
 
+_FUSED_QKV_A_RE = re.compile(
+    r"^(?P<prefix>.*\.self_attention\.)(?P<proj>linear_q_down_proj|linear_kv_down_proj)(?P<suffix>\.weight)$"
+)
+
+
 def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
     """
     All-gather TP-sharded param to full tensor. expert_bias→param, non-TP/duplicated→param.data.
@@ -48,6 +53,37 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
             partition_dim = 1
     param = torch.cat(param_partitions, dim=partition_dim)
     return param
+
+
+def group_fused_qkv_a_sync_items(items: Sequence, name_getter) -> list[list]:
+    """Keep each GLM/DeepSeek fused q-a and kv-a pair in one update RPC."""
+    item_list = list(items)
+    pair_members: dict[str, dict[str, tuple[int, object]]] = {}
+    for idx, item in enumerate(item_list):
+        match = _FUSED_QKV_A_RE.match(name_getter(item))
+        if match is None:
+            continue
+        key = f"{match.group('prefix')}{match.group('suffix')}"
+        pair_members.setdefault(key, {})[match.group("proj")] = (idx, item)
+
+    emitted: set[int] = set()
+    groups: list[list] = []
+    required = {"linear_q_down_proj", "linear_kv_down_proj"}
+    for idx, item in enumerate(item_list):
+        if idx in emitted:
+            continue
+        match = _FUSED_QKV_A_RE.match(name_getter(item))
+        if match is not None:
+            key = f"{match.group('prefix')}{match.group('suffix')}"
+            pair = pair_members.get(key, {})
+            if required.issubset(pair):
+                ordered = sorted(pair.values(), key=lambda pair_item: pair_item[0])
+                groups.append([pair_item for pair_idx, pair_item in ordered])
+                emitted.update(pair_idx for pair_idx, _ in ordered)
+                continue
+        groups.append([item])
+        emitted.add(idx)
+    return groups
 
 
 def all_gather_params_async(

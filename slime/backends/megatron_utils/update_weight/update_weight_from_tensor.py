@@ -1,4 +1,6 @@
+import gc
 import logging
+import os
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -24,6 +26,45 @@ from .update_weight_from_distributed import (
 
 logger = logging.getLogger(__name__)
 _LOGGED_CUDA_IPC_FAILURE = False
+
+
+def _weight_sync_memory_log_interval() -> int:
+    raw = os.environ.get("SLIME_WEIGHT_SYNC_MEMORY_LOG_INTERVAL", "0")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning("Ignoring invalid SLIME_WEIGHT_SYNC_MEMORY_LOG_INTERVAL=%r", raw)
+        return 0
+
+
+def _release_cuda_ipc_producer_cache() -> int:
+    """Release producer-side CUDA IPC handles after all consumers returned."""
+    from torch.multiprocessing import reductions
+
+    cache_entries = len(reductions.shared_cache)
+    reductions.shared_cache.clear()
+    gc.collect()
+    torch.cuda.ipc_collect()
+    return cache_entries
+
+
+def _log_weight_sync_memory(bucket_index: int, released_cache_entries: int) -> None:
+    interval = _weight_sync_memory_log_interval()
+    if interval <= 0 or (bucket_index != 1 and bucket_index % interval != 0):
+        return
+
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    gib = 1024**3
+    logger.info(
+        "Weight sync memory after bucket=%d: free_gib=%.2f total_gib=%.2f "
+        "allocated_gib=%.2f reserved_gib=%.2f released_ipc_cache_entries=%d",
+        bucket_index,
+        free_bytes / gib,
+        total_bytes / gib,
+        torch.cuda.memory_allocated() / gib,
+        torch.cuda.memory_reserved() / gib,
+        released_cache_entries,
+    )
 
 
 class UpdateWeightFromTensor:
@@ -169,19 +210,26 @@ class UpdateWeightFromTensor:
 
         megatron_local_weights = self.weights_getter()
 
-        for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+        for bucket_index, hf_named_tensors in enumerate(
+            self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights),
+            start=1,
+        ):
             refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
             ray.get(refs)
             # Free GPU tensors so the outer torch_memory_saver.disable() pool
-            # can reuse the blocks, then collect IPC entries whose consumers
-            # have already closed their handles.
+            # can reuse the blocks. MultiprocessingSerializer registers every
+            # exported storage in a process-local shared cache; ipc_collect()
+            # alone does not evict those entries, so a many-bucket full sync can
+            # otherwise retain tens of GiB after every consumer returned.
             del long_lived_tensors, hf_named_tensors
-            torch.cuda.ipc_collect()
+            released_cache_entries = _release_cuda_ipc_producer_cache()
+            if rank == 0:
+                _log_weight_sync_memory(bucket_index, released_cache_entries)
 
         dist.barrier(group=get_gloo_group())
         # After the barrier all engines have returned, so every rank's last-chunk
         # IPC handles are now released by the consumers.  Clean them up.
-        torch.cuda.ipc_collect()
+        _release_cuda_ipc_producer_cache()
 
         # int4/fp4 post_process
         if rank == 0:

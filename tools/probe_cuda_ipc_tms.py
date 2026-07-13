@@ -42,7 +42,7 @@ def _disable_tms_with_export_pool():
             yield
 
 
-def _serialize_bucket(size_bytes: int) -> int:
+def _serialize_bucket_payload(size_bytes: int) -> str:
     if size_bytes <= 0:
         raise ValueError("size_bytes must be positive")
     left = size_bytes // 2
@@ -55,11 +55,47 @@ def _serialize_bucket(size_bytes: int) -> int:
     )
     flattened = bucket.get_flattened_tensor()
     torch.cuda.synchronize()
-    payload = MultiprocessingSerializer.serialize(
+    return MultiprocessingSerializer.serialize(
         {"flattened_tensor": flattened, "metadata": bucket.get_metadata()},
         output_str=True,
     )
-    return len(payload)
+
+
+def _serialize_bucket(size_bytes: int) -> int:
+    return len(_serialize_bucket_payload(size_bytes))
+
+
+def _ipc_consumer(connection) -> None:
+    try:
+        monkey_patch_torch_reductions()
+        while True:
+            payload = connection.recv()
+            if payload is None:
+                connection.send({"ok": True, "stopped": True})
+                return
+
+            tensor_data = MultiprocessingSerializer.deserialize(payload)
+            flattened = tensor_data["flattened_tensor"]
+            if flattened.is_cuda:
+                torch.cuda.synchronize(flattened.device)
+            del flattened, tensor_data, payload
+
+            from torch.multiprocessing import reductions
+
+            reductions.shared_cache.clear()
+            gc.collect()
+            torch.cuda.ipc_collect()
+            connection.send({"ok": True})
+    except BaseException as exc:
+        connection.send(
+            {
+                "ok": False,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+        )
+    finally:
+        connection.close()
 
 
 def _run_case(name, size_bytes, context_factory):
@@ -90,10 +126,34 @@ def _run_case(name, size_bytes, context_factory):
         torch.cuda.ipc_collect()
 
 
-def _run_after_tms_pause(size_bytes: int, paused_allocation_bytes: int, repeats: int):
+def _memory_snapshot(iteration: int) -> dict[str, int]:
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    return {
+        "iteration": iteration,
+        "free_bytes": free_bytes,
+        "total_bytes": total_bytes,
+        "allocated_bytes": torch.cuda.memory_allocated(),
+        "reserved_bytes": torch.cuda.memory_reserved(),
+    }
+
+
+def _run_after_tms_pause(
+    size_bytes: int,
+    paused_allocation_bytes: int,
+    repeats: int,
+    memory_sample_interval: int,
+):
     resident = []
     paused = False
+    consumer = None
+    producer_connection = None
     try:
+        context = torch.multiprocessing.get_context("spawn")
+        producer_connection, consumer_connection = context.Pipe()
+        consumer = context.Process(target=_ipc_consumer, args=(consumer_connection,))
+        consumer.start()
+        consumer_connection.close()
+
         chunk_bytes = 256 * 1024 * 1024
         remaining = paused_allocation_bytes
         while remaining > 0:
@@ -106,13 +166,41 @@ def _run_after_tms_pause(size_bytes: int, paused_allocation_bytes: int, repeats:
         with torch_memory_saver.disable():
             state_during = _interesting_region()
             payload_bytes = []
-            for _ in range(repeats):
-                payload_bytes.append(_serialize_bucket(size_bytes))
+            memory_samples = [_memory_snapshot(0)]
+            for iteration in range(1, repeats + 1):
+                payload = _serialize_bucket_payload(size_bytes)
+                payload_bytes.append(len(payload))
+                producer_connection.send(payload)
+                if not producer_connection.poll(120):
+                    raise TimeoutError(f"CUDA IPC consumer timed out at iteration {iteration}")
+                consumer_result = producer_connection.recv()
+                if not consumer_result.get("ok"):
+                    raise RuntimeError(
+                        "CUDA IPC consumer failed at iteration "
+                        f"{iteration}: {consumer_result.get('error_type')}: {consumer_result.get('error')}"
+                    )
+                del payload, consumer_result
                 from torch.multiprocessing import reductions
 
                 reductions.shared_cache.clear()
                 gc.collect()
                 torch.cuda.ipc_collect()
+                if iteration % memory_sample_interval == 0 or iteration == repeats:
+                    memory_samples.append(_memory_snapshot(iteration))
+        min_free_bytes = min(sample["free_bytes"] for sample in memory_samples)
+        free_memory_loss_bytes = max(0, memory_samples[0]["free_bytes"] - min_free_bytes)
+        producer_connection.send(None)
+        if not producer_connection.poll(30):
+            raise TimeoutError("CUDA IPC consumer did not stop cleanly")
+        stop_result = producer_connection.recv()
+        if not stop_result.get("ok"):
+            raise RuntimeError(f"CUDA IPC consumer stop failed: {stop_result}")
+        consumer.join(timeout=30)
+        if consumer.is_alive() or consumer.exitcode != 0:
+            raise RuntimeError(f"CUDA IPC consumer exitcode={consumer.exitcode}")
+        consumer_exitcode = consumer.exitcode
+        producer_connection.close()
+        producer_connection = None
         return {
             "name": "after_tms_pause",
             "ok": True,
@@ -120,6 +208,9 @@ def _run_after_tms_pause(size_bytes: int, paused_allocation_bytes: int, repeats:
             "paused_allocation_bytes": paused_allocation_bytes,
             "repeats": repeats,
             "payload_chars": payload_bytes,
+            "memory_samples": memory_samples,
+            "free_memory_loss_bytes": free_memory_loss_bytes,
+            "consumer_exitcode": consumer_exitcode,
         }
     except Exception as exc:
         return {
@@ -131,6 +222,20 @@ def _run_after_tms_pause(size_bytes: int, paused_allocation_bytes: int, repeats:
             "error": str(exc),
         }
     finally:
+        if producer_connection is not None:
+            try:
+                if consumer is not None and consumer.is_alive():
+                    producer_connection.send(None)
+                    if producer_connection.poll(30):
+                        producer_connection.recv()
+            except (BrokenPipeError, EOFError, OSError):
+                pass
+            producer_connection.close()
+        if consumer is not None:
+            consumer.join(timeout=30)
+            if consumer.is_alive():
+                consumer.terminate()
+                consumer.join(timeout=30)
         if paused:
             torch_memory_saver.resume()
         resident.clear()
@@ -152,7 +257,9 @@ def main() -> int:
     parser.add_argument("--size-mib", type=int, default=216)
     parser.add_argument("--size-bytes", type=int)
     parser.add_argument("--paused-allocation-mib", type=int, default=1024)
-    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--repeats", type=int, default=256)
+    parser.add_argument("--memory-sample-interval", type=int, default=16)
+    parser.add_argument("--max-free-memory-loss-mib", type=int, default=1024)
     parser.add_argument("--output-json")
     parser.add_argument(
         "--cases",
@@ -160,6 +267,13 @@ def main() -> int:
     )
     parser.add_argument("--require-tms-disable-pass", action="store_true")
     args = parser.parse_args()
+
+    if args.repeats <= 0:
+        raise ValueError("--repeats must be positive")
+    if args.memory_sample_interval <= 0:
+        raise ValueError("--memory-sample-interval must be positive")
+    if args.max_free_memory_loss_mib < 0:
+        raise ValueError("--max-free-memory-loss-mib must be non-negative")
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -172,6 +286,7 @@ def main() -> int:
             size_bytes,
             args.paused_allocation_mib * 1024 * 1024,
             args.repeats,
+            args.memory_sample_interval,
         ),
         "tms_active": lambda: _run_case("tms_active", size_bytes, _no_context),
         "tms_disable_mem_pool": lambda: _run_case(
@@ -208,7 +323,19 @@ def main() -> int:
     if args.require_tms_disable_pass:
         required_names = {"after_tms_pause", "tms_disable_mem_pool"}
         required = [item for item in results if item["name"] in required_names]
-        exit_code = 0 if len(required) == len(required_names) and all(item["ok"] for item in required) else 1
+        paused_result = next((item for item in required if item["name"] == "after_tms_pause"), None)
+        memory_bounded = (
+            paused_result is not None
+            and paused_result.get("free_memory_loss_bytes", 0)
+            <= args.max_free_memory_loss_mib * 1024 * 1024
+        )
+        exit_code = (
+            0
+            if len(required) == len(required_names)
+            and all(item["ok"] for item in required)
+            and memory_bounded
+            else 1
+        )
 
     # This probe intentionally creates producer-only CUDA IPC handles. Avoid
     # PyTorch's process-exit warning/segfault for handles with no real consumer.

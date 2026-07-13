@@ -29,11 +29,18 @@ def test_fp8_online_post_process_skips_kv_cache_quant_methods():
     assert ") and should_run_quant_post_process(quant_method):" in legacy_text
 
 
-def test_latest_scheduler_tensor_update_and_post_process_cover_draft_worker():
+def test_latest_tensor_update_single_dispatches_and_cleans_exact_owner():
     text = LATEST_PATCH.read_text()
 
-    assert "self.tp_worker.update_weights_from_tensor(recv_req)" in text
-    assert "self.draft_worker.update_weights_from_tensor" in text
+    assert "Use one tensor deserialization owner" in text
+    assert "self.tp_worker.update_weights_from_tensor" not in text
+    assert "self.draft_worker.update_weights_from_tensor" not in text
+    assert "self.draft_worker.draft_runner.update_weights_from_tensor" in text
+    assert "self.target_worker.model_runner.update_weights_from_tensor" in text
+    assert "Release the CUDA IPC mapping in the TP process" in text
+    assert "Release the CUDA IPC mapping after EAGLE draft and target loads" in text
+    assert "torch.cuda.synchronize()" in text
+    assert "reductions.shared_cache.clear()" in text
     assert "self.tp_worker.post_process_weights(recv_req)" in text
     assert "self.draft_worker.post_process_weights(recv_req)" in text
 

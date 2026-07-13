@@ -54,3 +54,16 @@ def test_latest_builds_use_one_pinned_sglang_patch():
     ):
         assert obsolete_patch not in dockerfile
         assert not (SLIME_ROOT / "docker/patch/latest" / obsolete_patch).exists()
+
+
+def test_build_conda_prefix_mode_does_not_bootstrap_micromamba():
+    text = (SLIME_ROOT / "build_conda.sh").read_text()
+    prefix_branch = text.split(
+        "else\n  # Preserve the standalone bootstrap", maxsplit=1
+    )[0]
+
+    assert 'SLIME_ENV_PREFIX="${SLIME_ENV_PREFIX:-}"' in prefix_branch
+    assert 'ENV_SELECTOR=(-p "${SLIME_ENV_PREFIX}")' in prefix_branch
+    assert 'conda activate "${SLIME_ENV_PREFIX}"' in prefix_branch
+    assert "micro.mamba.pm" not in prefix_branch
+    assert "source ~/.bashrc" not in prefix_branch

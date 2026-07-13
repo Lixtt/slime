@@ -1,23 +1,47 @@
 #!/bin/bash
 
-set -ex
+set -euxo pipefail
 
-# create conda
-yes '' | "${SHELL}" <(curl -L micro.mamba.pm/install.sh)
-export PS1=tmp
-mkdir -p /root/.cargo/
-touch /root/.cargo/env
-source ~/.bashrc
+SLIME_ENV_PREFIX="${SLIME_ENV_PREFIX:-}"
+SLIME_ENV_NAME="${SLIME_ENV_NAME:-slime}"
 
-# The micromamba installer writes `nodefaults` into ~/.condarc as a channel
-# entry, which newer micromamba versions try to fetch as a real anaconda.org
-# repo (it isn't — it's a meta-tag) and time out on. Strip it.
-if [ -f ~/.condarc ]; then
-  sed -i '/^\s*-\s*nodefaults\s*$/d' ~/.condarc
+env_install() {
+  "${ENV_MANAGER_BIN}" install "${ENV_SELECTOR[@]}" "$@"
+}
+
+if [[ -n "${SLIME_ENV_PREFIX}" ]]; then
+  # Prefix mode is intended for shared clusters and CI: use an existing conda
+  # installation without downloading micromamba or changing shell dotfiles.
+  CONDA_EXE="${CONDA_EXE:-$(command -v conda || true)}"
+  if [[ -z "${CONDA_EXE}" || ! -x "${CONDA_EXE}" ]]; then
+    echo "SLIME_ENV_PREFIX requires an executable CONDA_EXE" >&2
+    exit 2
+  fi
+  ENV_MANAGER_BIN="${CONDA_EXE}"
+  ENV_SELECTOR=(-p "${SLIME_ENV_PREFIX}")
+  if [[ ! -x "${SLIME_ENV_PREFIX}/bin/python" ]]; then
+    "${CONDA_EXE}" create "${ENV_SELECTOR[@]}" python=3.12 pip -c conda-forge -y
+  fi
+  eval "$("${CONDA_EXE}" shell.bash hook)"
+  conda activate "${SLIME_ENV_PREFIX}"
+else
+  # Preserve the standalone bootstrap used by the upstream development image.
+  yes '' | "${SHELL}" <(curl -L micro.mamba.pm/install.sh)
+  export PS1=tmp
+  mkdir -p /root/.cargo/
+  touch /root/.cargo/env
+  source ~/.bashrc
+
+  # The installer may write the `nodefaults` meta-tag as a real channel.
+  if [[ -f ~/.condarc ]]; then
+    sed -i '/^\s*-\s*nodefaults\s*$/d' ~/.condarc
+  fi
+
+  ENV_MANAGER_BIN="$(command -v micromamba)"
+  ENV_SELECTOR=(-n "${SLIME_ENV_NAME}")
+  "${ENV_MANAGER_BIN}" create "${ENV_SELECTOR[@]}" python=3.12 pip -c conda-forge -y
+  micromamba activate "${SLIME_ENV_NAME}"
 fi
-
-micromamba create -n slime python=3.12 pip -c conda-forge -y
-micromamba activate slime
 export CUDA_HOME="$CONDA_PREFIX"
 
 # Keep these in sync with docker/Dockerfile:
@@ -45,7 +69,7 @@ fi
 SGLANG_PATCH="$SLIME_DIR/docker/patch/${PATCH_VERSION}/sglang.patch"
 
 # install cuda 12.9 as it's the default cuda version for torch
-micromamba install -n slime \
+env_install \
   cuda=12.9.1 \
   cuda-nvtx=12.9.79 \
   cuda-nvtx-dev=12.9.79 \
@@ -54,10 +78,10 @@ micromamba install -n slime \
   -c nvidia \
   -c conda-forge \
   -y
-micromamba install -n slime -c conda-forge cudnn -y
+env_install -c conda-forge cudnn -y
 # sglang's editable install builds a Rust extension (sglang-grpc via
 # setuptools-rust), so the conda env needs a working rustc + cargo.
-micromamba install -n slime -c conda-forge rust -y
+env_install -c conda-forge rust -y
 
 pip install cuda-python==12.9
 

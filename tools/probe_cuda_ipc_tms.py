@@ -65,7 +65,7 @@ def _serialize_bucket(size_bytes: int) -> int:
     return len(_serialize_bucket_payload(size_bytes))
 
 
-def _ipc_consumer(connection) -> None:
+def _ipc_consumer(connection, force_gc: bool) -> None:
     try:
         monkey_patch_torch_reductions()
         while True:
@@ -83,7 +83,8 @@ def _ipc_consumer(connection) -> None:
             from torch.multiprocessing import reductions
 
             reductions.shared_cache.clear()
-            gc.collect()
+            if force_gc:
+                gc.collect()
             torch.cuda.ipc_collect()
             connection.send({"ok": True})
     except BaseException as exc:
@@ -142,6 +143,7 @@ def _run_after_tms_pause(
     paused_allocation_bytes: int,
     repeats: int,
     memory_sample_interval: int,
+    consumer_force_gc: bool,
 ):
     resident = []
     paused = False
@@ -150,7 +152,10 @@ def _run_after_tms_pause(
     try:
         context = torch.multiprocessing.get_context("spawn")
         producer_connection, consumer_connection = context.Pipe()
-        consumer = context.Process(target=_ipc_consumer, args=(consumer_connection,))
+        consumer = context.Process(
+            target=_ipc_consumer,
+            args=(consumer_connection, consumer_force_gc),
+        )
         consumer.start()
         consumer_connection.close()
 
@@ -180,10 +185,6 @@ def _run_after_tms_pause(
                         f"{iteration}: {consumer_result.get('error_type')}: {consumer_result.get('error')}"
                     )
                 del payload, consumer_result
-                from torch.multiprocessing import reductions
-
-                reductions.shared_cache.clear()
-                gc.collect()
                 torch.cuda.ipc_collect()
                 if iteration % memory_sample_interval == 0 or iteration == repeats:
                     memory_samples.append(_memory_snapshot(iteration))
@@ -211,6 +212,7 @@ def _run_after_tms_pause(
             "memory_samples": memory_samples,
             "free_memory_loss_bytes": free_memory_loss_bytes,
             "consumer_exitcode": consumer_exitcode,
+            "consumer_force_gc": consumer_force_gc,
         }
     except Exception as exc:
         return {
@@ -260,6 +262,7 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=256)
     parser.add_argument("--memory-sample-interval", type=int, default=16)
     parser.add_argument("--max-free-memory-loss-mib", type=int, default=1024)
+    parser.add_argument("--consumer-force-gc", action="store_true")
     parser.add_argument("--output-json")
     parser.add_argument(
         "--cases",
@@ -287,6 +290,7 @@ def main() -> int:
             args.paused_allocation_mib * 1024 * 1024,
             args.repeats,
             args.memory_sample_interval,
+            args.consumer_force_gc,
         ),
         "tms_active": lambda: _run_case("tms_active", size_bytes, _no_context),
         "tms_disable_mem_pool": lambda: _run_case(
@@ -303,6 +307,11 @@ def main() -> int:
     unknown_cases = sorted(set(selected_cases) - set(case_runners))
     if unknown_cases:
         raise ValueError(f"Unknown cases: {unknown_cases}")
+    if not initial_state:
+        raise RuntimeError(
+            "probe requires the production actor TMS lifecycle; set TMS_INIT_ENABLE=1"
+        )
+    active_state = initial_state
     results = [case_runners[case]() for case in selected_cases]
     report = {
         "schema": "openclaw.cuda-ipc-tms-probe/v1",
@@ -311,6 +320,7 @@ def main() -> int:
         "torch_version": torch.__version__,
         "size_bytes": size_bytes,
         "initial_tms_interesting_region": initial_state,
+        "active_tms_interesting_region": active_state,
         "results": results,
     }
     if args.output_json:
@@ -337,8 +347,8 @@ def main() -> int:
             else 1
         )
 
-    # This probe intentionally creates producer-only CUDA IPC handles. Avoid
-    # PyTorch's process-exit warning/segfault for handles with no real consumer.
+    # Repeated CUDA IPC setup/teardown can trip PyTorch's process-exit cleanup
+    # after all measurements are already durable. Exit without re-running it.
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(exit_code)

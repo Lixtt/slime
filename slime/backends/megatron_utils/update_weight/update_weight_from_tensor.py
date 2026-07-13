@@ -1,4 +1,3 @@
-import gc
 import logging
 import os
 from argparse import Namespace
@@ -37,18 +36,12 @@ def _weight_sync_memory_log_interval() -> int:
         return 0
 
 
-def _release_cuda_ipc_producer_cache() -> int:
-    """Release producer-side CUDA IPC handles after all consumers returned."""
-    from torch.multiprocessing import reductions
-
-    cache_entries = len(reductions.shared_cache)
-    reductions.shared_cache.clear()
-    gc.collect()
+def _collect_released_cuda_ipc_handles() -> None:
+    """Let the producer reclaim mappings already closed by SGLang consumers."""
     torch.cuda.ipc_collect()
-    return cache_entries
 
 
-def _log_weight_sync_memory(bucket_index: int, released_cache_entries: int) -> None:
+def _log_weight_sync_memory(bucket_index: int) -> None:
     interval = _weight_sync_memory_log_interval()
     if interval <= 0 or (bucket_index != 1 and bucket_index % interval != 0):
         return
@@ -57,13 +50,12 @@ def _log_weight_sync_memory(bucket_index: int, released_cache_entries: int) -> N
     gib = 1024**3
     logger.info(
         "Weight sync memory after bucket=%d: free_gib=%.2f total_gib=%.2f "
-        "allocated_gib=%.2f reserved_gib=%.2f released_ipc_cache_entries=%d",
+        "allocated_gib=%.2f reserved_gib=%.2f",
         bucket_index,
         free_bytes / gib,
         total_bytes / gib,
         torch.cuda.memory_allocated() / gib,
         torch.cuda.memory_reserved() / gib,
-        released_cache_entries,
     )
 
 
@@ -216,20 +208,19 @@ class UpdateWeightFromTensor:
         ):
             refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
             ray.get(refs)
-            # Free GPU tensors so the outer torch_memory_saver.disable() pool
-            # can reuse the blocks. MultiprocessingSerializer registers every
-            # exported storage in a process-local shared cache; ipc_collect()
-            # alone does not evict those entries, so a many-bucket full sync can
-            # otherwise retain tens of GiB after every consumer returned.
+            # The engine RPC is synchronous: target and draft loads have both
+            # returned before the producer owner is dropped. The SGLang-side
+            # outer update boundary closes its consumer mapping; ipc_collect()
+            # then lets this process reclaim the exported allocation.
             del long_lived_tensors, hf_named_tensors
-            released_cache_entries = _release_cuda_ipc_producer_cache()
+            _collect_released_cuda_ipc_handles()
             if rank == 0:
-                _log_weight_sync_memory(bucket_index, released_cache_entries)
+                _log_weight_sync_memory(bucket_index)
 
         dist.barrier(group=get_gloo_group())
         # After the barrier all engines have returned, so every rank's last-chunk
         # IPC handles are now released by the consumers.  Clean them up.
-        _release_cuda_ipc_producer_cache()
+        _collect_released_cuda_ipc_handles()
 
         # int4/fp4 post_process
         if rank == 0:

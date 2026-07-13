@@ -194,25 +194,14 @@ def test_flattened_cuda_ipc_bucket_rejects_active_tms(monkeypatch):
         module._flatten_and_serialize_for_cuda_ipc([("weight", fake_cuda_tensor)])
 
 
-def test_release_cuda_ipc_producer_cache_clears_before_collect(monkeypatch):
+def test_collect_released_cuda_ipc_handles_uses_lightweight_cuda_collect(monkeypatch):
     module = _load_update_weight_module_with_stubs(monkeypatch)
     events = []
-
-    class FakeSharedCache(dict):
-        def clear(self):
-            events.append("clear")
-            super().clear()
-
-    shared_cache = FakeSharedCache({"a": object(), "b": object()})
-    monkeypatch.setattr(torch.multiprocessing.reductions, "shared_cache", shared_cache)
-    monkeypatch.setattr(module.gc, "collect", lambda: events.append("gc"))
     monkeypatch.setattr(module.torch.cuda, "ipc_collect", lambda: events.append("ipc_collect"))
 
-    released = module._release_cuda_ipc_producer_cache()
+    module._collect_released_cuda_ipc_handles()
 
-    assert released == 2
-    assert shared_cache == {}
-    assert events == ["clear", "gc", "ipc_collect"]
+    assert events == ["ipc_collect"]
 
 
 def test_connect_rollout_engines_maps_single_node_colocated_engine(monkeypatch):

@@ -222,9 +222,12 @@ class UpdateWeightFromTensor:
         # IPC handles are now released by the consumers.  Clean them up.
         _collect_released_cuda_ipc_handles()
 
-        # int4/fp4 post_process
         if rank == 0:
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            # Refresh fused/packed tensors derived from the updated quantized weights.
+            if self.quantization_config and self.quantization_config["quant_method"] in [
+                "compressed-tensors",
+                "fp8",
+            ]:
                 post_process_weights(
                     restore_weights_before_load=False,
                     post_process_quantization=True,

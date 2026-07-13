@@ -204,6 +204,34 @@ def test_collect_released_cuda_ipc_handles_uses_lightweight_cuda_collect(monkeyp
     assert events == ["ipc_collect"]
 
 
+def test_fp8_tensor_update_refreshes_quantized_weights(monkeypatch):
+    module = _load_update_weight_module_with_stubs(monkeypatch)
+    post_process_calls = []
+    updater = object.__new__(module.UpdateWeightFromTensor)
+    updater.weight_version = 0
+    updater.rollout_engines = []
+    updater.quantization_config = {"quant_method": "fp8"}
+    updater.weights_getter = lambda: {}
+    updater._hf_weight_iterator = types.SimpleNamespace(get_hf_weight_chunks=lambda _weights: [])
+
+    monkeypatch.setattr(module.ray, "get", lambda _refs: None, raising=False)
+    monkeypatch.setattr(module.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(module.dist, "barrier", lambda group=None: None)
+    monkeypatch.setattr(module, "_collect_released_cuda_ipc_handles", lambda: None)
+    monkeypatch.setattr(
+        module,
+        "post_process_weights",
+        lambda **kwargs: post_process_calls.append(kwargs),
+    )
+
+    updater.update_weights()
+
+    assert updater.weight_version == 1
+    assert len(post_process_calls) == 1
+    assert post_process_calls[0]["restore_weights_before_load"] is False
+    assert post_process_calls[0]["post_process_quantization"] is True
+
+
 def test_connect_rollout_engines_maps_single_node_colocated_engine(monkeypatch):
     module = _load_update_weight_module_with_stubs(monkeypatch)
     updater = object.__new__(module.UpdateWeightFromTensor)

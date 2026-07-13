@@ -154,7 +154,13 @@ fi
 # Online RL needs SGLang's autoregressive runtime. The `all` extra adds
 # diffusion, tracing, and HTTP/2 stacks that are part of the general Docker
 # image but not the Slime runtime and greatly expand resolver/network failure.
-pip install -e "python" --extra-index-url https://download.pytorch.org/whl/cu129
+if [[ "${SKIP_SGLANG_DEPENDENCY_RESOLUTION:-0}" != "1" ]]; then
+  pip install -e "python" --extra-index-url https://download.pytorch.org/whl/cu129
+else
+  # Resume a previously dependency-resolved build without letting SGLang's
+  # cu13-oriented metadata replace the pinned cu129 Torch stack again.
+  pip install -e "python" --no-deps
+fi
 mapfile -t cuda13_packages < <(
   pip list --format=freeze \
     | awk -F'==' '/-cu13(==|$)/ {print $1}'

@@ -8,6 +8,7 @@ import os
 import sys
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from sglang.srt.utils import MultiprocessingSerializer
@@ -18,7 +19,9 @@ from torch_memory_saver import torch_memory_saver
 
 def _interesting_region() -> bool:
     torch_memory_saver._ensure_initialized()
-    return bool(torch_memory_saver._impl._binary_wrapper.cdll.tms_get_interesting_region())
+    return bool(
+        torch_memory_saver._impl._binary_wrapper.cdll.tms_get_interesting_region()
+    )
 
 
 @contextmanager
@@ -65,7 +68,89 @@ def _serialize_bucket(size_bytes: int) -> int:
     return len(_serialize_bucket_payload(size_bytes))
 
 
-def _ipc_consumer(connection, force_gc: bool) -> None:
+class _SynchronizingWeightRunner:
+    def update_weights_from_tensor(self, *, named_tensors, load_format):
+        if load_format != "flattened_bucket":
+            return False, f"unexpected load_format={load_format}"
+        flattened = named_tensors["flattened_tensor"]
+        if flattened.is_cuda:
+            torch.cuda.synchronize(flattened.device)
+        return True, "ok"
+
+
+def _consume_with_production_path(payload: str, consumer_path: str) -> None:
+    from sglang.srt.managers.scheduler_components.weight_updater import (
+        SchedulerWeightUpdaterManager,
+    )
+    from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+
+    request = SimpleNamespace(
+        serialized_named_tensors=[payload],
+        load_format="flattened_bucket",
+        disable_draft_model=False,
+        flush_cache=False,
+        torch_empty_cache=False,
+    )
+    target_worker = SimpleNamespace(
+        tp_rank=0,
+        pp_rank=0,
+        model_runner=_SynchronizingWeightRunner(),
+    )
+    eagle_worker = SimpleNamespace(
+        tp_rank=0,
+        draft_worker=SimpleNamespace(draft_runner=_SynchronizingWeightRunner()),
+        target_worker=target_worker,
+    )
+
+    if consumer_path in {"production_tp", "production_eagle"}:
+        success, message = TpModelWorker.update_weights_from_tensor(
+            target_worker, request
+        )
+        if not success:
+            raise RuntimeError(f"TP tensor update failed: {message}")
+
+    if consumer_path in {"production_eagle_only", "production_eagle"}:
+        success, message = EAGLEWorkerV2.update_weights_from_tensor(
+            eagle_worker, request
+        )
+        if not success:
+            raise RuntimeError(f"EAGLE tensor update failed: {message}")
+
+    if consumer_path == "production_scheduler_eagle":
+        calls: list[str] = []
+
+        class TpProxy:
+            def update_weights_from_tensor(self, recv_req):
+                calls.append("tp")
+                return TpModelWorker.update_weights_from_tensor(target_worker, recv_req)
+
+        class EagleProxy:
+            def update_weights_from_tensor(self, recv_req):
+                calls.append("eagle")
+                return EAGLEWorkerV2.update_weights_from_tensor(eagle_worker, recv_req)
+
+        scheduler = SchedulerWeightUpdaterManager(
+            tp_worker=TpProxy(),
+            draft_worker=EagleProxy(),
+            tp_cpu_group=None,
+            memory_saver_adapter=None,
+            flush_cache=lambda **_kwargs: True,
+            is_fully_idle=lambda: True,
+        )
+        original_barrier = torch.distributed.barrier
+        torch.distributed.barrier = lambda *args, **kwargs: None
+        try:
+            response = scheduler.update_weights_from_tensor(request)
+        finally:
+            torch.distributed.barrier = original_barrier
+        if not response.success:
+            raise RuntimeError(f"scheduler tensor update failed: {response.message}")
+        if calls != ["eagle"]:
+            raise RuntimeError(f"scheduler did not single-dispatch to EAGLE: {calls}")
+
+
+def _ipc_consumer(connection, force_gc: bool, consumer_path: str) -> None:
     try:
         monkey_patch_torch_reductions()
         while True:
@@ -74,18 +159,24 @@ def _ipc_consumer(connection, force_gc: bool) -> None:
                 connection.send({"ok": True, "stopped": True})
                 return
 
-            tensor_data = MultiprocessingSerializer.deserialize(payload)
-            flattened = tensor_data["flattened_tensor"]
-            if flattened.is_cuda:
-                torch.cuda.synchronize(flattened.device)
-            del flattened, tensor_data, payload
+            if consumer_path.startswith("production_"):
+                _consume_with_production_path(payload, consumer_path)
+                del payload
+                if force_gc:
+                    gc.collect()
+            else:
+                tensor_data = MultiprocessingSerializer.deserialize(payload)
+                flattened = tensor_data["flattened_tensor"]
+                if flattened.is_cuda:
+                    torch.cuda.synchronize(flattened.device)
+                del flattened, tensor_data, payload
 
-            from torch.multiprocessing import reductions
+                from torch.multiprocessing import reductions
 
-            reductions.shared_cache.clear()
-            if force_gc:
-                gc.collect()
-            torch.cuda.ipc_collect()
+                reductions.shared_cache.clear()
+                if force_gc:
+                    gc.collect()
+                torch.cuda.ipc_collect()
             connection.send({"ok": True})
     except BaseException as exc:
         connection.send(
@@ -144,6 +235,7 @@ def _run_after_tms_pause(
     repeats: int,
     memory_sample_interval: int,
     consumer_force_gc: bool,
+    consumer_path: str,
 ):
     resident = []
     paused = False
@@ -154,7 +246,7 @@ def _run_after_tms_pause(
         producer_connection, consumer_connection = context.Pipe()
         consumer = context.Process(
             target=_ipc_consumer,
-            args=(consumer_connection, consumer_force_gc),
+            args=(consumer_connection, consumer_force_gc, consumer_path),
         )
         consumer.start()
         consumer_connection.close()
@@ -163,7 +255,9 @@ def _run_after_tms_pause(
         remaining = paused_allocation_bytes
         while remaining > 0:
             allocation_bytes = min(chunk_bytes, remaining)
-            resident.append(torch.zeros(allocation_bytes, dtype=torch.uint8, device="cuda"))
+            resident.append(
+                torch.zeros(allocation_bytes, dtype=torch.uint8, device="cuda")
+            )
             remaining -= allocation_bytes
         torch.cuda.synchronize()
         torch_memory_saver.pause()
@@ -177,7 +271,9 @@ def _run_after_tms_pause(
                 payload_bytes.append(len(payload))
                 producer_connection.send(payload)
                 if not producer_connection.poll(120):
-                    raise TimeoutError(f"CUDA IPC consumer timed out at iteration {iteration}")
+                    raise TimeoutError(
+                        f"CUDA IPC consumer timed out at iteration {iteration}"
+                    )
                 consumer_result = producer_connection.recv()
                 if not consumer_result.get("ok"):
                     raise RuntimeError(
@@ -189,7 +285,9 @@ def _run_after_tms_pause(
                 if iteration % memory_sample_interval == 0 or iteration == repeats:
                     memory_samples.append(_memory_snapshot(iteration))
         min_free_bytes = min(sample["free_bytes"] for sample in memory_samples)
-        free_memory_loss_bytes = max(0, memory_samples[0]["free_bytes"] - min_free_bytes)
+        free_memory_loss_bytes = max(
+            0, memory_samples[0]["free_bytes"] - min_free_bytes
+        )
         producer_connection.send(None)
         if not producer_connection.poll(30):
             raise TimeoutError("CUDA IPC consumer did not stop cleanly")
@@ -213,6 +311,7 @@ def _run_after_tms_pause(
             "free_memory_loss_bytes": free_memory_loss_bytes,
             "consumer_exitcode": consumer_exitcode,
             "consumer_force_gc": consumer_force_gc,
+            "consumer_path": consumer_path,
         }
     except Exception as exc:
         return {
@@ -263,6 +362,17 @@ def main() -> int:
     parser.add_argument("--memory-sample-interval", type=int, default=16)
     parser.add_argument("--max-free-memory-loss-mib", type=int, default=1024)
     parser.add_argument("--consumer-force-gc", action="store_true")
+    parser.add_argument(
+        "--consumer-path",
+        choices=(
+            "manual",
+            "production_tp",
+            "production_eagle_only",
+            "production_eagle",
+            "production_scheduler_eagle",
+        ),
+        default="manual",
+    )
     parser.add_argument("--output-json")
     parser.add_argument(
         "--cases",
@@ -281,7 +391,9 @@ def main() -> int:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     monkey_patch_torch_reductions()
-    size_bytes = args.size_bytes if args.size_bytes is not None else args.size_mib * 1024 * 1024
+    size_bytes = (
+        args.size_bytes if args.size_bytes is not None else args.size_mib * 1024 * 1024
+    )
 
     initial_state = _interesting_region()
     case_runners = {
@@ -291,6 +403,7 @@ def main() -> int:
             args.repeats,
             args.memory_sample_interval,
             args.consumer_force_gc,
+            args.consumer_path,
         ),
         "tms_active": lambda: _run_case("tms_active", size_bytes, _no_context),
         "tms_disable_mem_pool": lambda: _run_case(
@@ -321,19 +434,24 @@ def main() -> int:
         "size_bytes": size_bytes,
         "initial_tms_interesting_region": initial_state,
         "active_tms_interesting_region": active_state,
+        "consumer_path": args.consumer_path,
         "results": results,
     }
     if args.output_json:
         output_path = Path(args.output_json)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        output_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
     print(json.dumps(report, indent=2, sort_keys=True), flush=True)
 
     exit_code = 0
     if args.require_tms_disable_pass:
         required_names = {"after_tms_pause", "tms_disable_mem_pool"}
         required = [item for item in results if item["name"] in required_names]
-        paused_result = next((item for item in required if item["name"] == "after_tms_pause"), None)
+        paused_result = next(
+            (item for item in required if item["name"] == "after_tms_pause"), None
+        )
         memory_bounded = (
             paused_result is not None
             and paused_result.get("free_memory_loss_bytes", 0)

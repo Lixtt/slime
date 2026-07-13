@@ -17,7 +17,6 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
-from slime.utils.megatron_bridge_utils import patch_auto_bridge_hf_config
 from slime.utils.misc import load_function
 
 
@@ -82,26 +81,102 @@ def _get_model_provider_func(
         return wrapped_model_provider
 
     if args.megatron_to_hf_mode == "bridge":
-        from megatron.bridge import AutoBridge
+        from megatron.core.transformer.enums import AttnBackend
 
-        import slime_plugins.megatron_bridge  # noqa: F401  # register custom bridges
-
-        bridge = patch_auto_bridge_hf_config(AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True))
-        provider = bridge.to_megatron_provider(load_weights=False)
+        bridge, hf_pretrained, is_local_bridge = load_function(
+            "slime.utils.megatron_bridge_utils.build_bridge_for_hf_checkpoint"
+        )(args.hf_checkpoint, load_weights=False)
+        if is_local_bridge:
+            provider = bridge.provider_bridge(hf_pretrained)
+        else:
+            provider = bridge.to_megatron_provider(load_weights=False)
+        print(
+            "Qwen35 bridge debug: "
+            f"bridge={type(bridge).__module__}.{type(bridge).__name__} "
+            f"provider={type(provider).__module__}.{type(provider).__name__} "
+            f"is_local_bridge={is_local_bridge}"
+        )
         # TODO: we should not manually set this...
         provider.tensor_model_parallel_size = args.tensor_model_parallel_size
         provider.pipeline_model_parallel_size = args.pipeline_model_parallel_size
         provider.expert_model_parallel_size = args.expert_model_parallel_size
         provider.expert_tensor_parallel_size = args.expert_tensor_parallel_size
         provider.sequence_parallel = args.sequence_parallel
-        provider.context_parallel_size = args.context_parallel_size
-        provider.variable_seq_lengths = args.variable_seq_lengths
+        if hasattr(args, "context_parallel_size"):
+            provider.context_parallel_size = args.context_parallel_size
+        if hasattr(args, "variable_seq_lengths"):
+            provider.variable_seq_lengths = args.variable_seq_lengths
         if hasattr(args, "moe_token_dispatcher_type"):
             provider.moe_token_dispatcher_type = args.moe_token_dispatcher_type
         if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
             provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
         if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
             provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
+        # Bridge providers are constructed from HF config and ignore most CLI flags
+        # forwarded to TransformerConfig in the raw path. Activation-recompute is
+        # the most consequential one for long-context RL memory.
+        skip_full_recompute = (
+            getattr(args, "recompute_granularity", None) == "full"
+            and bool(getattr(provider, "deepstack_visual_indexes", None))
+        )
+        if skip_full_recompute:
+            print(
+                "Bridge provider: skipped full activation recompute for "
+                f"{type(provider).__name__} with deepstack visual features"
+            )
+        elif getattr(args, "recompute_granularity", None) is not None:
+            provider.recompute_granularity = args.recompute_granularity
+            provider.recompute_method = args.recompute_method
+            provider.recompute_num_layers = args.recompute_num_layers
+
+        _BRIDGE_FORWARDED_ARGS = (
+            "attention_dropout",
+            "hidden_dropout",
+            "attention_softmax_in_fp32",
+            "accumulate_allreduce_grads_in_fp32",
+            "fp16_lm_cross_entropy",
+            "cross_entropy_loss_fusion",
+            "cross_entropy_fusion_impl",
+            "attention_backend",
+            "apply_rope_fusion",
+            "bias_swiglu_fusion",
+            "bias_dropout_fusion",
+            "bias_gelu_fusion",
+            "masked_softmax_fusion",
+            "gradient_accumulation_fusion",
+            "async_tensor_model_parallel_allreduce",
+            "tp_comm_overlap",
+            "context_parallel_size",
+            "params_dtype",
+            "bf16",
+            "fp16",
+        )
+        forwarded = []
+        skipped = []
+        for name in _BRIDGE_FORWARDED_ARGS:
+            if not hasattr(args, name):
+                continue
+            value = getattr(args, name)
+            if value is None:
+                continue
+            if not hasattr(provider, name):
+                skipped.append(name)
+                continue
+            setattr(provider, name, value)
+            forwarded.append((name, value))
+        if forwarded:
+            print("Bridge provider: forwarded CLI flags -> " + ", ".join(f"{n}={v}" for n, v in forwarded))
+        if skipped:
+            print("Bridge provider: skipped CLI flags not exposed by provider -> " + ", ".join(skipped))
+
+        if getattr(args, "fallback_to_eager_attn", False):
+            provider.attention_backend = AttnBackend.local
+        if getattr(args, "transformer_impl", None) == "local" and hasattr(provider, "transformer_layer_spec"):
+            from megatron.bridge.models.gpt_provider import local_layer_spec
+
+            provider.transformer_layer_spec = local_layer_spec
+            print("Bridge provider: using local transformer layer spec")
+        provider.use_transformer_engine = getattr(args, "transformer_impl", None) == "transformer_engine"
         provider.finalize()
 
         if role == "critic":
@@ -170,6 +245,7 @@ def _get_model_provider_func(
                         qk_layernorm=args.qk_layernorm,
                         multi_latent_attention=args.multi_latent_attention,
                         moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
+                        fallback_to_eager_attn=getattr(args, "fallback_to_eager_attn", False),
                     )
                 else:
                     transformer_layer_spec = get_gpt_layer_local_spec(

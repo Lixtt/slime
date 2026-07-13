@@ -1,6 +1,7 @@
 import argparse
 import os
 
+import megatron.bridge.training.checkpointing as _checkpointing_module
 import megatron.bridge.training.model_load_save as _model_load_save_module
 from megatron.bridge import AutoBridge
 
@@ -11,6 +12,7 @@ from slime.utils.megatron_bridge_utils import patch_auto_bridge_hf_config
 # by Megatron and lack of provider information.
 _provider_override = {}
 _original_load_model_config = _model_load_save_module.load_model_config
+_original_load_model_weights_from_checkpoint = _checkpointing_module._load_model_weights_from_checkpoint
 
 
 def _patched_load_model_config(checkpoint_path):
@@ -26,6 +28,25 @@ def _patched_load_model_config(checkpoint_path):
 
 
 _model_load_save_module.load_model_config = _patched_load_model_config
+
+
+def _patch_dist_ckpt_strictness(strictness):
+    def _patched_load_model_weights_from_checkpoint(*args, **kwargs):
+        kwargs.setdefault("dist_ckpt_strictness", strictness)
+        print(f"[convert] Loading distributed checkpoint with dist_ckpt_strictness={kwargs['dist_ckpt_strictness']}")
+        return _original_load_model_weights_from_checkpoint(*args, **kwargs)
+
+    _checkpointing_module._load_model_weights_from_checkpoint = _patched_load_model_weights_from_checkpoint
+
+
+def _set_provider_attr(provider, name, value):
+    if not hasattr(provider, name):
+        print(f"[convert] Provider {type(provider).__name__} has no {name}; skipped override")
+        return False
+    old_value = getattr(provider, name)
+    setattr(provider, name, value)
+    print(f"[convert] Provider override: {name}={old_value!r} -> {value!r}")
+    return True
 
 
 if __name__ == "__main__":
@@ -45,10 +66,40 @@ if __name__ == "__main__":
     parser.add_argument(
         "-f", "--force", action="store_true", help="Force overwrite the output directory if it exists."
     )
+    parser.add_argument(
+        "--keep-gradient-accumulation-fusion",
+        action="store_true",
+        help=(
+            "Keep Bridge provider gradient_accumulation_fusion enabled. By default the converter disables it "
+            "because export does not need weight-gradient fusion and many runtime images lack the APEX "
+            "fused_weight_gradient_mlp_cuda extension required by Megatron Core's ColumnParallelLinear."
+        ),
+    )
+    parser.add_argument(
+        "--dist-ckpt-strictness",
+        default="ignore_all",
+        choices=[
+            "assume_ok_unexpected",
+            "log_unexpected",
+            "log_all",
+            "raise_unexpected",
+            "raise_all",
+            "return_unexpected",
+            "return_all",
+            "ignore_all",
+        ],
+        help=(
+            "Megatron distributed-checkpoint mismatch handling used while loading the source checkpoint. "
+            "The default ignore_all avoids export failures on non-weight _extra_state keys that may be "
+            "present in the runtime model state dict but absent from older checkpoints."
+        ),
+    )
     args = parser.parse_args()
 
     if os.path.exists(args.output_dir) and not args.force:
         raise ValueError(f"Output directory {args.output_dir} already exists. Use --force to overwrite it.")
+
+    _patch_dist_ckpt_strictness(args.dist_ckpt_strictness)
 
     print(f"Loading config from {args.origin_hf_dir}")
     bridge = patch_auto_bridge_hf_config(AutoBridge.from_hf_pretrained(args.origin_hf_dir, trust_remote_code=True))
@@ -56,6 +107,8 @@ if __name__ == "__main__":
     # Use Bridge's provider so the correct model class is created (e.g., Qwen3VLModel
     # instead of GPTModel). This is needed because MLM checkpoints lack run_config.yaml.
     provider = bridge.to_megatron_provider(load_weights=False)
+    if not args.keep_gradient_accumulation_fusion:
+        _set_provider_attr(provider, "gradient_accumulation_fusion", False)
     _provider_override["provider"] = provider
     print(f"[convert] Using Bridge provider: {type(provider).__name__}")
 

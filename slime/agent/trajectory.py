@@ -237,7 +237,7 @@ class _SampleBuilder:
         return Sample(
             index=base_sample.index,
             group_index=base_sample.group_index,
-            rollout_id=base_sample.rollout_id if base_sample.rollout_id is not None else base_sample.index,
+            group_id=base_sample.group_id if base_sample.group_id is not None else base_sample.index,
             prompt=base_sample.prompt,
             label=base_sample.label,
             tokens=list(self.tokens),

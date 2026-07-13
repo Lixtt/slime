@@ -6,7 +6,6 @@ import os
 from argparse import Namespace
 from collections.abc import Callable, Sequence
 from functools import partial
-from pathlib import Path
 
 import torch
 from megatron.core import mpu
@@ -425,6 +424,9 @@ def forward_only(
                     origin_values[origin_index] = value
                 values = origin_values
             rollout_data[f"{store_prefix}{key}"] = values
+
+    # Release references to intermediate forward tensors before returning.
+    del forward_data_store
     return rollout_data
 
 
@@ -885,7 +887,6 @@ def save(
     )
     if should_disable_forward_pre_hook(args):
         enable_forward_pre_hook(model)
-
 
 def initialize_model_and_optimizer(
     args: Namespace, role: str = "actor"

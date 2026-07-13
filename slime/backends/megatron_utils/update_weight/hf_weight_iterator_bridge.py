@@ -39,27 +39,41 @@ def _patch_bridge_expert_cache_to_cpu():
 class HfWeightIteratorBridge(HfWeightIteratorBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
-        from megatron.bridge import AutoBridge
-
-        import slime_plugins.megatron_bridge  # noqa: F401
-
-        self._bridge = megatron_bridge_utils.patch_auto_bridge_hf_config(
-            AutoBridge.from_hf_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
+        self._bridge, self._hf_pretrained, _ = megatron_bridge_utils.build_bridge_for_hf_checkpoint(
+            self.args.hf_checkpoint,
+            load_weights=False,
         )
+        if self._hf_pretrained is not None and getattr(self._bridge, "hf_pretrained", None) is None:
+            self._bridge.hf_pretrained = self._hf_pretrained
         _patch_bridge_expert_cache_to_cpu()
 
     def get_hf_weight_chunks(self, megatron_local_weights, progress_desc: str = "Update weights"):
         # TODO support quantization (e.g. modify megatron-bridge to provide megatron param name)
         renamed_megatron_local_weights = {strip_param_name_prefix(k): v for k, v in megatron_local_weights.items()}
         with megatron_bridge_utils.patch_megatron_model(self.model):
-            conversion_tasks = self._bridge.get_conversion_tasks(self.model)
+            if hasattr(self._bridge, "get_conversion_tasks"):
+                conversion_tasks = self._bridge.get_conversion_tasks(self.model)
+            else:
+                conversion_tasks = self._bridge.build_conversion_tasks(self._hf_pretrained, self.model)
             conversion_tasks = _process_conversion_tasks(conversion_tasks, renamed_megatron_local_weights)
 
-            named_weights = self._bridge.export_hf_weights(self.model, cpu=False, conversion_tasks=conversion_tasks)
+            if hasattr(self._bridge, "export_hf_weights"):
+                named_weights = self._bridge.export_hf_weights(self.model, cpu=False, conversion_tasks=conversion_tasks)
+            else:
+                named_weights = self._bridge.stream_weights_megatron_to_hf(
+                    self.model,
+                    self._hf_pretrained,
+                    cpu=False,
+                    conversion_tasks=conversion_tasks,
+                )
+
+            hf_to_megatron_name = _hf_to_megatron_name_map(conversion_tasks)
 
             def _streaming_quantized():
-                for hf_param_name, weight, megatron_param_name in named_weights:
+                for hf_param_name, weight, megatron_param_name in _iter_named_weights_with_megatron_names(
+                    named_weights,
+                    hf_to_megatron_name,
+                ):
                     processed_weight = postprocess_hf_param(
                         args=self.args,
                         megatron_param_name=megatron_param_name,
@@ -110,3 +124,39 @@ class _MapWithLen:
     def __iter__(self):
         for x in self.xs:
             yield self.fn(x)
+
+
+def _hf_to_megatron_name_map(conversion_tasks):
+    """Best-effort map for bridge outputs that do not include Megatron names."""
+    ret = {}
+    for task in conversion_tasks:
+        if task is None:
+            continue
+        mapping = getattr(task, "mapping", None)
+        hf_param = getattr(mapping, "hf_param", None)
+        megatron_name = getattr(task, "global_param_name", None) or getattr(task, "param_name", None)
+        if not megatron_name:
+            continue
+        if isinstance(hf_param, str):
+            ret[hf_param] = megatron_name
+        elif isinstance(hf_param, dict):
+            for name in hf_param.values():
+                ret[name] = megatron_name
+
+    ret.setdefault("lm_head.weight", "output_layer.weight")
+    for hf_name in list(ret):
+        if hf_name.endswith(".embed_tokens.weight"):
+            ret.setdefault(hf_name, "embedding.word_embeddings.weight")
+    return ret
+
+
+def _iter_named_weights_with_megatron_names(named_weights, hf_to_megatron_name):
+    for item in named_weights:
+        if len(item) == 3:
+            hf_param_name, weight, megatron_param_name = item
+        elif len(item) == 2:
+            hf_param_name, weight = item
+            megatron_param_name = hf_to_megatron_name.get(hf_param_name, hf_param_name)
+        else:
+            raise ValueError(f"Unexpected bridge weight tuple length: {len(item)}")
+        yield hf_param_name, weight, megatron_param_name

@@ -11,8 +11,7 @@ import sglang_router
 from packaging.version import parse
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
-from urllib3.exceptions import NewConnectionError
-
+from .qwen3_5 import is_qwen35_model_path, maybe_prepare_qwen35_text_model, patch_sglang_qwen35
 from slime.backends.sglang_utils.external import get_server_info
 from slime.ray.ray_actor import RayActor
 from slime.utils.http_utils import get_host_info
@@ -27,6 +26,9 @@ def get_base_gpu_id(args, rank):
     else:
         num_actor_gpus = 0 if args.debug_rollout_only else args.actor_num_gpus_per_node * args.actor_num_nodes
         start_index = (num_actor_gpus + rank * num_gpus) % args.num_gpus_per_node
+        if getattr(args, "use_critic", False):
+            num_critic_gpus = args.critic_num_gpus_per_node * args.critic_num_nodes
+            start_index = (num_actor_gpus + num_critic_gpus + rank * num_gpus) % args.num_gpus_per_node
     return start_index
 
 
@@ -58,11 +60,9 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
             wait_for_server=True,
         )
 
-    from sglang.srt.entrypoints.http_server import launch_server
-
     multiprocessing.set_start_method("spawn", force=True)
     server_args.host = server_args.host.strip("[]")
-    p = multiprocessing.Process(target=launch_server, args=(server_args,))
+    p = multiprocessing.Process(target=_launch_server_entry, args=(server_args,))
     p.start()
 
     if getattr(server_args, "node_rank", 0) != 0:
@@ -77,6 +77,16 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     return p
 
 
+def _launch_server_entry(server_args: ServerArgs):
+    try:
+        patch_sglang_qwen35()
+    except (ImportError, ModuleNotFoundError):
+        pass
+    from sglang.srt.entrypoints.http_server import launch_server
+
+    launch_server(server_args)
+
+
 def _wait_server_healthy(base_url, api_key, is_process_alive):
     headers = {
         "Content-Type": "application/json; charset=utf-8",
@@ -86,8 +96,31 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
     with requests.Session() as session:
         while True:
             try:
-                response = session.get(f"{base_url}/health_generate", headers=headers)
+                healthy = False
+                for endpoint in ("/health", "/health_generate"):
+                    response = session.get(f"{base_url}{endpoint}", headers=headers, timeout=5)
+                    if response.status_code == 200:
+                        healthy = True
+                        break
+                    if endpoint == "/health" and response.status_code == 404:
+                        continue
+                if healthy:
+                    break
+            except requests.RequestException:
+                pass
+
+            if not is_process_alive():
+                raise Exception("Server process terminated unexpectedly.")
+
+            time.sleep(2)
+
+        # Make sure the working queue is empty before offload or weight update.
+        while True:
+            try:
+                response = session.get(f"{base_url}/flush_cache", headers=headers, timeout=5)
                 if response.status_code == 200:
+                    break
+                if response.status_code == 400 and "Cache flushed." in response.text:
                     break
             except requests.RequestException:
                 pass
@@ -557,12 +590,26 @@ def _compute_server_args(
     num_gpus_per_engine: int | None = None,
 ):
     _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
+    original_model_path = getattr(args, "rollout_model_path", None) or args.hf_checkpoint
+    model_path = maybe_prepare_qwen35_text_model(
+        original_model_path,
+        language_only=getattr(args, "sglang_language_only", False),
+    )
+    server_language_only = getattr(args, "sglang_language_only", False)
+    # Once Qwen3.5 has been materialized as a text-only shadow checkpoint, stop
+    # forwarding language_only; new SGLang treats it as encoder disaggregation.
+    if model_path != original_model_path and is_qwen35_model_path(model_path):
+        server_language_only = False
+    if is_qwen35_model_path(model_path) or is_qwen35_model_path(original_model_path):
+        os.environ["SLIME_ENABLE_QWEN35_SGLANG_PATCH"] = "1"
+        os.environ["SGLANG_EXTERNAL_MODEL_PACKAGE"] = "slime_plugins.sglang_models"
+
     nnodes = max(1, _gpus_per_engine // args.num_gpus_per_node)
     node_rank = rank % nnodes
     base = base_gpu_id if base_gpu_id is not None else get_base_gpu_id(args, rank)
     base = _to_local_gpu_id(base)
     kwargs = {
-        "model_path": args.hf_checkpoint,
+        "model_path": model_path,
         "trust_remote_code": True,
         "random_seed": args.seed + rank,
         # memory
@@ -614,6 +661,10 @@ def _compute_server_args(
     unused_keys = set(kwargs.keys())
     for attr in server_arg_fields:
         if worker_type == "decode" and attr.name == "enable_hierarchical_cache":
+            continue
+        if attr.name == "language_only":
+            kwargs[attr.name] = server_language_only
+            unused_keys.discard(attr.name)
             continue
         if hasattr(args, f"sglang_{attr.name}") and attr.name not in kwargs:
             kwargs[attr.name] = getattr(args, f"sglang_{attr.name}")

@@ -21,7 +21,7 @@ MODEL_ARGS=(
    --untie-embeddings-and-output-weights
    --vocab-size 248320
 
-   --rotary-base 10000000
+   --rotary-base "${MODEL_ARGS_ROTARY_BASE:-10000000}"
 
    # Qwen3.5 specific
    --attention-output-gate

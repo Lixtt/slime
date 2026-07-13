@@ -349,7 +349,7 @@ dict: {
 **使用场景**:
 - 处理 `list[list[Sample]]` 输入
 - 自定义训练数据格式需求
-  
+
 ---
 
 ### 14. 日志函数
@@ -387,16 +387,16 @@ def log_eval_rollout_data(rollout_id, args, data, extra_metrics) -> bool
 class CustomDataSource(DataSource):
     def get_samples(self, num_samples: int) -> list[list[Sample]]:
         """返回 num_samples 个样本"""
-        
+
     def add_samples(self, samples: list[list[Sample]]):
         """将样本添加回数据源"""
-        
+
     def save(self, rollout_id):
         """保存状态用于 ckpt"""
-        
+
     def load(self, rollout_id=None):
         """从 ckpt 加载状态"""
-    
+
     def __len__(self) -> int:
     """
         返回当前数据源中可用样本的数量。该数量可能会随着样本的获取或添加而变化。

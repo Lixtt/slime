@@ -282,7 +282,7 @@ def log_rollout_data(
                 "multimodal_train_inputs",
                 "loss_masks",
                 "sample_indices",
-                "rollout_ids",
+                "group_ids",
                 "rollout_mask_sums",
                 "rollout_top_p_token_ids",
                 "rollout_top_p_token_offsets",

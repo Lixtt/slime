@@ -1,4 +1,4 @@
-"""Per-rollout DP/microbatch scheduling.
+"""Per-group DP/microbatch scheduling.
 
 Pure-Python logic that decides, for one rollout's worth of sample lengths,
 how to group samples into micro-batches and which DP rank owns each mbs.
@@ -7,12 +7,12 @@ under CPU-only CI.
 
 The scheduling philosophy is **pack first, distribute second**:
 
-  1. Group samples by rollout id (``rollout_indices[i]`` =
-     ``samples[i].index``) and split rollouts into steps of
-     ``global_batch_size`` rollouts each. In the common case one rollout
-     emits one training sample so this is the same as a contiguous chunk;
-     under compact / subagent one rollout may emit multiple training
-     samples, in which case all of those samples stay in the same step.
+  1. Group samples by training group id (``group_indices[i]`` =
+     ``samples[i].group_id`` or ``samples[i].index``) and split groups into
+     steps of ``global_batch_size`` groups each. In the common case one group
+     has one training sample so this is the same as a contiguous chunk; under
+     compact / subagent one rollout may emit multiple training samples, in
+     which case all sibling samples stay in the same step.
   2. For each step, pack its samples into ``K`` micro-batches with a
      single first-fit pass (dynamic batch) or fixed-size chunking
      (static batch).
@@ -85,7 +85,8 @@ def build_dp_schedule(
     total_lengths: list[int],
     *,
     global_batch_size: int,
-    rollout_indices: list[int],
+    group_indices: list[int] | None = None,
+    rollout_indices: list[int] | None = None,
 ) -> tuple[list[list[int]], list[list[list[int]]], list[int], list[int]]:
     """Compute the per-rank DP partition and micro-batch schedule.
 
@@ -95,14 +96,17 @@ def build_dp_schedule(
         args: Namespace with ``micro_batch_size``, ``use_dynamic_batch_size``,
             ``max_tokens_per_gpu``, ``balance_data``.
         train_parallel_config: ``{"dp_size", "cp_size", "vpp_size",
-            "microbatch_group_size_per_vp_stage"}``.
+            "microbatch_group_size_per_vp_stage"}``. Non-Megatron backends
+            may omit context/pipeline fields; they default to non-parallel
+            values.
         total_lengths: token count per sample, indexed globally.
-        global_batch_size: number of rollouts (NOT training samples) per
+        global_batch_size: number of groups (NOT training samples) per
             training step. Number of training steps =
-            ``num_rollouts // global_batch_size``; trailing rollouts whose
+            ``num_groups // global_batch_size``; trailing groups whose
             samples don't fit are dropped.
-        rollout_indices: rollout id for each sample (``samples[i].index``).
-            Samples sharing the same id are kept together in one step.
+        group_indices: group id for each sample. Samples sharing the same id
+            are kept together in one step.
+        rollout_indices: legacy alias for ``group_indices``.
 
     Returns:
         ``(partitions, micro_batch_indices, num_microbatches, global_batch_sizes)``.
@@ -110,9 +114,9 @@ def build_dp_schedule(
         ``global_batch_size`` for every step).
     """
     dp_size = train_parallel_config["dp_size"]
-    cp_size = train_parallel_config["cp_size"]
-    vpp_size = train_parallel_config["vpp_size"]
-    mb_group = train_parallel_config["microbatch_group_size_per_vp_stage"]
+    cp_size = train_parallel_config.get("cp_size", 1)
+    vpp_size = train_parallel_config.get("vpp_size", 1)
+    mb_group = train_parallel_config.get("microbatch_group_size_per_vp_stage", 1)
 
     max_per_bin = None
     if args.use_dynamic_batch_size:
@@ -124,18 +128,24 @@ def build_dp_schedule(
     # count is a multiple of mb_group.
     align_to = dp_size * (mb_group if vpp_size > 1 else 1)
 
-    # Group samples by rollout id (preserve first-occurrence order). All
-    # samples from one rollout stay in a single step so the per-rollout loss
-    # reducer is well-defined.
-    rollout_id_to_samples: dict[int, list[int]] = {}
-    for sample_pos, rid in enumerate(rollout_indices):
-        rollout_id_to_samples.setdefault(rid, []).append(sample_pos)
-    rollout_ids = list(rollout_id_to_samples.keys())
+    if group_indices is None:
+        assert rollout_indices is not None, "group_indices is required"
+        group_indices = rollout_indices
+    elif rollout_indices is not None and list(group_indices) != list(rollout_indices):
+        raise ValueError("group_indices and rollout_indices were both provided but differ.")
 
-    num_steps = len(rollout_ids) // global_batch_size
+    # Group samples by group id (preserve first-occurrence order). All
+    # samples from one group stay in a single step so the per-group loss
+    # reducer is well-defined.
+    group_id_to_samples: dict[int, list[int]] = {}
+    for sample_pos, group_id in enumerate(group_indices):
+        group_id_to_samples.setdefault(group_id, []).append(sample_pos)
+    group_ids = list(group_id_to_samples.keys())
+
+    num_steps = len(group_ids) // global_batch_size
     assert num_steps >= 1, (
-        f"num_rollouts ({len(rollout_ids)}) < global_batch_size ({global_batch_size}); "
-        f"need at least one rollout per step."
+        f"num_groups/num_rollouts ({len(group_ids)}) < global_batch_size ({global_batch_size}); "
+        f"need at least one group per step."
     )
 
     partitions: list[list[int]] = [[] for _ in range(dp_size)]
@@ -144,8 +154,8 @@ def build_dp_schedule(
     global_batch_sizes: list[int] = []
 
     for step_i in range(num_steps):
-        step_rollouts = rollout_ids[step_i * global_batch_size : (step_i + 1) * global_batch_size]
-        sample_indices = [pos for rid in step_rollouts for pos in rollout_id_to_samples[rid]]
+        step_groups = group_ids[step_i * global_batch_size : (step_i + 1) * global_batch_size]
+        sample_indices = [pos for group_id in step_groups for pos in group_id_to_samples[group_id]]
         step_lengths = [total_lengths[i] for i in sample_indices]
         global_batch_sizes.append(global_batch_size)
         assert len(sample_indices) >= dp_size, (
@@ -161,7 +171,7 @@ def build_dp_schedule(
             use_dynamic_batch_size=args.use_dynamic_batch_size,
             max_per_bin=max_per_bin,
             micro_batch_size=getattr(args, "micro_batch_size", None),
-            balance_by_flops=args.balance_by_flops,
+            balance_by_flops=getattr(args, "balance_by_flops", False),
         )
 
         # 2. Align mbs count to a multiple of ``align_to``.

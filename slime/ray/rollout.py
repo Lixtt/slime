@@ -651,18 +651,75 @@ class RolloutManager:
             data = call_rollout_fn(self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)
             metrics = data.metrics
             data = data.samples
-            # Enforce the rollout_id contract before flattening: any list[Sample]
-            # encountered in the nested output must have rollout_id set on every
-            # element. Default rollouts inherit it from the data source; compact /
+            # Enforce the group_id contract before flattening: compact /
             # subagent paths that split one rollout into N training samples must
-            # set the same rollout_id on every sibling so the loss reducer counts
-            # the rollout once instead of N times.
-            _validate_rollout_id_annotated(data)
+            # set the same group_id on every sibling so the loss reducer counts
+            # that group once instead of N times.
+            _validate_group_id_annotated(data)
             # flatten the data if it is a list of lists
-            while isinstance(data[0], list):
+            while data and isinstance(data[0], list):
                 data = list(itertools.chain.from_iterable(data))
 
+            if not getattr(self.args, "disable_rollout_trim_samples", False):
+                global_batch_size = self.args.global_batch_size
+                target_steps_per_rollout = getattr(self.args, "num_steps_per_rollout", None)
+                auto_dynamic_for_history = (
+                    getattr(self.args, "dynamic_history", False) and target_steps_per_rollout is not None
+                )
+                use_dynamic_gbs = getattr(self.args, "use_dynamic_global_batch_size", False) or auto_dynamic_for_history
+                dynamic_target_steps = target_steps_per_rollout if auto_dynamic_for_history else None
+                if use_dynamic_gbs:
+                    logger.info(f"Collected {len(data)} samples from rollout to train with dynamic global batch size")
+                    self._dynamic_global_batch_size = self._compute_dynamic_global_batch_size(
+                        len(data), target_steps=dynamic_target_steps
+                    )
+                    global_batch_size = self._dynamic_global_batch_size
+
+                if len(data) % global_batch_size != 0:
+                    trim_len = (len(data) // global_batch_size) * global_batch_size
+                    if trim_len == 0:
+                        if use_dynamic_gbs and len(data) > 0:
+                            logger.warning(
+                                "Keeping %d short dynamic rollout sample(s) for later dummy padding "
+                                "instead of failing global_batch_size=%d.",
+                                len(data),
+                                global_batch_size,
+                            )
+                        else:
+                            raise ValueError(
+                                f"Not enough samples {len(data)} for global_batch_size {global_batch_size}"
+                            )
+                    else:
+                        origin_data_length = len(data)
+                        data = data[:trim_len]
+                        logger.info(f"trim number of samples from {origin_data_length} to {trim_len}")
+                logger.info(f"Final collected {len(data)} samples from rollout to train")
+
         return data, metrics
+
+    def _compute_dynamic_global_batch_size(self, num_samples: int, target_steps: int | None = None) -> int:
+        """Calculate dynamic global_batch_size from actual rollout samples."""
+        dp_size = self.train_parallel_config["dp_size"]
+        original_gbs = self.args.global_batch_size
+
+        desired_steps = int(target_steps) if target_steps is not None and target_steps > 0 else 1
+        per_step_target = max(1, num_samples // desired_steps)
+        dynamic_gbs = (per_step_target // dp_size) * dp_size
+
+        if dynamic_gbs == 0:
+            dynamic_gbs = dp_size
+            logger.warning(f"num_samples={num_samples} < dp_size={dp_size}, using dp_size as global_batch_size")
+
+        realized_steps = max(1, num_samples // dynamic_gbs)
+        wasted = num_samples % dynamic_gbs
+        if dynamic_gbs != original_gbs or wasted > 0 or realized_steps != desired_steps:
+            logger.info(
+                f"Dynamic global_batch_size: {original_gbs} -> {dynamic_gbs} "
+                f"(num_samples={num_samples}, dp_size={dp_size}, "
+                f"target_steps={desired_steps}, realized_steps={realized_steps}, wasted={wasted})"
+            )
+
+        return dynamic_gbs
 
     def _save_debug_rollout_data(self, data, rollout_id, evaluation: bool):
         # TODO to be refactored (originally Buffer._set_data)
@@ -717,20 +774,72 @@ class RolloutManager:
         if self.custom_convert_samples_to_train_data_func is not None:
             return self.custom_convert_samples_to_train_data_func(self.args, samples)
 
+        def _sample_group_id(sample: Sample) -> int | None:
+            return sample.group_id if sample.group_id is not None else sample.index
+
+        def _count_distinct_groups(items: list[Sample]) -> int:
+            return len({_sample_group_id(sample) for sample in items})
+
+        def _make_dummy_samples(count: int) -> list[Sample]:
+            reward = {self.args.reward_key: 0.0} if self.args.reward_key else 0.0
+            used_group_ids = {_sample_group_id(sample) for sample in samples}
+            dummy_samples: list[Sample] = []
+            next_offset = 1
+            while len(dummy_samples) < count:
+                group_id = -next_offset
+                next_offset += 1
+                if group_id in used_group_ids:
+                    continue
+                used_group_ids.add(group_id)
+                dummy_samples.append(
+                    Sample(
+                        group_index=group_id,
+                        index=group_id,
+                        group_id=group_id,
+                        tokens=[0, 0],
+                        response_length=1,
+                        loss_mask=[0],
+                        rollout_log_probs=[0.0],
+                        reward=reward,
+                        remove_sample=True,
+                        status=Sample.Status.FAILED,
+                        metadata={"dummy_removed_sample": True},
+                    )
+                )
+            return dummy_samples
+
+        dp_size = self.train_parallel_config["dp_size"]
+        target_group_count = None
+        if getattr(self.args, "use_dynamic_global_batch_size", False):
+            target_steps = getattr(self.args, "num_steps_per_rollout", None)
+            self._dynamic_global_batch_size = self._compute_dynamic_global_batch_size(
+                len(samples), target_steps=target_steps
+            )
+            target_group_count = self._dynamic_global_batch_size
+        elif getattr(self.args, "disable_rollout_trim_samples", False):
+            target_group_count = self.args.global_batch_size
+
+        dummy_count = max(0, dp_size - len(samples))
+        if target_group_count is not None:
+            dummy_count = max(dummy_count, target_group_count - _count_distinct_groups(samples))
+        if dummy_count:
+            logger.warning("Injecting %d dummy samples.", dummy_count)
+            samples.extend(_make_dummy_samples(dummy_count))
+
         raw_rewards, rewards = self._post_process_rewards(samples)
 
         assert len(raw_rewards) == len(samples)
         assert len(rewards) == len(samples)
 
-        rollout_ids = [sample.rollout_id for sample in samples]
-        existed_rollout_id_values = set(rid for rid in rollout_ids if rid is not None)
+        group_ids = [sample.group_id if sample.group_id is not None else sample.index for sample in samples]
+        existed_group_id_values = set(group_id for group_id in group_ids if group_id is not None)
         tmp_id = 0
-        for i in range(len(rollout_ids)):
-            if rollout_ids[i] is None:
-                while tmp_id in existed_rollout_id_values:
+        for i in range(len(group_ids)):
+            if group_ids[i] is None:
+                while tmp_id in existed_group_id_values:
                     tmp_id += 1
-                rollout_ids[i] = tmp_id
-                existed_rollout_id_values.add(tmp_id)
+                group_ids[i] = tmp_id
+                existed_group_id_values.add(tmp_id)
 
         train_data = {
             "tokens": [sample.tokens for sample in samples],
@@ -741,7 +850,7 @@ class RolloutManager:
             "raw_reward": raw_rewards,
             "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
             "sample_indices": [sample.index for sample in samples],
-            "rollout_ids": rollout_ids,
+            "group_ids": group_ids,
         }
 
         # loss mask
@@ -760,22 +869,23 @@ class RolloutManager:
             loss_masks.append(sample.loss_mask)
         train_data["loss_masks"] = loss_masks
 
-        # Per-rollout aggregate, precomputed at the step level (where we can
-        # see every sample of every rollout) and broadcast per-sample so the
-        # per-mb loss reducer uses the correct whole-rollout denominator even
-        # when a rollout's samples land in different micro-batches (first-fit
-        # packing can split a rollout across mbs):
+        # Per-group aggregate, precomputed at the step level (where we can
+        # see every sample of every group) and broadcast per-sample so the
+        # per-mb loss reducer uses the correct whole-group denominator even
+        # when a group's samples land in different micro-batches (first-fit
+        # packing can split a group across mbs). The downstream backend field
+        # is still named rollout_mask_sums for compatibility:
         #
         #   ``rollout_mask_sums[i]`` — sum of loss-mask totals over every
-        #   sample in sample i's rollout. Used as the reducer's denominator
+        #   sample in sample i's group. Used as the reducer's denominator
         #   so summing partial contributions across mbs yields one
-        #   token-weighted mean per rollout.
-        rollout_id_list = train_data["rollout_ids"]
+        #   token-weighted mean per group.
+        group_id_list = train_data["group_ids"]
         mask_sums_per_sample = [sum(m) for m in loss_masks]
-        rollout_total_mask: dict[int, int] = {}
-        for rid, ms in zip(rollout_id_list, mask_sums_per_sample, strict=True):
-            rollout_total_mask[rid] = rollout_total_mask.get(rid, 0) + ms
-        train_data["rollout_mask_sums"] = [rollout_total_mask[rid] for rid in rollout_id_list]
+        group_total_mask: dict[int, int] = {}
+        for group_id, ms in zip(group_id_list, mask_sums_per_sample, strict=True):
+            group_total_mask[group_id] = group_total_mask.get(group_id, 0) + ms
+        train_data["rollout_mask_sums"] = [group_total_mask[group_id] for group_id in group_id_list]
 
         # Overwrite raw_reward when available. Mixed-source batches may only
         # populate this field for a subset of samples (e.g. SWE but not code).
@@ -831,12 +941,10 @@ class RolloutManager:
         into a Ray Box. The schedule itself is computed by
         :func:`build_dp_schedule` so it stays unit-testable without Ray/sglang.
 
-        Step split is by rollout id (``samples[i].rollout_id``, falling back
+        Step split is by group id (``samples[i].group_id``, falling back
         to ``samples[i].index``); each step holds exactly
-        ``args.global_batch_size`` rollouts so the training-step count per
-        rollout is fixed at ``rollout_batch_size * n_samples_per_prompt //
-        global_batch_size`` regardless of how many training samples each
-        rollout produced.
+        ``global_batch_size`` groups so the training-step count per rollout is
+        stable even when a rollout produced multiple training samples.
         """
         dp_size = self.train_parallel_config["dp_size"]
         total_lengths = [len(t) for t in data["tokens"]]
@@ -846,8 +954,8 @@ class RolloutManager:
             self.args,
             self.train_parallel_config,
             total_lengths,
-            global_batch_size=self.args.global_batch_size,
-            rollout_indices=data["rollout_ids"],
+            global_batch_size=getattr(self, "_dynamic_global_batch_size", self.args.global_batch_size),
+            group_indices=data["group_ids"],
         )
 
         # Package per-rank rollout_data
@@ -864,7 +972,7 @@ class RolloutManager:
                 "loss_masks",
                 "round_number",
                 "sample_indices",
-                "rollout_ids",
+                "group_ids",
                 "rollout_mask_sums",
                 "rollout_log_probs",
                 "rollout_top_p_token_ids",
@@ -895,8 +1003,8 @@ class RolloutManager:
         return rollout_data_refs
 
 
-def _validate_rollout_id_annotated(node, depth=0):
-    """Walk the rollout function's nested output and validate ``rollout_id`` only
+def _validate_group_id_annotated(node, depth=0):
+    """Walk the rollout function's nested output and validate ``group_id`` only
     when a compact / subagent pattern is detected.
 
     "Compact" = the rollout function wraps multiple training samples from one
@@ -906,25 +1014,25 @@ def _validate_rollout_id_annotated(node, depth=0):
     preserving backward compatibility. A compact rollout adds a third level:
     ``list[list[list[Sample]]]`` (prompt × rollout × samples-from-one-rollout),
     so the leaf ``list[Sample]`` lands at depth ≥ 2. At that point we require
-    every sibling to carry a non-None ``rollout_id`` and to share the same
-    value, so the loss reducer counts the rollout once instead of N times.
+    every sibling to carry a non-None ``group_id`` and to share the same
+    value, so the loss reducer counts the group once instead of N times.
     """
     if isinstance(node, Sample):
         return
     assert isinstance(node, list), f"unexpected rollout output node type: {type(node).__name__}"
     if node and isinstance(node[0], Sample):
         if depth >= 2 and len(node) > 1:
-            rids = [s.rollout_id for s in node]
-            missing = [i for i, r in enumerate(rids) if r is None]
+            gids = [s.group_id for s in node]
+            missing = [i for i, group_id in enumerate(gids) if group_id is None]
             assert not missing, (
-                f"Compact rollout returned {len(node)} samples but rollout_id is unset on "
-                f"positions {missing}. Set Sample.rollout_id on every sibling so the loss "
-                "reducer can aggregate them as one rollout instead of N."
+                f"Compact rollout returned {len(node)} samples but group_id is unset on "
+                f"positions {missing}. Set Sample.group_id on every sibling so the loss "
+                "reducer can aggregate them as one group instead of N."
             )
-            assert len(set(rids)) == 1, f"Sibling samples from one compact rollout must share rollout_id; got {rids}."
+            assert len(set(gids)) == 1, f"Sibling samples from one compact rollout must share group_id; got {gids}."
         return
     for item in node:
-        _validate_rollout_id_annotated(item, depth + 1)
+        _validate_group_id_annotated(item, depth + 1)
 
 
 def _allocate_rollout_engine_addr_and_ports_normal(
@@ -1307,9 +1415,12 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
 
 
 def compute_metrics_from_samples(args, samples):
+    if not samples:
+        return {"sample_count": 0}
+
     response_lengths = [sample.effective_response_length for sample in samples]
 
-    log_dict = {}
+    log_dict = {"sample_count": len(samples)}
     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
     log_dict |= _compute_zero_std_metrics(args, samples)
     log_dict |= _compute_spec_metrics(args, samples)
@@ -1322,10 +1433,12 @@ def compute_metrics_from_samples(args, samples):
 
 
 def compute_perf_metrics_from_samples(args, samples, rollout_time):
+    log_dict = {"rollout_time": rollout_time, "sample_count": len(samples)}
+    if not samples:
+        return log_dict
+
     non_generation_time = [sample.non_generation_time for sample in samples]
 
-    log_dict = {}
-    log_dict["rollout_time"] = rollout_time
     if max(non_generation_time) > 0:
         log_dict |= dict_add_prefix(compute_statistics(non_generation_time), "non_generation_time/")
 

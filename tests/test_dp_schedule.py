@@ -4,9 +4,15 @@ The tests assert the invariants documented at the top of dp_schedule.py against
 a range of static / dynamic / VPP / oversize / balance / uneven scenarios.
 """
 
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+SLIME_ROOT = Path(__file__).resolve().parents[1]
+if str(SLIME_ROOT) not in sys.path:
+    sys.path.insert(0, str(SLIME_ROOT))
 
 from slime.utils.dp_schedule import build_dp_schedule
 
@@ -176,6 +182,31 @@ def test_dynamic_uniform():
 
     partitions, mbi, nmb, gbs_per_step = build_dp_schedule(
         args, tp, total_lengths, global_batch_size=8, rollout_indices=rollout_indices
+    )
+
+    assert gbs_per_step == [8]
+    assert_invariants(
+        partitions,
+        mbi,
+        nmb,
+        dp_size=2,
+        expected_global_sample_indices=range(8),
+        total_lengths=total_lengths,
+        max_per_bin=10,
+    )
+
+
+@pytest.mark.unit
+def test_dynamic_accepts_minimal_non_megatron_parallel_config():
+    """FSDP actor used to report only dp_size; schedule should treat missing
+    CP/VPP fields as non-parallel defaults."""
+    total_lengths = [5] * 8
+    group_indices = list(range(8))
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=10)
+    tp = {"dp_size": 2}
+
+    partitions, mbi, nmb, gbs_per_step = build_dp_schedule(
+        args, tp, total_lengths, global_batch_size=8, group_indices=group_indices
     )
 
     assert gbs_per_step == [8]

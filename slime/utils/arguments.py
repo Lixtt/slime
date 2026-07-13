@@ -106,6 +106,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_train_arguments(parser):
+            def ensure_arg(name, **kwargs):
+                if not any(name in action.option_strings for action in parser._actions):
+                    parser.add_argument(name, **kwargs)
+
             # --train-backend is parsed early in _pre_parse_mode() and merged later.
             parser.add_argument(
                 "--qwen-gdn-backend",
@@ -114,6 +118,44 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="fla",
                 help="GDN implementation backend for Qwen linear-attention layers.",
             )
+            parser.add_argument(
+                "--true-on-policy-mode",
+                action="store_true",
+                default=False,
+                help="Whether to enable true-on-policy mode.",
+            )
+            # These arguments are consumed by the FSDP actor path.  The top-level
+            # parser still routes through Megatron's parser, so declare FSDP-only
+            # options here to avoid parse_known_args silently dropping them.
+            ensure_arg("--optimizer", type=str, default="adam")
+            ensure_arg("--lr", type=float, default=2e-5)
+            ensure_arg("--lr-warmup-init", type=float, default=0.0)
+            ensure_arg("--min-lr", type=float, default=0.0)
+            ensure_arg("--lr-decay-style", type=str, default="constant")
+            ensure_arg("--lr-decay-iters", type=int, default=None)
+            ensure_arg("--lr-warmup-iters", type=int, default=0)
+            ensure_arg("--lr-warmup-fraction", type=float, default=None)
+            ensure_arg("--lr-wsd-decay-iters", type=int, default=None)
+            ensure_arg("--lr-wsd-decay-style", type=str, default=None)
+            ensure_arg("--use-checkpoint-lr-scheduler", action=argparse.BooleanOptionalAction, default=True)
+            ensure_arg("--override-lr-scheduler", action="store_true", default=False)
+            ensure_arg("--weight-decay", type=float, default=0.0)
+            ensure_arg("--adam-beta1", type=float, default=0.9)
+            ensure_arg("--adam-beta2", type=float, default=0.95)
+            ensure_arg("--adam-eps", type=float, default=1e-8)
+            ensure_arg("--attn-implementation", type=str, default="flash_attention_2")
+            ensure_arg("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=False)
+            ensure_arg("--fp16", action="store_true", default=False)
+            ensure_arg("--fsdp-state-dict-cpu-offload", action=argparse.BooleanOptionalAction, default=True)
+            ensure_arg("--fsdp-cpu-offload", action="store_true", default=False)
+            ensure_arg("--fsdp-cpu-backend", type=str, default="gloo")
+            ensure_arg("--deterministic-mode", action="store_true", default=False)
+            ensure_arg("--use-lora", action="store_true", default=False)
+            ensure_arg("--lora-rank", type=int, default=8)
+            ensure_arg("--lora-alpha", type=int, default=16)
+            ensure_arg("--lora-dropout", type=float, default=0.0)
+            ensure_arg("--lora-target-modules", type=str, default=None)
+            ensure_arg("--lora-modules-to-save", type=str, default=None)
             parser.add_argument(
                 "--train-env-vars",
                 type=json.loads,
@@ -426,6 +468,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "It should be able to judge whether the result of a prompt should be selected or not."
                     "We will do dynamic filter for sampling as in DAPO. e.g. not all correct or all wrong samples."
                     "You could use `slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std` as an example."
+                ),
+            )
+            parser.add_argument(
+                "--disable-rollout-trim-samples",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help=(
+                    "Whether to skip trimming rollout samples to a multiple of global_batch_size. "
+                    "This is mainly useful for custom rollouts that handle padding or batching themselves."
                 ),
             )
 
@@ -1505,7 +1556,7 @@ def _pre_parse_mode():
     the final ``args`` after Phase 2 parsing.
     """
     temp_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    temp_parser.add_argument("--train-backend", type=str, choices=["megatron"], default="megatron")
+    temp_parser.add_argument("--train-backend", type=str, choices=["megatron", "fsdp"], default="megatron")
     temp_parser.add_argument("--debug-rollout-only", action="store_true", default=False)
     temp_parser.add_argument("--debug-train-only", action="store_true", default=False)
     temp_parser.add_argument("--load-debug-rollout-data", type=str, default=None)

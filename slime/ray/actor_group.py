@@ -85,9 +85,16 @@ class RayTrainGroup:
         if self.args.use_routing_replay and self.role == "actor":
             env_vars["ENABLE_ROUTING_REPLAY"] = "1"
 
-        from slime.backends.megatron_utils.actor import MegatronTrainRayActor
+        if self.args.train_backend == "fsdp":
+            from slime.backends.fsdp_utils.actor import FSDPTrainRayActor
 
-        actor_impl = MegatronTrainRayActor
+            actor_impl = FSDPTrainRayActor
+        elif self.args.train_backend == "megatron":
+            from slime.backends.megatron_utils.actor import MegatronTrainRayActor
+
+            actor_impl = MegatronTrainRayActor
+        else:
+            raise ValueError(f"Unsupported train_backend: {self.args.train_backend}")
 
         actor_options = {
             "num_gpus": 1,

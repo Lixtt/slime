@@ -91,3 +91,14 @@ def test_build_conda_replaces_cuda13_python_bindings_after_sglang_resolution():
     reinstall = "pip install --force-reinstall cuda-python==12.9"
     assert reinstall in text
     assert text.index("pip uninstall -y") < text.index(reinstall)
+
+
+def test_build_conda_uses_cached_retries_for_autoregressive_sglang_runtime():
+    text = (SLIME_ROOT / "build_conda.sh").read_text()
+
+    assert 'SLIME_BUILD_CACHE_DIR="${SLIME_BUILD_CACHE_DIR:-}"' in text
+    assert 'export PIP_CACHE_DIR="${SLIME_BUILD_CACHE_DIR}"' in text
+    assert 'PIP_INSTALL_RETRIES="${PIP_INSTALL_RETRIES:-4}"' in text
+    assert "pip install attempt ${attempt}/${PIP_INSTALL_RETRIES} failed" in text
+    assert 'pip install -e "python"' in text
+    assert 'pip install -e "python[all]"' not in text

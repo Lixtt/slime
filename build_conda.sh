@@ -8,12 +8,21 @@ BUILD_MAX_JOBS="${BUILD_MAX_JOBS:-$(nproc)}"
 FA2_MAX_JOBS="${FA2_MAX_JOBS:-${BUILD_MAX_JOBS}}"
 FA3_MAX_JOBS="${FA3_MAX_JOBS:-${BUILD_MAX_JOBS}}"
 SLIME_BUILD_TMPDIR="${SLIME_BUILD_TMPDIR:-}"
+SLIME_BUILD_CACHE_DIR="${SLIME_BUILD_CACHE_DIR:-}"
+PIP_INSTALL_RETRIES="${PIP_INSTALL_RETRIES:-4}"
+PIP_RETRY_SLEEP_SEC="${PIP_RETRY_SLEEP_SEC:-10}"
 
 if [[ -n "${SLIME_BUILD_TMPDIR}" ]]; then
   mkdir -p "${SLIME_BUILD_TMPDIR}"
   export TMPDIR="${SLIME_BUILD_TMPDIR}"
 fi
-export PIP_NO_CACHE_DIR="${PIP_NO_CACHE_DIR:-1}"
+if [[ -n "${SLIME_BUILD_CACHE_DIR}" ]]; then
+  mkdir -p "${SLIME_BUILD_CACHE_DIR}"
+  export PIP_CACHE_DIR="${SLIME_BUILD_CACHE_DIR}"
+  unset PIP_NO_CACHE_DIR
+else
+  export PIP_NO_CACHE_DIR="${PIP_NO_CACHE_DIR:-1}"
+fi
 
 env_install() {
   "${ENV_MANAGER_BIN}" install "${ENV_SELECTOR[@]}" "$@"
@@ -61,6 +70,28 @@ else
   set -u
 fi
 export CUDA_HOME="$CONDA_PREFIX"
+
+# Retry complete pip install transactions. Streaming resets from cluster-local
+# mirrors otherwise force operators to rerun this multi-hour build by hand.
+pip() {
+  local is_install=0
+  local attempt
+  [[ "${1:-}" == "install" || "${2:-}" == "install" ]] && is_install=1
+  if (( ! is_install )); then
+    "${CONDA_PREFIX}/bin/python" -m pip "$@"
+    return
+  fi
+  for (( attempt = 1; attempt <= PIP_INSTALL_RETRIES; attempt++ )); do
+    if "${CONDA_PREFIX}/bin/python" -m pip "$@"; then
+      return 0
+    fi
+    if (( attempt < PIP_INSTALL_RETRIES )); then
+      echo "pip install attempt ${attempt}/${PIP_INSTALL_RETRIES} failed; retrying in ${PIP_RETRY_SLEEP_SEC}s" >&2
+      sleep "${PIP_RETRY_SLEEP_SEC}"
+    fi
+  done
+  return 1
+}
 
 # Keep these in sync with docker/Dockerfile:
 #   - SGLANG_IMAGE_TAG (ARG)            -> SGLANG_VERSION below
@@ -120,7 +151,10 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ] \
   echo "Refusing to install from an unexpectedly dirty SGLang checkout: $SGLANG_DIR" >&2
   exit 1
 fi
-pip install -e "python[all]" --extra-index-url https://download.pytorch.org/whl/cu129
+# Online RL needs SGLang's autoregressive runtime. The `all` extra adds
+# diffusion, tracing, and HTTP/2 stacks that are part of the general Docker
+# image but not the Slime runtime and greatly expand resolver/network failure.
+pip install -e "python" --extra-index-url https://download.pytorch.org/whl/cu129
 pip install --force-reinstall --no-deps \
   torch==2.11.0 torchvision torchaudio==2.11.0 \
   --index-url https://download.pytorch.org/whl/cu129

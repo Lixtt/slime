@@ -11,6 +11,7 @@ SLIME_BUILD_TMPDIR="${SLIME_BUILD_TMPDIR:-}"
 SLIME_BUILD_CACHE_DIR="${SLIME_BUILD_CACHE_DIR:-}"
 PIP_INSTALL_RETRIES="${PIP_INSTALL_RETRIES:-4}"
 PIP_RETRY_SLEEP_SEC="${PIP_RETRY_SLEEP_SEC:-10}"
+NVIDIA_PYPI_INDEX_URL="${NVIDIA_PYPI_INDEX_URL:-https://pypi.nvidia.com}"
 
 if [[ -n "${SLIME_BUILD_TMPDIR}" ]]; then
   mkdir -p "${SLIME_BUILD_TMPDIR}"
@@ -244,7 +245,7 @@ cd $SLIME_DIR/slime/backends/megatron_utils/kernels/int4_qat
 pip install . --no-build-isolation
 
 # https://github.com/pytorch/pytorch/issues/168167
-pip install nvidia-cudnn-cu12==9.16.0.29
+pip install nvidia-cudnn-cu12==9.16.0.29 --index-url "${NVIDIA_PYPI_INDEX_URL}"
 pip install "numpy<2"
 # kernels 0.15.x trips a ValueError("Either a revision or a version must be
 # specified") on `transformers.integrations.hub_kernels` import; pin to <0.15

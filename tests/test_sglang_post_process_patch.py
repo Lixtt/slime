@@ -103,6 +103,8 @@ def test_build_conda_replaces_cuda13_variants_before_cu129_torch():
     assert reinstall in text
     assert text.index("pip uninstall -y") < text.index(cu129_torch)
     assert text.index(cu129_torch) < text.index(reinstall)
+    assert 'NVIDIA_PYPI_INDEX_URL="${NVIDIA_PYPI_INDEX_URL:-https://pypi.nvidia.com}"' in text
+    assert 'nvidia-cudnn-cu12==9.16.0.29 --index-url "${NVIDIA_PYPI_INDEX_URL}"' in text
 
 
 def test_build_conda_validates_native_runtime_and_conda_abi_first():

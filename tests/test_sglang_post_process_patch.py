@@ -67,3 +67,13 @@ def test_build_conda_prefix_mode_does_not_bootstrap_micromamba():
     assert 'conda activate "${SLIME_ENV_PREFIX}"' in prefix_branch
     assert "micro.mamba.pm" not in prefix_branch
     assert "source ~/.bashrc" not in prefix_branch
+
+
+def test_build_conda_native_build_parallelism_is_overridable():
+    text = (SLIME_ROOT / "build_conda.sh").read_text()
+
+    assert 'BUILD_MAX_JOBS="${BUILD_MAX_JOBS:-$(nproc)}"' in text
+    assert 'MAX_JOBS="${FA2_MAX_JOBS}"' in text
+    assert 'MAX_JOBS="${FA3_MAX_JOBS}"' in text
+    assert "MAX_JOBS=64" not in text
+    assert "MAX_JOBS=96" not in text

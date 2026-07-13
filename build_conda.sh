@@ -4,6 +4,9 @@ set -euxo pipefail
 
 SLIME_ENV_PREFIX="${SLIME_ENV_PREFIX:-}"
 SLIME_ENV_NAME="${SLIME_ENV_NAME:-slime}"
+BUILD_MAX_JOBS="${BUILD_MAX_JOBS:-$(nproc)}"
+FA2_MAX_JOBS="${FA2_MAX_JOBS:-${BUILD_MAX_JOBS}}"
+FA3_MAX_JOBS="${FA3_MAX_JOBS:-${BUILD_MAX_JOBS}}"
 
 env_install() {
   "${ENV_MANAGER_BIN}" install "${ENV_SELECTOR[@]}" "$@"
@@ -152,7 +155,7 @@ pip install --force-reinstall --no-deps \
 pip install cmake ninja
 
 # flash attn 2 (matches Dockerfile)
-MAX_JOBS=64 pip -v install flash-attn==2.8.3 --no-build-isolation
+MAX_JOBS="${FA2_MAX_JOBS}" pip -v install flash-attn==2.8.3 --no-build-isolation
 
 # flash attn 3 (matches Dockerfile and TransformerEngine 2.16 CP APIs)
 if [ ! -d "$BASE_DIR/flash-attention/.git" ]; then
@@ -162,7 +165,7 @@ cd "$BASE_DIR/flash-attention"
 git checkout 002cce0a1068f8c07dfccb5a1d232b9a3276947c
 git submodule update --init
 cd hopper
-FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=96 pip -v install . --no-build-isolation
+FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS="${FA3_MAX_JOBS}" pip -v install . --no-build-isolation
 
 pip install git+https://github.com/ISEEKYAN/mbridge.git@89eb10887887bc74853f89a4de258c0702932a1c --no-deps
 pip install flash-linear-attention==0.4.2

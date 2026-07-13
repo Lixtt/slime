@@ -141,6 +141,3 @@ ray job submit --address="http://127.0.0.1:8265" \
    "${TRAIN_BACKEND_ARGS[@]}" \
    "${PERF_ARGS[@]}" \
    "${MISC_ARGS[@]}"
-
-
-

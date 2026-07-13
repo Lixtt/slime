@@ -90,4 +90,3 @@ SGLang Model Gateway 是一个高性能 Rust router，面向大规模 inference 
 
 - 当你需要 R3 或 radix-tree cache 时，使用 SlimeRouter
 - 其他情况使用 SGLang Model Gateway（推荐默认选项）
-

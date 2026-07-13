@@ -320,8 +320,8 @@ def _iter_all(root):
 # though get_trajectory consumes the session.
 _TREE_SNAP: dict[str, str] = {}
 
-# Input reward passed to get_trajectory, keyed by sid, so the dump can show the
-# split (input_reward / n_samples == per_sample_reward) explicitly.
+# Input reward passed to get_trajectory, keyed by sid, so the dump can show that
+# every emitted sample carries the full input reward.
 _REWARD_IN: dict[str, float] = {}
 
 

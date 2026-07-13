@@ -6,6 +6,7 @@ import math
 import os
 from argparse import Namespace
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
 
@@ -38,6 +39,7 @@ from .data import DataIterator, get_batch
 from .lora import load_megatron_lora_checkpoint, save_megatron_lora_checkpoint
 from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_rollout_top_p_logprob_kwargs, loss_function
 from .model_provider import get_model_provider_func
+from .stateless_adam import StatelessAdam
 from .trainable_checkpoint_state import (
     TRAINING_STATE_FORMAT,
     build_training_state_payload,
@@ -159,12 +161,45 @@ def _iter_critic_output_layers(model: Sequence[DDP]):
             yield chunk_id, output_layer
 
 
+try:
+    from megatron.training.checkpointing import get_load_checkpoint_path_by_args
+except ImportError:
+
+    def get_load_checkpoint_path_by_args(args, load_arg="load"):
+        from megatron.training.checkpointing import (
+            get_checkpoint_name,
+            get_checkpoint_tracker_filename,
+            isfile,
+            read_metadata,
+        )
+
+        """Get the checkpoint path based on the arguments."""
+        load_dir = getattr(args, load_arg)
+        iteration, release = -1, False
+        tracker_filename = "because load directory is not defined"
+        if load_dir is not None:
+            tracker_filename = get_checkpoint_tracker_filename(load_dir)
+            if isfile(tracker_filename):
+                iteration, release = read_metadata(tracker_filename)
+            else:
+                load_dir, checkpoint_step = os.path.split(load_dir)
+                if checkpoint_step == "release" or checkpoint_step.startswith("iter_"):
+                    release = checkpoint_step == "release"
+                    if not release:
+                        iteration = int(checkpoint_step.split("_")[1])
+
+        # Allow user to specify the loaded iteration.
+        if getattr(args, "ckpt_step", None):
+            iteration = args.ckpt_step
+
+        return get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
+
+
 def _critic_output_layer_needs_reinit(args: Namespace, model: Sequence[DDP], role: str) -> bool:
     if role != "critic" or args.load is None:
         return False
 
     from megatron.core.dist_checkpointing.serialization import load_tensors_metadata
-    from megatron.training.checkpointing import get_load_checkpoint_path_by_args
 
     checkpoint_path = Path(get_load_checkpoint_path_by_args(args))
     if not (checkpoint_path / ".metadata").is_file():
@@ -273,6 +308,38 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
     return opt_param_scheduler
 
 
+def _noop_init_state_fn(*args, **kwargs) -> None:
+    return None
+
+
+def _disable_distributed_optimizer_state_initialization(optimizer: MegatronOptimizer) -> None:
+    for megatron_optimizer in getattr(optimizer, "chained_optimizers", [optimizer]):
+        if megatron_optimizer.__class__.__name__ == "DistributedOptimizer":
+            megatron_optimizer.init_state_fn = _noop_init_state_fn
+
+
+@contextmanager
+def _patch_megatron_adam(adam_cls):
+    import megatron.core.optimizer as megatron_optimizer
+    import megatron.core.optimizer.distrib_optimizer as megatron_distrib_optimizer
+
+    missing = object()
+    old_adam = megatron_optimizer.Adam
+    old_cpu_adam = getattr(megatron_optimizer, "CPUAdam", missing)
+    old_distrib_adam = megatron_distrib_optimizer.Adam
+    try:
+        megatron_optimizer.Adam = adam_cls
+        if old_cpu_adam is not missing:
+            megatron_optimizer.CPUAdam = adam_cls
+        megatron_distrib_optimizer.Adam = adam_cls
+        yield
+    finally:
+        megatron_optimizer.Adam = old_adam
+        if old_cpu_adam is not missing:
+            megatron_optimizer.CPUAdam = old_cpu_adam
+        megatron_distrib_optimizer.Adam = old_distrib_adam
+
+
 def setup_model_and_optimizer(
     args: Namespace,
     role: str = "actor",
@@ -307,11 +374,19 @@ def setup_model_and_optimizer(
     config = OptimizerConfig(**kwargs)
     config.timers = None
 
-    optimizer = get_megatron_optimizer(
-        config=config,
-        model_chunks=model,
-        use_gloo_process_groups=args.enable_gloo_process_groups,
-    )
+    if args.use_stateless_adam:
+        assert config.optimizer == "adam", "Stateless Adam only supports --optimizer adam."
+        assert args.no_save_optim, "Stateless Adam does not save Adam moment states. Please set --no-save-optim."
+
+    optimizer_context = _patch_megatron_adam(StatelessAdam) if args.use_stateless_adam else nullcontext()
+    with optimizer_context:
+        optimizer = get_megatron_optimizer(
+            config=config,
+            model_chunks=model,
+            use_gloo_process_groups=args.enable_gloo_process_groups,
+        )
+    if args.use_stateless_adam:
+        _disable_distributed_optimizer_state_initialization(optimizer)
     opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
     return model, optimizer, opt_param_scheduler
 
@@ -776,7 +851,7 @@ def train(
             and mpu.get_tensor_model_parallel_rank() == 0
             and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
         ):
-            print("Reset optimizer states")
+            logger.info("Reset optimizer states")
         for chained_optimizer in optimizer.chained_optimizers:
             for group in chained_optimizer.optimizer.param_groups:
                 if "step" in group:

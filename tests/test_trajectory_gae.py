@@ -108,4 +108,3 @@ def test_batched_gae_uses_trajectory_layout(monkeypatch):
     torch.testing.assert_close(advantages[1], torch.tensor([1.0]))
     torch.testing.assert_close(returns[0], advantages[0])
     torch.testing.assert_close(returns[1], advantages[1])
-

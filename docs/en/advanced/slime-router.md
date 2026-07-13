@@ -90,4 +90,3 @@ For more details on SGLang Model Gateway, see the [official documentation](https
 
 - Use SlimeRouter when you need R3 or radix-tree caching
 - Use SGLang Model Gateway for everything else (recommended default)
-

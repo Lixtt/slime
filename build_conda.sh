@@ -7,6 +7,7 @@ SLIME_ENV_NAME="${SLIME_ENV_NAME:-slime}"
 BUILD_MAX_JOBS="${BUILD_MAX_JOBS:-$(nproc)}"
 FA2_MAX_JOBS="${FA2_MAX_JOBS:-${BUILD_MAX_JOBS}}"
 FA3_MAX_JOBS="${FA3_MAX_JOBS:-${BUILD_MAX_JOBS}}"
+FA3_DISABLE_SM80="${FA3_DISABLE_SM80:-1}"
 SLIME_TORCH_CUDA_ARCH_LIST="${SLIME_TORCH_CUDA_ARCH_LIST:-9.0}"
 FA2_CUDA_ARCHS="${FA2_CUDA_ARCHS:-90}"
 SLIME_BUILD_TMPDIR="${SLIME_BUILD_TMPDIR:-}"
@@ -75,6 +76,12 @@ else
 fi
 export CUDA_HOME="$CONDA_PREFIX"
 export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+CUDA_TARGET_INCLUDE_DIR="${CUDA_TARGET_INCLUDE_DIR:-${CONDA_PREFIX}/targets/x86_64-linux/include}"
+if [[ ! -f "${CUDA_TARGET_INCLUDE_DIR}/cuda_runtime.h" ]]; then
+  echo "Missing CUDA runtime headers: ${CUDA_TARGET_INCLUDE_DIR}/cuda_runtime.h" >&2
+  exit 2
+fi
+export CPATH="${CUDA_TARGET_INCLUDE_DIR}${CPATH:+:${CPATH}}"
 
 # CUDA 12.9 rejects GCC 14, which current conda-forge activation hooks may
 # select through x86_64-conda-linux-gnu-c++. Use the host's supported compiler
@@ -93,7 +100,7 @@ if [[ ! "${cuda_host_cxx_major}" =~ ^[0-9]+$ ]] || (( cuda_host_cxx_major >= 14 
 fi
 export CC="${CUDA_HOST_CC}"
 export CXX="${CUDA_HOST_CXX}"
-export NVCC_PREPEND_FLAGS="-ccbin=${CUDA_HOST_CXX}"
+export NVCC_PREPEND_FLAGS="-I${CUDA_TARGET_INCLUDE_DIR} -ccbin=${CUDA_HOST_CXX}"
 export TORCH_CUDA_ARCH_LIST="${SLIME_TORCH_CUDA_ARCH_LIST}"
 
 # Retry complete pip install transactions. Streaming resets from cluster-local
@@ -269,7 +276,22 @@ cd "$BASE_DIR/flash-attention"
 git checkout 002cce0a1068f8c07dfccb5a1d232b9a3276947c
 git submodule update --init
 cd hopper
-FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS="${FA3_MAX_JOBS}" pip -v install . --no-build-isolation
+if python - <<'PY'
+from importlib import metadata
+
+import flash_attn_3._C
+
+assert metadata.version("flash-attn-3") == "3.0.0"
+print("flash-attn-3=3.0.0 already installed")
+PY
+then
+  :
+else
+  FLASH_ATTENTION_FORCE_BUILD=TRUE \
+    FLASH_ATTENTION_DISABLE_SM80="$( [[ "${FA3_DISABLE_SM80}" == "1" ]] && echo TRUE || echo FALSE )" \
+    MAX_JOBS="${FA3_MAX_JOBS}" \
+    pip -v install . --no-build-isolation
+fi
 
 pip install git+https://github.com/ISEEKYAN/mbridge.git@89eb10887887bc74853f89a4de258c0702932a1c --no-deps
 pip install flash-linear-attention==0.4.2

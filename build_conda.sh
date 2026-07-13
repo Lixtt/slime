@@ -32,15 +32,21 @@ if [[ -n "${SLIME_ENV_PREFIX}" ]]; then
   if [[ ! -x "${SLIME_ENV_PREFIX}/bin/python" ]]; then
     "${CONDA_EXE}" create "${ENV_SELECTOR[@]}" python=3.12 pip -c conda-forge -y
   fi
+  # Third-party conda activate hooks may read optional variables without
+  # default expansions (CUDA's hook reads NVCC_PREPEND_FLAGS, for example).
+  set +u
   eval "$("${CONDA_EXE}" shell.bash hook)"
   conda activate "${SLIME_ENV_PREFIX}"
+  set -u
 else
   # Preserve the standalone bootstrap used by the upstream development image.
   yes '' | "${SHELL}" <(curl -L micro.mamba.pm/install.sh)
   export PS1=tmp
   mkdir -p /root/.cargo/
   touch /root/.cargo/env
+  set +u
   source ~/.bashrc
+  set -u
 
   # The installer may write the `nodefaults` meta-tag as a real channel.
   if [[ -f ~/.condarc ]]; then
@@ -50,7 +56,9 @@ else
   ENV_MANAGER_BIN="$(command -v micromamba)"
   ENV_SELECTOR=(-n "${SLIME_ENV_NAME}")
   "${ENV_MANAGER_BIN}" create "${ENV_SELECTOR[@]}" python=3.12 pip -c conda-forge -y
+  set +u
   micromamba activate "${SLIME_ENV_NAME}"
+  set -u
 fi
 export CUDA_HOME="$CONDA_PREFIX"
 

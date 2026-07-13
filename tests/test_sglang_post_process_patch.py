@@ -65,6 +65,8 @@ def test_build_conda_prefix_mode_does_not_bootstrap_micromamba():
     assert 'SLIME_ENV_PREFIX="${SLIME_ENV_PREFIX:-}"' in prefix_branch
     assert 'ENV_SELECTOR=(-p "${SLIME_ENV_PREFIX}")' in prefix_branch
     assert 'conda activate "${SLIME_ENV_PREFIX}"' in prefix_branch
+    assert 'set +u\n  eval "$("${CONDA_EXE}" shell.bash hook)"' in prefix_branch
+    assert 'conda activate "${SLIME_ENV_PREFIX}"\n  set -u' in prefix_branch
     assert "micro.mamba.pm" not in prefix_branch
     assert "source ~/.bashrc" not in prefix_branch
 

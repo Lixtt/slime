@@ -74,6 +74,25 @@ fi
 export CUDA_HOME="$CONDA_PREFIX"
 export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
+# CUDA 12.9 rejects GCC 14, which current conda-forge activation hooks may
+# select through x86_64-conda-linux-gnu-c++. Use the host's supported compiler
+# for CUDA extensions while retaining conda's headers, libraries, and linker
+# flags.
+CUDA_HOST_CC="${CUDA_HOST_CC:-/usr/bin/gcc}"
+CUDA_HOST_CXX="${CUDA_HOST_CXX:-/usr/bin/g++}"
+if [[ ! -x "${CUDA_HOST_CC}" || ! -x "${CUDA_HOST_CXX}" ]]; then
+  echo "Missing CUDA host compiler: CC=${CUDA_HOST_CC} CXX=${CUDA_HOST_CXX}" >&2
+  exit 2
+fi
+cuda_host_cxx_major="$("${CUDA_HOST_CXX}" -dumpfullversion -dumpversion | cut -d. -f1)"
+if [[ ! "${cuda_host_cxx_major}" =~ ^[0-9]+$ ]] || (( cuda_host_cxx_major >= 14 )); then
+  echo "CUDA 12.9 requires a host C++ compiler older than GCC 14; got ${CUDA_HOST_CXX} major=${cuda_host_cxx_major}" >&2
+  exit 2
+fi
+export CC="${CUDA_HOST_CC}"
+export CXX="${CUDA_HOST_CXX}"
+export NVCC_PREPEND_FLAGS="-ccbin=${CUDA_HOST_CXX}"
+
 # Retry complete pip install transactions. Streaming resets from cluster-local
 # mirrors otherwise force operators to rerun this multi-hour build by hand.
 pip() {

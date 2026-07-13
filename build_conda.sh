@@ -174,31 +174,71 @@ fi
 # Online RL needs SGLang's autoregressive runtime. The `all` extra adds
 # diffusion, tracing, and HTTP/2 stacks that are part of the general Docker
 # image but not the Slime runtime and greatly expand resolver/network failure.
-if [[ "${SKIP_SGLANG_DEPENDENCY_RESOLUTION:-0}" != "1" ]]; then
-  pip install -e "python" --extra-index-url https://download.pytorch.org/whl/cu129
+if [[ "${SLIME_BUILD_RESUME_AFTER_CU129_BASE:-0}" == "1" ]]; then
+  SGLANG_DIR="${SGLANG_DIR}" python - <<'PY'
+import json
+import os
+from importlib import metadata
+from pathlib import Path
+
+import torch
+from packaging.version import Version
+
+expected = {
+    "sgl-deep-gemm": "0.1.3",
+    "sglang": "0.5.14",
+    "sglang-kernel": "0.4.4",
+    "torch": "2.11.0",
+    "torchaudio": "2.11.0",
+    "torchvision": "0.26.0",
+}
+for package, version in expected.items():
+    actual = metadata.version(package)
+    if Version(actual).base_version != version:
+        raise SystemExit(f"cannot resume: {package} expected {version}, got {actual}")
+cuda_python_version = Version(metadata.version("cuda-python"))
+if cuda_python_version.release[:2] != (12, 9):
+    raise SystemExit(
+        f"cannot resume: cuda-python expected 12.9.x, got {cuda_python_version}"
+    )
+if torch.version.cuda != "12.9":
+    raise SystemExit(f"cannot resume: torch CUDA expected 12.9, got {torch.version.cuda}")
+direct_url = json.loads(metadata.distribution("sglang").read_text("direct_url.json"))
+actual_source = Path(direct_url["url"].removeprefix("file://")).resolve()
+expected_source = (Path(os.environ["SGLANG_DIR"]) / "python").resolve()
+if not direct_url.get("dir_info", {}).get("editable") or actual_source != expected_source:
+    raise SystemExit(
+        f"cannot resume: SGLang editable source expected {expected_source}, got {actual_source}"
+    )
+print("cu129_base_resume_check=ok")
+PY
 else
-  # Resume a previously dependency-resolved build without letting SGLang's
-  # cu13-oriented metadata replace the pinned cu129 Torch stack again.
-  pip install -e "python" --no-deps
+  if [[ "${SKIP_SGLANG_DEPENDENCY_RESOLUTION:-0}" != "1" ]]; then
+    pip install -e "python" --extra-index-url https://download.pytorch.org/whl/cu129
+  else
+    # Resume a previously dependency-resolved build without letting SGLang's
+    # cu13-oriented metadata replace the pinned cu129 Torch stack again.
+    pip install -e "python" --no-deps
+  fi
+  mapfile -t cuda13_packages < <(
+    pip list --format=freeze \
+      | awk -F'==' '/-cu13(==|$)/ {print $1}'
+  )
+  if (( ${#cuda13_packages[@]} )); then
+    pip uninstall -y "${cuda13_packages[@]}"
+  fi
+  torch_index_args=(--index-url https://download.pytorch.org/whl/cu129)
+  if [[ -n "${GENERAL_PYPI_INDEX_URL}" ]]; then
+    torch_index_args+=(--extra-index-url "${GENERAL_PYPI_INDEX_URL}")
+  fi
+  pip install --force-reinstall \
+    torch==2.11.0+cu129 torchvision==0.26.0+cu129 torchaudio==2.11.0+cu129 \
+    "${torch_index_args[@]}"
+  pip install --force-reinstall --no-deps \
+    sglang-kernel==0.4.4 sgl-deep-gemm==0.1.3 \
+    --index-url https://docs.sglang.ai/whl/cu129/
+  pip install --force-reinstall cuda-python==12.9
 fi
-mapfile -t cuda13_packages < <(
-  pip list --format=freeze \
-    | awk -F'==' '/-cu13(==|$)/ {print $1}'
-)
-if (( ${#cuda13_packages[@]} )); then
-  pip uninstall -y "${cuda13_packages[@]}"
-fi
-torch_index_args=(--index-url https://download.pytorch.org/whl/cu129)
-if [[ -n "${GENERAL_PYPI_INDEX_URL}" ]]; then
-  torch_index_args+=(--extra-index-url "${GENERAL_PYPI_INDEX_URL}")
-fi
-pip install --force-reinstall \
-  torch==2.11.0+cu129 torchvision==0.26.0+cu129 torchaudio==2.11.0+cu129 \
-  "${torch_index_args[@]}"
-pip install --force-reinstall --no-deps \
-  sglang-kernel==0.4.4 sgl-deep-gemm==0.1.3 \
-  --index-url https://docs.sglang.ai/whl/cu129/
-pip install --force-reinstall cuda-python==12.9
 
 
 pip install cmake ninja

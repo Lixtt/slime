@@ -7,6 +7,8 @@ SLIME_ENV_NAME="${SLIME_ENV_NAME:-slime}"
 BUILD_MAX_JOBS="${BUILD_MAX_JOBS:-$(nproc)}"
 FA2_MAX_JOBS="${FA2_MAX_JOBS:-${BUILD_MAX_JOBS}}"
 FA3_MAX_JOBS="${FA3_MAX_JOBS:-${BUILD_MAX_JOBS}}"
+SLIME_TORCH_CUDA_ARCH_LIST="${SLIME_TORCH_CUDA_ARCH_LIST:-9.0}"
+FA2_CUDA_ARCHS="${FA2_CUDA_ARCHS:-90}"
 SLIME_BUILD_TMPDIR="${SLIME_BUILD_TMPDIR:-}"
 SLIME_BUILD_CACHE_DIR="${SLIME_BUILD_CACHE_DIR:-}"
 PIP_INSTALL_RETRIES="${PIP_INSTALL_RETRIES:-4}"
@@ -92,6 +94,7 @@ fi
 export CC="${CUDA_HOST_CC}"
 export CXX="${CUDA_HOST_CXX}"
 export NVCC_PREPEND_FLAGS="-ccbin=${CUDA_HOST_CXX}"
+export TORCH_CUDA_ARCH_LIST="${SLIME_TORCH_CUDA_ARCH_LIST}"
 
 # Retry complete pip install transactions. Streaming resets from cluster-local
 # mirrors otherwise force operators to rerun this multi-hour build by hand.
@@ -244,7 +247,9 @@ fi
 pip install cmake ninja
 
 # flash attn 2 (matches Dockerfile)
-MAX_JOBS="${FA2_MAX_JOBS}" pip -v install flash-attn==2.8.3 --no-build-isolation
+FLASH_ATTN_CUDA_ARCHS="${FA2_CUDA_ARCHS}" \
+  MAX_JOBS="${FA2_MAX_JOBS}" \
+  pip -v install flash-attn==2.8.3 --no-build-isolation
 
 # flash attn 3 (matches Dockerfile and TransformerEngine 2.16 CP APIs)
 if [ ! -d "$BASE_DIR/flash-attention/.git" ]; then

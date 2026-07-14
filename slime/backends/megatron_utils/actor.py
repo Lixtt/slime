@@ -698,7 +698,13 @@ class MegatronTrainRayActor(TrainRayActor):
             print_memory("after update_weights")
 
             verify_weight_version = self.args.ci_test or self.args.verify_rollout_weight_version_after_update
-            if verify_weight_version and len(rollout_engines) > 0 and self.weight_updater.weight_version > 0:
+            engine_update_is_deferred = getattr(self.weight_updater, "defers_rollout_engine_update", False)
+            if (
+                verify_weight_version
+                and not engine_update_is_deferred
+                and len(rollout_engines) > 0
+                and self.weight_updater.weight_version > 0
+            ):
                 engine = random.choice(rollout_engines)
                 engine_version = ray.get(engine.get_weight_version.remote())
                 if str(engine_version) != str(self.weight_updater.weight_version):

@@ -17,6 +17,11 @@ from ..hf_checkpoint_saver import save_hf_model_to_path
 class UpdateWeightFromDisk:
     """Full-weight sync through a shared filesystem and SGLang disk reload."""
 
+    # RayTrainGroup reloads the engines only after every Megatron actor has
+    # finished publishing its shard. Actor-local version checks must therefore
+    # wait for that group-level reload.
+    defers_rollout_engine_update = True
+
     def __init__(
         self,
         args: Namespace,

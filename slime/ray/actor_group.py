@@ -274,7 +274,8 @@ class RayTrainGroup:
                 for engine in engines
             ]
         )
-        if self.args.ci_test:
+        verify_weight_version = self.args.ci_test or self.args.verify_rollout_weight_version_after_update
+        if verify_weight_version:
             engine_versions = ray.get([engine.get_weight_version.remote() for engine in engines])
             mismatches = [
                 f"engine {idx}: {engine_version}"

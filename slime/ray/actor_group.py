@@ -156,11 +156,7 @@ class RayTrainGroup:
         """Save actor model"""
         ret = ray.get([actor.save_model.remote(rollout_id, force_sync=force_sync) for actor in self._actor_handlers])
         if self._release_train_enabled():
-            self.args.load = self.args.save
-            self.args.ckpt_step = None
-            self.args.finetune = False
-            self.args.no_load_optim = self.args.no_save_optim
-            self.args.no_load_rng = False
+            self._prepare_release_train_reload()
         return ret
 
     def update_weights(self):
@@ -220,6 +216,28 @@ class RayTrainGroup:
 
     def _release_train_enabled(self):
         return self.role == "actor" and getattr(self.args, "release_train", False)
+
+    def _prepare_release_train_reload(self):
+        if self._trainable_only_save_enabled():
+            # Trainable-only checkpoints are overlays, not standalone Megatron
+            # checkpoints. Keep the full base load and advance only the overlay;
+            # the exact optimizer/scheduler/RNG state is restored by that overlay.
+            self.args.megatron_trainable_only_load = self.args.save
+            return
+
+        self.args.load = self.args.save
+        self.args.ckpt_step = None
+        self.args.finetune = False
+        self.args.no_load_optim = self.args.no_save_optim
+        self.args.no_load_rng = False
+
+    def _trainable_only_save_enabled(self):
+        value = os.environ.get("SLIME_MEGATRON_TRAINABLE_ONLY_SAVE")
+        if value is None:
+            value = (getattr(self.args, "train_env_vars", None) or {}).get(
+                "SLIME_MEGATRON_TRAINABLE_ONLY_SAVE"
+            )
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
     def _full_disk_weight_update_enabled(self):
         return (

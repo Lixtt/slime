@@ -17,6 +17,13 @@ from slime.utils.misc import validate_rollout_window
 logger = logging.getLogger(__name__)
 
 
+def _environment_flag(name: str, args=None) -> bool:
+    value = os.environ.get(name)
+    if value is None and args is not None:
+        value = (getattr(args, "train_env_vars", None) or {}).get(name)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def reset_arg(parser, name, **kwargs):
     """
     Reset the default value of a Megatron argument.
@@ -2216,3 +2223,18 @@ def slime_validate_args(args):
             args.save_interval = 1
         if args.update_weight_mode != "full" or args.update_weight_transport != "disk":
             raise ValueError("--release-train requires --update-weight-mode=full and --update-weight-transport=disk.")
+        if _environment_flag("SLIME_MEGATRON_TRAINABLE_ONLY_SAVE", args):
+            required_state_flags = (
+                "SLIME_MEGATRON_TRAINABLE_ONLY_SAVE_TRAINING_STATE",
+                "SLIME_MEGATRON_TRAINABLE_ONLY_LOAD_TRAINING_STATE",
+            )
+            missing_state_flags = [name for name in required_state_flags if not _environment_flag(name, args)]
+            if missing_state_flags:
+                raise ValueError(
+                    "--release-train with trainable-only checkpoints requires exact training-state "
+                    f"save/load; enable {', '.join(missing_state_flags)}."
+                )
+            if getattr(args, "no_save_optim", False) or getattr(args, "no_save_rng", False):
+                raise ValueError(
+                    "--release-train with trainable-only checkpoints must save optimizer and RNG state."
+                )

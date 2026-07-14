@@ -387,6 +387,8 @@ def make_slime_validate_args(**overrides):
         ckpt_step=None,
         no_load_optim=False,
         no_load_rng=False,
+        no_save_optim=False,
+        no_save_rng=False,
         finetune=False,
         start_rollout_id=None,
         eval_interval=None,
@@ -572,6 +574,69 @@ def test_update_weights_initial_full_sync_requires_trainable_only(monkeypatch):
 
     with pytest.raises(ValueError, match="requires --update-weights-trainable-only"):
         module._validate_update_weight_args(args)
+
+
+@pytest.mark.unit
+def test_release_train_trainable_only_requires_exact_training_state(monkeypatch):
+    monkeypatch.setenv("SLIME_MEGATRON_TRAINABLE_ONLY_SAVE", "1")
+    monkeypatch.delenv("SLIME_MEGATRON_TRAINABLE_ONLY_SAVE_TRAINING_STATE", raising=False)
+    monkeypatch.delenv("SLIME_MEGATRON_TRAINABLE_ONLY_LOAD_TRAINING_STATE", raising=False)
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        release_train=True,
+        save="/checkpoints/trainable",
+        save_interval=1,
+        update_weight_transport="disk",
+        update_weight_disk_dir="/checkpoints/weights",
+    )
+
+    with pytest.raises(ValueError, match="requires exact training-state save/load"):
+        module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_release_train_trainable_only_accepts_exact_training_state(monkeypatch):
+    monkeypatch.setenv("SLIME_MEGATRON_TRAINABLE_ONLY_SAVE", "1")
+    monkeypatch.setenv("SLIME_MEGATRON_TRAINABLE_ONLY_SAVE_TRAINING_STATE", "1")
+    monkeypatch.setenv("SLIME_MEGATRON_TRAINABLE_ONLY_LOAD_TRAINING_STATE", "1")
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        release_train=True,
+        save="/checkpoints/trainable",
+        save_interval=1,
+        update_weight_transport="disk",
+        update_weight_disk_dir="/checkpoints/weights",
+    )
+
+    module.slime_validate_args(args)
+
+    assert args.offload_train is False
+    assert args.offload_rollout is False
+
+
+@pytest.mark.unit
+def test_release_train_validation_reads_exact_state_from_train_env(monkeypatch):
+    for name in (
+        "SLIME_MEGATRON_TRAINABLE_ONLY_SAVE",
+        "SLIME_MEGATRON_TRAINABLE_ONLY_SAVE_TRAINING_STATE",
+        "SLIME_MEGATRON_TRAINABLE_ONLY_LOAD_TRAINING_STATE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        release_train=True,
+        save="/checkpoints/trainable",
+        save_interval=1,
+        update_weight_transport="disk",
+        update_weight_disk_dir="/checkpoints/weights",
+        train_env_vars={
+            "SLIME_MEGATRON_TRAINABLE_ONLY_SAVE": "1",
+            "SLIME_MEGATRON_TRAINABLE_ONLY_SAVE_TRAINING_STATE": "true",
+            "SLIME_MEGATRON_TRAINABLE_ONLY_LOAD_TRAINING_STATE": "yes",
+        },
+    )
+
+    module.slime_validate_args(args)
 
 
 if __name__ == "__main__":

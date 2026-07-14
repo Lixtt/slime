@@ -1,5 +1,4 @@
 import dataclasses
-import importlib.util
 import itertools
 import logging
 import math
@@ -50,23 +49,6 @@ def _ray_retry_option_from_env(name: str, default: int) -> int:
         return int(raw)
     except ValueError as exc:
         raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
-
-
-def _torch_memory_saver_preload_env() -> dict[str, str]:
-    spec = importlib.util.find_spec("torch_memory_saver")
-    if spec is None or spec.submodule_search_locations is None:
-        return {}
-
-    package_dir = next(iter(spec.submodule_search_locations), "")
-    package_parent = os.path.dirname(package_dir)
-    for filename in (
-        "torch_memory_saver_hook_mode_preload_cu12.abi3.so",
-        "torch_memory_saver_hook_mode_preload.abi3.so",
-    ):
-        path = os.path.join(package_parent, filename)
-        if os.path.exists(path):
-            return {"LD_PRELOAD": path}
-    return {}
 
 
 _ROLLOUT_DATA_TENSOR_DTYPES = {
@@ -392,14 +374,9 @@ class ServerGroup:
                     "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
                 }.items()
             }
-            if self.args.offload_rollout:
-                preload_env = _torch_memory_saver_preload_env()
-                if preload_env:
-                    env_vars.update(preload_env)
-                else:
-                    logger.warning(
-                        "offload_rollout is enabled, but torch_memory_saver preload library was not found."
-                    )
+            # SGLang owns torch_memory_saver setup for its scheduler children.
+            # Preloading it on the Ray actor as well duplicates LD_PRELOAD when
+            # SGLang enters configure_subprocess().
             rollout_engine = RolloutRayActor.options(
                 num_cpus=num_cpus,
                 num_gpus=num_gpus,

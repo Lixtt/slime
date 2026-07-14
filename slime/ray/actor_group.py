@@ -270,6 +270,9 @@ class RayTrainGroup:
                 engine.update_weights_from_disk.remote(
                     model_path=model_path,
                     weight_version=weight_version,
+                    disable_draft_model=getattr(
+                        self.args, "update_weight_disable_draft_model", False
+                    ),
                 )
                 for engine in engines
             ]

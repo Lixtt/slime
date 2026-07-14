@@ -181,6 +181,9 @@ class UpdateWeightFromDiskDelta(UpdateWeightFromDistributed):
                     engine.update_weights_from_disk.remote(
                         model_path=self.args.update_weight_local_checkpoint_dir,
                         weight_version=str(self.weight_version),
+                        disable_draft_model=getattr(
+                            self.args, "update_weight_disable_draft_model", False
+                        ),
                     )
                     for engine in self.rollout_engines
                 ]

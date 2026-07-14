@@ -623,6 +623,7 @@ class SGLangEngine(RayActor):
         model_path: str,
         load_format: str | None = None,
         weight_version: str | None = None,
+        disable_draft_model: bool = False,
     ):
         """Reload weights from the checkpoint at *model_path* without restarting the engine."""
         payload: dict = {"model_path": model_path}
@@ -630,6 +631,8 @@ class SGLangEngine(RayActor):
             payload["load_format"] = load_format
         if weight_version is not None:
             payload["weight_version"] = weight_version
+        if disable_draft_model:
+            payload["disable_draft_model"] = True
         return self._make_request("update_weights_from_disk", payload)
 
     def init_weights_update_group(self, master_address, master_port, rank_offset, world_size, group_name, backend):

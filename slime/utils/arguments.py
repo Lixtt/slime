@@ -245,6 +245,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--update-weight-disable-draft-model",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help=(
+                    "Keep speculative draft weights unchanged when rollout engines reload a disk checkpoint. "
+                    "Use this when the training checkpoint contains only the target model."
+                ),
+            )
+            parser.add_argument(
                 "--update-weight-delta-encoding",
                 choices=["xor", "overwrite"],
                 default="xor",

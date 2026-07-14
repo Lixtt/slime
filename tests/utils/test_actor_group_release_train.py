@@ -25,8 +25,12 @@ class _FakeEngine:
         self.get_weight_version = _RemoteMethod(self._get_weight_version)
         self.continue_generation = _RemoteMethod(lambda: self.events.append("continue"))
 
-    def _update_weights_from_disk(self, *, model_path, weight_version):
-        self.events.append(("reload", model_path, weight_version))
+    def _update_weights_from_disk(
+        self, *, model_path, weight_version, disable_draft_model
+    ):
+        self.events.append(
+            ("reload", model_path, weight_version, disable_draft_model)
+        )
         self.version = weight_version
 
     def _get_weight_version(self):
@@ -55,6 +59,7 @@ def _group(**overrides):
         "offload_rollout": False,
         "update_weight_local_checkpoint_dir": None,
         "update_weight_disk_keep_files": True,
+        "update_weight_disable_draft_model": False,
         "ci_test": False,
         "verify_rollout_weight_version_after_update": True,
     }
@@ -116,8 +121,26 @@ def test_full_disk_reload_verifies_every_engine_after_reload(monkeypatch, tmp_pa
 
     group._reload_rollout_weights_from_disk(Path(tmp_path), "3")
 
-    expected = ["pause", "flush", ("reload", str(tmp_path), "3"), "verify", "continue"]
+    expected = [
+        "pause",
+        "flush",
+        ("reload", str(tmp_path), "3", False),
+        "verify",
+        "continue",
+    ]
     assert [engine.events for engine in engines] == [expected, expected]
+
+
+@pytest.mark.unit
+def test_full_disk_reload_can_preserve_speculative_draft(monkeypatch, tmp_path):
+    monkeypatch.setattr("slime.ray.actor_group.ray.get", lambda value: value)
+    engines = [_FakeEngine()]
+    group = _group(update_weight_disable_draft_model=True)
+    group._rollout_manager = _FakeRolloutManager(engines)
+
+    group._reload_rollout_weights_from_disk(Path(tmp_path), "4")
+
+    assert ("reload", str(tmp_path), "4", True) in engines[0].events
 
 
 @pytest.mark.unit

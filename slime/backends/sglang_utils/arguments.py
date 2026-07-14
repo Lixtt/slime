@@ -153,10 +153,27 @@ def add_sglang_arguments(parser):
     return parser
 
 
+def _normalize_parallel_size(args, canonical_name, legacy_name):
+    """Read either the current SGLang field name or its legacy alias."""
+    if hasattr(args, canonical_name):
+        return getattr(args, canonical_name)
+    if hasattr(args, legacy_name):
+        return getattr(args, legacy_name)
+    raise AttributeError(f"SGLang argument namespace has neither {canonical_name!r} nor {legacy_name!r}")
+
+
 def validate_args(args):
-    args.sglang_dp_size = args.sglang_data_parallel_size
-    args.sglang_pp_size = args.sglang_pipeline_parallel_size
-    args.sglang_ep_size = args.sglang_expert_parallel_size
+    # SGLang v0.5.14 uses dp_size/pp_size/ep_size as the argparse dests,
+    # while older releases used the expanded parallel-size names.
+    args.sglang_dp_size = _normalize_parallel_size(
+        args, "sglang_dp_size", "sglang_data_parallel_size"
+    )
+    args.sglang_pp_size = _normalize_parallel_size(
+        args, "sglang_pp_size", "sglang_pipeline_parallel_size"
+    )
+    args.sglang_ep_size = _normalize_parallel_size(
+        args, "sglang_ep_size", "sglang_expert_parallel_size"
+    )
 
     # Compute effective TP size considering PP size
     if args.sglang_pp_size > 1:

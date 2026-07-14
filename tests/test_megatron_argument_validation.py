@@ -305,6 +305,41 @@ def test_sglang_parse_args_preserves_router_cli_values(monkeypatch):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("parallel_sizes", "expected"),
+    [
+        ({"sglang_dp_size": 1, "sglang_pp_size": 2, "sglang_ep_size": 4}, (1, 2, 4)),
+        (
+            {
+                "sglang_data_parallel_size": 1,
+                "sglang_pipeline_parallel_size": 2,
+                "sglang_expert_parallel_size": 4,
+            },
+            (1, 2, 4),
+        ),
+    ],
+)
+def test_sglang_validate_accepts_current_and_legacy_parallel_size_names(
+    monkeypatch, parallel_sizes, expected
+):
+    module = load_sglang_arguments_module(monkeypatch)
+    args = types.SimpleNamespace(
+        rollout_num_gpus_per_engine=8,
+        sglang_enable_dp_attention=False,
+        sglang_router_ip=None,
+        prefill_num_servers=None,
+        sglang_config=None,
+        rollout_external=False,
+        **parallel_sizes,
+    )
+
+    module.validate_args(args)
+
+    assert (args.sglang_dp_size, args.sglang_pp_size, args.sglang_ep_size) == expected
+    assert args.sglang_tp_size == 4
+
+
+@pytest.mark.unit
 def test_hf_validate_all_moe_skips_dense_intermediate_size(monkeypatch):
     module = load_arguments_module(monkeypatch)
 

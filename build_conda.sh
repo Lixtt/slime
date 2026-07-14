@@ -263,6 +263,23 @@ fi
 pip install cmake ninja
 
 # flash attn 2 (matches Dockerfile)
+# SGLang's dependency resolver may install flash-attn-4.  Its distribution
+# metadata makes TransformerEngine select the FA4 API even after FA2 has
+# overwritten the shared flash_attn package, so remove it before building FA2.
+pip uninstall -y flash-attn-4 || true
+
+# FA 2.8.3's CuTe backend explicitly requires CUTLASS DSL 4.1.0.  Newer
+# split-package releases removed cutlass.utils.ampere_helpers and may leave
+# overlapping files behind when downgraded, so clear the whole family first.
+mapfile -t cutlass_dsl_packages < <(
+  pip list --format=freeze \
+    | awk -F'==' 'tolower($1) ~ /^nvidia-cutlass-dsl/ {print $1}'
+)
+if (( ${#cutlass_dsl_packages[@]} )); then
+  pip uninstall -y "${cutlass_dsl_packages[@]}"
+fi
+pip install --no-deps nvidia-cutlass-dsl==4.1.0
+
 FLASH_ATTENTION_FORCE_BUILD=TRUE \
   FLASH_ATTN_CUDA_ARCHS="${FA2_CUDA_ARCHS}" \
   MAX_JOBS="${FA2_MAX_JOBS}" \
@@ -400,6 +417,8 @@ from packaging.version import Version
 
 expected_exact = {
     "flash-attn": "2.8.3",
+    "flash-attn-3": "3.0.0",
+    "nvidia-cutlass-dsl": "4.1.0",
     "sgl-deep-gemm": "0.1.3",
     "sglang": "0.5.14",
     "sglang-kernel": "0.4.4",
@@ -414,6 +433,16 @@ for package, expected in expected_exact.items():
     if Version(actual).base_version != expected:
         raise SystemExit(f"{package}: expected {expected}, got {actual}")
     print(f"{package}={actual}")
+
+try:
+    flash_attn_4_version = metadata.version("flash-attn-4")
+except metadata.PackageNotFoundError:
+    pass
+else:
+    raise SystemExit(
+        "flash-attn-4 must be absent when using FA2 2.8.3; "
+        f"found {flash_attn_4_version}"
+    )
 
 if torch.version.cuda != "12.9":
     raise SystemExit(f"torch: expected CUDA 12.9, got {torch.version.cuda}")

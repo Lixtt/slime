@@ -525,9 +525,10 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
         rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
             inference_context, None, hidden_states, self.config, packed_seq_params
         )
-        rotary_pos_emb, mscale = self.rotary_pos_emb(
-            rotary_seq_len, packed_seq_params=packed_seq_params
-        )
+        # RotaryEmbedding.forward is lru-cached in current Megatron, so pass the
+        # hashable packed-layout flag rather than PackedSeqParams itself.
+        packed_seq = packed_seq_params.qkv_format == "thd"
+        rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
 
         cu_seqlens_q = packed_seq_params.cu_seqlens_q
         cu_seqlens_kv = packed_seq_params.cu_seqlens_kv

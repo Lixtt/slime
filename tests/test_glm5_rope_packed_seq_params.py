@@ -4,8 +4,11 @@ import ast
 from pathlib import Path
 
 
-def test_glm5_mla_passes_packed_seq_params_to_rope() -> None:
-    source = Path("slime/slime_plugins/models/glm5/glm5.py").read_text(encoding="utf-8")
+GLM5_SOURCE = Path(__file__).resolve().parents[1] / "slime_plugins/models/glm5/glm5.py"
+
+
+def test_glm5_mla_passes_hashable_packed_seq_flag_to_rope() -> None:
+    source = GLM5_SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(source)
 
     class Visitor(ast.NodeVisitor):
@@ -36,12 +39,18 @@ def test_glm5_mla_passes_packed_seq_params_to_rope() -> None:
     assert visitor.rope_calls, "GLM5 MLA should call self.rotary_pos_emb in QKV preparation"
     rope_call = visitor.rope_calls[0]
     keyword_names = {keyword.arg for keyword in rope_call.keywords}
-    assert "packed_seq_params" in keyword_names
-    assert "packed_seq" not in keyword_names
+    assert "packed_seq" in keyword_names
+    assert "packed_seq_params" not in keyword_names
+
+    packed_seq_keyword = next(
+        keyword for keyword in rope_call.keywords if keyword.arg == "packed_seq"
+    )
+    assert isinstance(packed_seq_keyword.value, ast.Name)
+    assert packed_seq_keyword.value.id == "packed_seq"
 
 
 def test_glm5_mla_rope_has_unfused_thd_fallback() -> None:
-    source = Path("slime/slime_plugins/models/glm5/glm5.py").read_text(encoding="utf-8")
+    source = GLM5_SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(source)
 
     apex_imports = [

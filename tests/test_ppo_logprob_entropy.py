@@ -286,6 +286,66 @@ def test_calculate_log_probs_and_entropy_handles_empty_input(with_entropy: bool)
         assert entropy is None
 
 
+@pytest.mark.parametrize("chunk_size", [-1, 2])
+@pytest.mark.parametrize("with_entropy", [False, True])
+def test_calculate_log_probs_and_entropy_applies_temperature_per_chunk(
+    chunk_size: int,
+    with_entropy: bool,
+):
+    temperature = 0.6
+    logits = _single_rank_logits().requires_grad_()
+    tokens = torch.tensor([3, 0, 1], dtype=torch.long)
+
+    log_probs, entropy = calculate_log_probs_and_entropy(
+        logits,
+        tokens,
+        tp_group=None,
+        with_entropy=with_entropy,
+        chunk_size=chunk_size,
+        temperature=temperature,
+    )
+
+    ref_logits = logits.detach().clone().requires_grad_()
+    expected_log_probs, expected_entropy = calculate_log_probs_and_entropy(
+        ref_logits / temperature,
+        tokens,
+        tp_group=None,
+        with_entropy=with_entropy,
+        chunk_size=chunk_size,
+    )
+    torch.testing.assert_close(log_probs, expected_log_probs, rtol=STRICT_RTOL, atol=STRICT_ATOL)
+    if with_entropy:
+        torch.testing.assert_close(entropy, expected_entropy, rtol=STRICT_RTOL, atol=STRICT_ATOL)
+    else:
+        assert entropy is None
+
+    logprob_weights = torch.tensor([0.25, -0.5, 1.5], dtype=torch.float32)
+    entropy_weights = torch.tensor([0.55, -0.2, 1.8], dtype=torch.float32)
+    _weighted_loss(
+        log_probs,
+        entropy,
+        logprob_weights=logprob_weights,
+        entropy_weights=entropy_weights,
+    ).backward()
+    _weighted_loss(
+        expected_log_probs,
+        expected_entropy,
+        logprob_weights=logprob_weights,
+        entropy_weights=entropy_weights,
+    ).backward()
+    torch.testing.assert_close(logits.grad, ref_logits.grad, rtol=STRICT_RTOL, atol=STRICT_ATOL)
+
+
+def test_calculate_log_probs_and_entropy_rejects_nonpositive_temperature():
+    with pytest.raises(ValueError, match="temperature must be positive"):
+        calculate_log_probs_and_entropy(
+            _single_rank_logits(),
+            torch.tensor([3, 0, 1], dtype=torch.long),
+            tp_group=None,
+            temperature=0.0,
+        )
+
+
 def _distributed_full_logits() -> torch.Tensor:
     return torch.tensor(
         [

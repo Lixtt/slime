@@ -922,7 +922,16 @@ def calculate_log_probs_and_entropy(
     chunk_size: int = -1,
     log_prob_keep_mask=None,
     with_entropy_grad: bool = True,
+    temperature: float = 1.0,
 ):
+    if temperature <= 0:
+        raise ValueError(f"temperature must be positive, got {temperature}")
+
+    def scale_logits(logits_chunk: torch.Tensor) -> torch.Tensor:
+        if temperature == 1.0:
+            return logits_chunk
+        return logits_chunk / temperature
+
     logits = logits.contiguous()
     entropy = None
     if logits.size(0) != 0:
@@ -938,7 +947,7 @@ def calculate_log_probs_and_entropy(
             entropy_chunks = []
             for tokens_chunk, logits_chunk, mask_chunk in zip(tokens_chunks, logits_chunks, mask_chunks, strict=True):
                 log_prob, entropy_chunk = _calculate_log_probs_and_entropy_chunk(
-                    logits_chunk,
+                    scale_logits(logits_chunk),
                     tokens_chunk,
                     tp_group,
                     with_entropy=with_entropy,
@@ -953,7 +962,7 @@ def calculate_log_probs_and_entropy(
                 entropy = torch.cat(entropy_chunks, dim=0)
         else:
             log_prob, entropy = _calculate_log_probs_and_entropy_chunk(
-                logits,
+                scale_logits(logits),
                 tokens,
                 tp_group,
                 with_entropy=with_entropy,

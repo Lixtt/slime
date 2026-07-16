@@ -494,10 +494,9 @@ def get_log_probs_and_entropy(
     assert logits.size(0) == 1, f"{logits.shape}"
     logits = logits.squeeze(0)
 
-    # Apply rollout temperature scaling to logits to match rollout-time log-probs.
+    # Scale inside each log-prob chunk. Scaling the packed [T, V] tensor here
+    # duplicates the full logits allocation and can OOM on long trajectories.
     rollout_temperature = getattr(args, "rollout_temperature", 1.0)
-    if rollout_temperature != 1.0:
-        logits = logits / rollout_temperature
     logits = logits.contiguous()
     T = logits.size(0)
     device = logits.device
@@ -533,6 +532,7 @@ def get_log_probs_and_entropy(
         with_entropy_grad=with_entropy_grad,
         chunk_size=chunk_size,
         log_prob_keep_mask=top_p_keep_mask,
+        temperature=rollout_temperature,
     )
     log_prob_full = log_prob_full.squeeze(-1)  # [T, 1] -> [T]
 

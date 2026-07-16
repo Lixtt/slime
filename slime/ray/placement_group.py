@@ -212,6 +212,15 @@ def create_actor_model(args, pgs, rollout_manager, actor_cls=None):
 
 
 def create_training_models(args, pgs, rollout_manager, actor_cls=None):
+    if getattr(args, "debug_rollout_only", False):
+        # A rollout-only run has no training model to allocate. This matters for
+        # external engines, whose placement group intentionally has zero GPUs.
+        if args.start_rollout_id is None:
+            args.start_rollout_id = 0
+        if args.rollout_global_dataset:
+            ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))
+        return None, None
+
     actor_model, actor_start_rollout_ids = create_actor_model(args, pgs, rollout_manager, actor_cls=actor_cls)
 
     critic_model = None

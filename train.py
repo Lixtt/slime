@@ -27,7 +27,7 @@ def train(args):
         debug_train_only=args.debug_train_only,
     )
 
-    if args.offload_rollout:
+    if args.offload_rollout and not args.debug_rollout_only:
         ray.get(rollout_manager.offload.remote())
 
     # create the actor and critic models
@@ -38,16 +38,18 @@ def train(args):
         allow_empty=args.num_rollout == 0 and args.eval_interval is not None,
     )
 
-    if args.offload_rollout and not release_train:
+    if args.offload_rollout and actor_model is not None and not release_train:
         ray.get(rollout_manager.onload_weights.remote())
 
-    # Always push actor weights to rollout once weights are loaded.
-    actor_model.update_weights()
+    # External rollout-only runs serve an already materialized checkpoint and
+    # intentionally have no training actor to synchronize from.
+    if actor_model is not None:
+        actor_model.update_weights()
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
 
-    if args.offload_rollout:
+    if args.offload_rollout and actor_model is not None:
         ray.get(rollout_manager.onload_kv.remote())
 
     run_rollout_generation_quality_gate(
@@ -61,6 +63,8 @@ def train(args):
         ray.get(rollout_manager.eval.remote(rollout_id=0))
 
     def offload_train(actor_trains_this_step):
+        if actor_model is None:
+            return
         # Each model auto-offloads after train() when offload_train is set,
         # so we only need clear_memory for the non-offload case.
         if not args.offload_train:
@@ -83,39 +87,44 @@ def train(args):
             debug_train_only=args.debug_train_only,
         )
 
-        if args.offload_rollout:
+        if args.offload_rollout and actor_model is not None:
             ray.get(rollout_manager.offload.remote())
 
-        if release_train:
-            actor_model.create()
+        actor_trains = False
+        if actor_model is not None:
+            if release_train:
+                actor_model.create()
 
-        actor_trains = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
-        if args.use_critic:
-            value_refs = critic_model.async_train(rollout_id, rollout_data_ref)
-            if actor_trains:
-                ray.get(actor_model.async_train(rollout_id, rollout_data_ref, external_data=value_refs))
+            actor_trains = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
+            if args.use_critic:
+                value_refs = critic_model.async_train(rollout_id, rollout_data_ref)
+                if actor_trains:
+                    ray.get(actor_model.async_train(rollout_id, rollout_data_ref, external_data=value_refs))
+                else:
+                    ray.get(value_refs)
             else:
-                ray.get(value_refs)
-        else:
-            ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+                ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
 
-        if release_train or should_run_periodic_action(
+        checkpoint_due = release_train or should_run_periodic_action(
             rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
-        ):
+        )
+        if checkpoint_due:
             force_sync = release_train or rollout_id == args.num_rollout - 1
             # A critic-only warmup still advances the shared actor/data cursor.
-            actor_model.save_model(rollout_id, force_sync=force_sync)
-            if args.use_critic:
+            if actor_model is not None:
+                actor_model.save_model(rollout_id, force_sync=force_sync)
+            if critic_model is not None:
                 critic_model.save_model(rollout_id, force_sync=force_sync)
             if args.rollout_global_dataset:
                 ray.get(rollout_manager.save.remote(rollout_id))
 
-        offload_train(actor_trains)
-        if args.offload_rollout and not release_train:
-            ray.get(rollout_manager.onload_weights.remote())
-        actor_model.update_weights()
+        if actor_model is not None:
+            offload_train(actor_trains)
+            if args.offload_rollout and not release_train:
+                ray.get(rollout_manager.onload_weights.remote())
+            actor_model.update_weights()
 
-        if args.offload_rollout:
+        if args.offload_rollout and actor_model is not None:
             ray.get(rollout_manager.onload_kv.remote())
 
         run_rollout_generation_quality_gate(

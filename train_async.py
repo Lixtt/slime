@@ -26,15 +26,17 @@ def train(args):
         debug_train_only=args.debug_train_only,
     )
 
-    if args.offload_rollout:
+    if args.offload_rollout and not args.debug_rollout_only:
         ray.get(rollout_manager.offload.remote())
 
     # create the actor and critic models
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
     validate_rollout_window(args.start_rollout_id, args.num_rollout)
 
-    # Always push actor weights to rollout once weights are loaded.
-    actor_model.update_weights()
+    # External rollout-only runs serve an already materialized checkpoint and
+    # intentionally have no training actor to synchronize from.
+    if actor_model is not None:
+        actor_model.update_weights()
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
@@ -56,26 +58,29 @@ def train(args):
         if rollout_id + 1 < args.num_rollout:
             rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
 
-        if release_train:
-            actor_model.create()
+        actor_trains = False
+        if actor_model is not None:
+            if release_train:
+                actor_model.create()
 
-        actor_trains = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
-        if args.use_critic:
-            value_refs = critic_model.async_train(rollout_id, rollout_data_curr_ref)
-            if actor_trains:
-                ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref, external_data=value_refs))
-            else:
-                ray.get(value_refs)
-        else:
-            ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
-
-        if release_train or should_run_periodic_action(
-            rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
-        ):
-            force_sync = release_train or rollout_id == args.num_rollout - 1
-            if actor_trains:
-                actor_model.save_model(rollout_id, force_sync=force_sync)
+            actor_trains = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
             if args.use_critic:
+                value_refs = critic_model.async_train(rollout_id, rollout_data_curr_ref)
+                if actor_trains:
+                    ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref, external_data=value_refs))
+                else:
+                    ray.get(value_refs)
+            else:
+                ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
+
+        checkpoint_due = release_train or should_run_periodic_action(
+            rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
+        )
+        if checkpoint_due:
+            force_sync = release_train or rollout_id == args.num_rollout - 1
+            if actor_model is not None and actor_trains:
+                actor_model.save_model(rollout_id, force_sync=force_sync)
+            if critic_model is not None:
                 critic_model.save_model(rollout_id, force_sync=force_sync)
             if args.rollout_global_dataset:
                 ray.get(rollout_manager.save.remote(rollout_id))
@@ -89,7 +94,8 @@ def train(args):
                 f"pre_update_{rollout_id}",
                 debug_train_only=args.debug_train_only,
             )
-            actor_model.update_weights()
+            if actor_model is not None:
+                actor_model.update_weights()
             run_rollout_generation_quality_gate(
                 rollout_manager,
                 f"post_update_{rollout_id}",

@@ -29,6 +29,7 @@ from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_inf
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
+from slime.utils.rollout_artifact import load_behavior_policy_manifest
 from slime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
@@ -735,11 +736,17 @@ class RolloutManager:
     def generate(self, rollout_id):
         start_time = time.time()
         self.rollout_id = rollout_id
+        behavior_policy = self._load_rollout_behavior_policy(rollout_id)
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
         data, metrics = self._get_rollout_data(rollout_id=rollout_id)
-        self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
+        self._save_debug_rollout_data(
+            data,
+            rollout_id=rollout_id,
+            evaluation=False,
+            behavior_policy=behavior_policy,
+        )
         _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         if self.args.debug_rollout_only:
             # if debug rollout only, we don't convert samples to train data and directly return
@@ -752,10 +759,16 @@ class RolloutManager:
             # if debug train only, we don't generate evaluation data
             return
         self.health_monitoring_resume()
+        behavior_policy = self._load_rollout_behavior_policy(rollout_id)
 
         result = call_rollout_fn(self.eval_generate_rollout, self.args, rollout_id, self.data_source, evaluation=True)
         data = result.data
-        self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
+        self._save_debug_rollout_data(
+            data,
+            rollout_id=rollout_id,
+            evaluation=True,
+            behavior_policy=behavior_policy,
+        )
         _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
 
     def save(self, rollout_id):
@@ -977,7 +990,19 @@ class RolloutManager:
         }
         return self.train_parallel_config
 
-    def _save_debug_rollout_data(self, data, rollout_id, evaluation: bool):
+    def _load_rollout_behavior_policy(self, rollout_id: int) -> dict[str, Any] | None:
+        manifest_path = getattr(self.args, "rollout_behavior_policy_manifest", None)
+        if not manifest_path:
+            return None
+        return load_behavior_policy_manifest(manifest_path, rollout_id=rollout_id)
+
+    def _save_debug_rollout_data(
+        self,
+        data,
+        rollout_id,
+        evaluation: bool,
+        behavior_policy: dict[str, Any] | None = None,
+    ):
         # TODO to be refactored (originally Buffer._set_data)
         if (path_template := self.args.save_debug_rollout_data) is not None:
             path = Path(path_template.format(rollout_id=("eval_" if evaluation else "") + str(rollout_id)))
@@ -994,7 +1019,11 @@ class RolloutManager:
                     samples=[sample.to_dict() for sample in data],
                 )
 
-            atomic_torch_save(dict(rollout_id=rollout_id, **dump_data), path, durable=True)
+            artifact = dict(rollout_id=rollout_id, **dump_data)
+            if behavior_policy is not None:
+                artifact["behavior_policy"] = behavior_policy
+
+            atomic_torch_save(artifact, path, durable=True)
 
     def _post_process_rewards(self, samples: list[Sample] | list[list[Sample]]):
         if self.custom_reward_post_process_func is not None:

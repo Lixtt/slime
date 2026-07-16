@@ -1,3 +1,4 @@
+import json
 import sys
 from argparse import Namespace
 from pathlib import Path
@@ -10,6 +11,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from slime.backends.sglang_utils.external import apply_external_engine_info_to_args, discover_external_engines
 from slime.utils.http_utils import get_rollout_num_engines
+from slime.utils.rollout_artifact import behavior_policy_identity_digest
 
 NUM_GPUS = 0
 
@@ -136,6 +138,53 @@ def test_apply_external_engine_info_requires_addrs():
     args = Namespace(rollout_external_engine_addrs=None)
 
     with pytest.raises(ValueError, match="rollout-external-engine-addrs"):
+        apply_external_engine_info_to_args(args)
+
+
+def test_external_engine_must_match_behavior_policy(monkeypatch, tmp_path):
+    model_path = "/models/iter2"
+    identity = {
+        "format": "openclaw_rollout_behavior_policy_v1",
+        "expected_rollout_id": 3,
+        "target_train_iteration": 3,
+        "model": {"path": model_path},
+        "sampling_and_trajectory": {},
+        "expected_weight_versions": ["default"],
+    }
+    manifest = {
+        "schema_version": 1,
+        "expected_rollout_id": 3,
+        "identity_digest": behavior_policy_identity_digest(identity),
+        "identity": identity,
+    }
+    manifest_path = tmp_path / "policy.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    payload = {
+        "tp_size": 8,
+        "pp_size": 1,
+        "model_path": model_path,
+        "weight_version": "default",
+    }
+    monkeypatch.setattr(
+        "slime.backends.sglang_utils.external.requests.get",
+        lambda url, timeout: _Response(payload),
+    )
+    args = Namespace(
+        rollout_external_engine_addrs=["engine:10090"],
+        rollout_behavior_policy_manifest=str(manifest_path),
+        start_rollout_id=3,
+    )
+    apply_external_engine_info_to_args(args)
+    assert args.rollout_num_engines == 1
+
+    payload["model_path"] = "/models/wrong"
+    with pytest.raises(ValueError, match="model does not match"):
+        apply_external_engine_info_to_args(args)
+
+    payload["model_path"] = model_path
+    payload["weight_version"] = "stale"
+    with pytest.raises(ValueError, match="weight version does not match"):
         apply_external_engine_info_to_args(args)
 
 

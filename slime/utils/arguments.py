@@ -1412,6 +1412,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "The file will be saved to `save_debug_rollout_data.format(rollout_id)`."
                 ),
             )
+            parser.add_argument(
+                "--rollout-behavior-policy-manifest",
+                type=str,
+                default=None,
+                help=(
+                    "JSON manifest identifying the immutable behavior policy used for a persisted rollout. "
+                    "When --save-debug-rollout-data is set, the validated manifest is embedded in the .pt artifact."
+                ),
+            )
             # --load-debug-rollout-data, --debug-rollout-only, --debug-train-only
             # are parsed early in _pre_parse_mode() and merged later.
             parser.add_argument(

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from urllib.parse import urlparse
 
 import requests
+
+from slime.utils.rollout_artifact import load_behavior_policy_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +116,32 @@ def apply_external_engine_info_to_args(args, logger=None) -> None:
     infos = discover_external_engines(addrs)
     if not infos:
         raise ValueError("--rollout-external-engine-addrs did not contain any engines.")
+
+    behavior_policy_path = getattr(args, "rollout_behavior_policy_manifest", None)
+    if behavior_policy_path:
+        rollout_id = getattr(args, "start_rollout_id", None)
+        if rollout_id is None:
+            raise ValueError(
+                "--rollout-behavior-policy-manifest with external engines requires --start-rollout-id."
+            )
+        manifest = load_behavior_policy_manifest(behavior_policy_path, rollout_id=int(rollout_id))
+        identity = manifest["identity"]
+        expected_model_path = os.path.abspath(identity["model"]["path"])
+        expected_weight_versions = set(identity["expected_weight_versions"])
+        for info in infos:
+            actual_model_path = info.server_info.get("model_path")
+            actual_weight_version = info.server_info.get("weight_version")
+            if not actual_model_path or os.path.abspath(str(actual_model_path)) != expected_model_path:
+                raise ValueError(
+                    "External SGLang engine model does not match the rollout behavior policy: "
+                    f"engine={info.url}, expected={expected_model_path}, actual={actual_model_path!r}"
+                )
+            if str(actual_weight_version) not in expected_weight_versions:
+                raise ValueError(
+                    "External SGLang engine weight version does not match the rollout behavior policy: "
+                    f"engine={info.url}, expected={sorted(expected_weight_versions)}, "
+                    f"actual={actual_weight_version!r}"
+                )
 
     args.rollout_external_engine_infos = [info.to_dict() for info in infos]
     args.rollout_num_engines = len(infos)

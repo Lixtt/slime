@@ -165,6 +165,7 @@ class _SampleBuilder:
         self.loss_mask: list[int] = []
         self.logprobs: list[float] = []
         self.weight_versions: list[str] = []
+        self.turn_spans: list[dict[str, Any]] = []
         self.last_response_start_idx: int | None = None
         self.leading_prompt_len: int = 0
 
@@ -192,7 +193,15 @@ class _SampleBuilder:
             return DriftKind.REALIGN
         return DriftKind.FORK
 
-    def append_turn(self, turn: TurnRecord, kind: DriftKind, *, trained: bool = True) -> None:
+    def append_turn(
+        self,
+        turn: TurnRecord,
+        kind: DriftKind,
+        *,
+        trained: bool = True,
+        turn_index: int | None = None,
+        turn_metadata: dict[str, Any] | None = None,
+    ) -> None:
         """Append a cleanly extending turn to this builder.
 
         Any drift is handled by opening another builder before this method is
@@ -208,8 +217,19 @@ class _SampleBuilder:
 
         # --- append this turn's generated response (loss_mask=1 unless re-emitted as context) ---
         self.last_response_start_idx = len(self.tokens)
+        response_start = len(self.tokens)
         self._append_tokens(
             turn.output_ids, loss_mask=int(trained), logprobs=turn.output_log_probs if trained else None
+        )
+        response_end = len(self.tokens)
+        self.turn_spans.append(
+            {
+                "turn_index": turn_index,
+                "metadata": dict(turn_metadata or {}),
+                "response_start": response_start,
+                "response_end": response_end,
+                "trained": bool(trained),
+            }
         )
         if trained and turn.output_ids and turn.weight_version is not None:
             self.weight_versions.append(str(turn.weight_version))
@@ -239,6 +259,26 @@ class _SampleBuilder:
             loss_mask = loss_mask[:max_sample_tokens]
             logprobs = logprobs[:max_sample_tokens]
         md = dict(extra_metadata or {})
+        response_region_end = len(tokens)
+        serialized_turn_spans = []
+        for span in self.turn_spans:
+            absolute_start = max(start, int(span["response_start"]))
+            absolute_end = min(response_region_end, int(span["response_end"]))
+            if absolute_end <= absolute_start:
+                continue
+            serialized_turn_spans.append(
+                {
+                    "turn_index": span["turn_index"],
+                    "metadata": dict(span["metadata"]),
+                    "response_token_start": absolute_start - start,
+                    "response_token_end": absolute_end - start,
+                    "sampled_token_count": absolute_end - absolute_start,
+                    "train_token_count": int(sum(loss_mask[absolute_start:absolute_end])),
+                    "trained": bool(span["trained"]),
+                    "truncated": absolute_end < int(span["response_end"]),
+                }
+            )
+        md["trajectory_turn_spans"] = serialized_turn_spans
         return Sample(
             index=base_sample.index,
             group_index=base_sample.group_index,
@@ -425,12 +465,24 @@ class TrajectoryManager:
 
             if not builders:
                 builders.append(_SampleBuilder(self._fork_threshold))
-                builders[-1].append_turn(asst_node.turn, DriftKind.CLEAN, trained=trained)
+                builders[-1].append_turn(
+                    asst_node.turn,
+                    DriftKind.CLEAN,
+                    trained=trained,
+                    turn_index=asst_node.turn_index,
+                    turn_metadata=asst_node.metadata,
+                )
                 continue
 
             kind = builders[-1].classify_token_drift(asst_node.turn)
             if kind is DriftKind.CLEAN:
-                builders[-1].append_turn(asst_node.turn, kind, trained=trained)
+                builders[-1].append_turn(
+                    asst_node.turn,
+                    kind,
+                    trained=trained,
+                    turn_index=asst_node.turn_index,
+                    turn_metadata=asst_node.metadata,
+                )
                 continue
 
             # REALIGN used to overwrite the previous generated response and
@@ -438,7 +490,13 @@ class TrajectoryManager:
             # REALIGN and FORK now close the current row and start another row
             # under the same trajectory id.
             builders.append(_SampleBuilder(self._fork_threshold))
-            builders[-1].append_turn(asst_node.turn, DriftKind.CLEAN, trained=trained)
+            builders[-1].append_turn(
+                asst_node.turn,
+                DriftKind.CLEAN,
+                trained=trained,
+                turn_index=asst_node.turn_index,
+                turn_metadata=asst_node.metadata,
+            )
         return builders
 
     def _chain_to_samples(

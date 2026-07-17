@@ -264,6 +264,7 @@ def append(
     logprobs=None,
     weight_version=None,
     response_message=None,
+    metadata=None,
 ):
     p = list(prompt_ids) if prompt_ids is not None else render_prompt(prompt_msgs)
     if response_ids is not None:
@@ -298,6 +299,7 @@ def append(
         ),
         prompt_messages=messages(prompt_msgs),
         response_message=rmsg,
+        metadata=metadata,
     )
     return p, r
 
@@ -1320,6 +1322,49 @@ def test_4_7_context_compression_preserves_one_trajectory_and_both_actions():
     _check_invariants(samples)
     _record("4.7 context compression -> one trajectory, two trainable segments", mgr, sid, samples)
     print("PASS 4.7")
+
+
+def test_4_8_turn_spans_preserve_source_turn_metadata_and_token_boundaries():
+    mgr = TrajectoryManager()
+    sid = "4.8"
+    system, task = sys_msg("S"), usr_msg("task")
+    first_assistant, tool = asst_msg("call"), tool_msg("result")
+    _, first_response = append(
+        mgr,
+        sid,
+        [system, task],
+        "call",
+        finish_reason="tool_calls",
+        metadata={"turn_num": 11, "turn_type": "main"},
+    )
+    _, second_response = append(
+        mgr,
+        sid,
+        [system, task, first_assistant, tool],
+        "done",
+        metadata={"turn_num": 12, "turn_type": "tool_continuation"},
+    )
+
+    samples = get_traj(
+        mgr,
+        sid,
+        base_sample=Sample(index=18, group_index=6, group_id=731, prompt="task"),
+        reward={"score": 1.0},
+    )
+
+    assert len(samples) == 1
+    sample = samples[0]
+    spans = sample.metadata["trajectory_turn_spans"]
+    assert [span["turn_index"] for span in spans] == [1, 2]
+    assert [span["metadata"]["turn_num"] for span in spans] == [11, 12]
+    assert [span["metadata"]["turn_type"] for span in spans] == ["main", "tool_continuation"]
+    assert spans[0]["response_token_start"] == 0
+    assert spans[0]["response_token_end"] == len(first_response)
+    assert spans[1]["response_token_end"] == sample.response_length
+    assert spans[1]["response_token_start"] == sample.response_length - len(second_response)
+    assert [span["train_token_count"] for span in spans] == [len(first_response), len(second_response)]
+    assert all(span["trained"] and not span["truncated"] for span in spans)
+    _check_invariants(samples)
 
 
 # ===========================================================================
